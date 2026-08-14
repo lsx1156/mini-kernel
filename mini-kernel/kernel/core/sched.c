@@ -32,18 +32,22 @@ void _sched_ready_remove(tcb_t *task) {
 
 void sched_ready_enqueue(tcb_t *task) {
     if (!task) return;
-    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    /* 保存/恢复 PRIMASK：避免冷初始化阶段意外开中断 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _sched_ready_enqueue(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 void sched_ready_remove(tcb_t *task) {
     if (!task || task->next == NULL) return;
-    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    /* 保存/恢复 PRIMASK */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _sched_ready_remove(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 tcb_t *sched_ready_pick_next(void) {
@@ -94,18 +98,22 @@ void _sched_sleep_remove(tcb_t *task) {
 
 void sched_sleep_enqueue(tcb_t *task) {
     if (!task) return;
-    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    /* 保存/恢复 PRIMASK */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _sched_sleep_enqueue(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 void sched_sleep_remove(tcb_t *task) {
     if (!task || task->next == NULL) return;
-    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    /* 保存/恢复 PRIMASK */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _sched_sleep_remove(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 void sched_sleep_tick(void) {

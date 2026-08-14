@@ -79,14 +79,43 @@ static inline void _led_off(void) {
     *(volatile uint32_t *)(0xD0000000u + 0x018) = 0x02000000u;
 }
 
+/* LED 诊断辅助函数：通过 LED 闪烁次数指示当前阶段
+ * 用法：_led_stage(3) 会让 LED 闪 3 次（每次亮灭各 ~200ms）
+ * 这样用户可以告诉我们 LED 闪了几下，就能定位崩溃位置 */
+static void _led_stage(uint8_t count) {
+    register const uint32_t sio_base = 0xD0000000u;
+    register const uint32_t gpio25_mask = 0x02000000u;
+    
+    for (uint8_t i = 0; i < count; i++) {
+        *(volatile uint32_t *)(sio_base + 0x014) = gpio25_mask;  /* ON */
+        for (volatile uint32_t j = 0; j < 2500000; j++) __asm("nop");
+        *(volatile uint32_t *)(sio_base + 0x018) = gpio25_mask;  /* OFF */
+        for (volatile uint32_t j = 0; j < 2500000; j++) __asm("nop");
+    }
+    /* 结束后留 1 秒停顿 */
+    for (volatile uint32_t j = 0; j < 6250000; j++) __asm("nop");
+}
+
+/* boot_setup 任务：调度器首次运行后执行的热初始化阶段
+ *   0. [可选] 板载 USB Serial 需要主机 → SET_CONFIGURATION。
+ *      等待 stdio_usb_connected() 超时 5s（LED 闪烁标识等待中）
+ *   1. stdio_init_all (UART0 + USB CDC) ← 已在 hal_console_init 完成
+ *   2. 开中断 + 等 USB 枚举
+ *   3. 打印 Banner
+ *   4. demo_app_init (4 个 demo 任务 + shell)
+ *   5. 自挂起（启动任务一次性） */
+
 static void _boot_setup_task(void *arg) {
     (void)arg;
 
-    /* 控制台已在 kernel_main() (MSP 上下文) 中初始化完毕。
-     * USB 枚举也已在启动前完成。SDK 原生 printf/putchar 可正常输出。 */
+    /* 阶段 9：boot_setup 任务开始运行 */
+    _led_stage(9);
 
     /* — Step 1: 系统滴答定时器 — */
     hal_systick_init(OS_CFG_TICK_HZ);
+
+    /* 阶段 10：systick 初始化完成 */
+    _led_stage(10);
 
     /* 【关键修复】确保全局中断开启
      * sched_start() 中的 svc #0 进入 SVC_Handler，SVC_Handler 内部可能
@@ -94,6 +123,9 @@ static void _boot_setup_task(void *arg) {
      * TIMER_IRQ_0 无法触发 → tick 永远是 0 → task_sleep 永远不唤醒。
      * 在 hal_systick_init 之后显式 cpsie i，确保 systick 中断能触发。 */
     __asm volatile ("cpsie i" ::: "memory");
+
+    /* 阶段 11：中断已开启 */
+    _led_stage(11);
 
     /* — Step 2: 打印启动横幅（USB 已就绪，直接输出） — */
     {
@@ -107,10 +139,16 @@ static void _boot_setup_task(void *arg) {
         hal_console_putc('\r'); hal_console_putc('\n');
     }
 
+    /* 阶段 12：横幅打印完成，准备创建 demo 任务 */
+    _led_stage(12);
+
     /* — Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） — */
     if (&demo_app_init != NULL) {
         demo_app_init();
     }
+
+    /* 阶段 13：demo 任务创建完成 */
+    _led_stage(13);
 
     /* — Step 4: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
     task_suspend(g_current_task);
@@ -129,13 +167,14 @@ static void _boot_setup_task(void *arg) {
  * ================================================================ */
 __attribute__((weak)) int main(void) {
     /* 【核心修复】冷启动阶段**始终关中断**。诊断固件已证实：
-     *   开中断做 USB 枚举 → SDK alarm pool / TinyUSB state machine
-     *   的 IRQ 回调会在 kmem_init / task_module_init 数据结构未
-     *   初始化完成时就跑起来 → 静默损坏内存 → 稍后 HardFault。 */
+     *   开中断做 USB 枚举 → SDK alarm pool / TinyUSB 回调会在 kmem_init / task_module_init 数据结构未初始化完成时就跑起来 → 静默损坏内存 → 稍后 HardFault。 */
     __asm volatile ("cpsid i" ::: "memory");
 
     _led_init();
-    _led_set(0);  /* 灭灯，避免 bootrom 继承亮态干扰判断 */
+    _led_set(0);  /* 灭灯 */
+
+    /* 阶段 1：进入 main */
+    _led_stage(1);
 
     kernel_main();
 
@@ -151,17 +190,34 @@ __attribute__((weak)) int main(void) {
  * kernel_main：冷初始化部分（全部关中断，除了 USB 枚举阶段）
  * ================================================================ */
 void kernel_main(void) {
+    /* 确保 LED GPIO 已初始化（rp2040demo 的 main 覆盖了弱 main，
+     * 不会调用 _led_init，诊断 LED 需要 GPIO 配置才能工作） */
+    _led_init();
+    _led_set(0);
+
+    /* 阶段 2：进入 kernel_main */
+    _led_stage(2);
+
     /* —— 冷初始化 Step 1: 内存管理（关中断安全） —— */
     kmem_init(&__end__, KERNEL_HEAP_SIZE);
 
+    /* 阶段 3：内存初始化完成 */
+    _led_stage(3);
+
     /* —— 冷初始化 Step 2: 任务模块 + idle 任务（关中断安全） —— */
     task_module_init();
+
+    /* 阶段 4：任务模块初始化完成 */
+    _led_stage(4);
 
     /* —— 冷初始化 Step 3: 调度器（空队列安全） —— */
     sched_init();
 
     /* —— 冷初始化 Step 4: 创建 boot_setup 启动任务（栈增大到 1024 以容纳 demo_app_init） —— */
     task_create("boot_setup", _boot_setup_task, NULL, 1024, 3);
+
+    /* 阶段 5：boot_setup 任务创建完成 */
+    _led_stage(5);
 
     /* —— 【关键修复】把控制台初始化移到这里（MSP 上下文，全局中断开启后）
      *
@@ -173,11 +229,32 @@ void kernel_main(void) {
      *   同时必须开启全局中断，让 USBCTRL_IRQ 能驱动 USB 枚举（Windows
      *   枚举 USB 约 100ms），并等待 500ms 确保 SET_CONFIGURATION 完成。 */
     __asm volatile ("cpsie i" ::: "memory");
+
+    /* 阶段 6：开中断，准备初始化控制台 */
+    _led_stage(6);
+
     hal_console_init(115200);
+
+    /* 阶段 7：控制台初始化完成，开始等待 USB 枚举 */
+    _led_stage(7);
+
     for (volatile uint32_t i = 0; i < 50000000; i++) __asm("nop"); /* ~5s wait for USB enum */
+
+    /* 阶段 8：USB 枚举完成，准备启动调度器 */
+    _led_stage(8);
 
     /* —— 冷初始化 Step 5: 启动调度器（内部 cpsie i + msr psp + svc #0） —— */
     sched_start();
+
+    /* 不应到达此处 */
+    while (1) {
+        register uint32_t sio_base = 0xD0000000u;
+        register uint32_t mask25   = 0x02000000u;
+        *(volatile uint32_t *)(sio_base + 0x014) = mask25;
+        for (volatile uint32_t j = 0; j < 6250000; j++) __asm("nop");
+        *(volatile uint32_t *)(sio_base + 0x018) = mask25;
+        for (volatile uint32_t j = 0; j < 6250000; j++) __asm("nop");
+    }
 }
 
 /* ================================================================

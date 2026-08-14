@@ -112,11 +112,13 @@ static void *_kmalloc_internal(size_t size) {
 void *kmalloc(size_t size) {
     if (size == 0) return NULL;
     
-    /* 关中断保护：防止抢占式调度破坏链表操作
-     * （PendSV 可能在遍历/修改链表时触发，导致链表损坏） */
+    /* 保存/恢复 PRIMASK：若调用方已关中断（如 kernel_main 冷初始化），
+     * 不能无条件 cpsie i，否则会在数据结构未初始化时开中断 → HardFault */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     void *ptr = _kmalloc_internal(size);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
     return ptr;
 }
 
@@ -159,10 +161,12 @@ static void _kfree_internal(void *ptr) {
 void kfree(void *ptr) {
     if (!ptr) return;
     
-    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    /* 保存/恢复 PRIMASK */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _kfree_internal(ptr);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 size_t kmem_free_size(void) {

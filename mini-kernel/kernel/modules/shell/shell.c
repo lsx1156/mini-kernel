@@ -48,7 +48,7 @@ extern const char *k_version(void);
  * Shell 基本常量
  * ================================================================ */
 #define SHELL_LINE_SIZE       128   /* 单条命令最大长度 */
-#define SHELL_MAX_ARGS        4     /* 最大参数个数（含命令本身） */
+#define SHELL_MAX_ARGS        10    /* 最大参数个数（含命令本身，gpio init af 等需要 5+） */
 #define SHELL_PROMPT_STR      "mk> "
 #define SHELL_TASK_NAME       "shell"
 #define SHELL_TASK_STACK      768   /* 行解析 + 打印任务列表足够 */
@@ -111,6 +111,7 @@ static int cmd_kill(int argc, char **argv);
 static int cmd_clear(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_syscalls(int argc, char **argv);
+static int cmd_gpio(int argc, char **argv);
 
 /* ================================================================
  * 命令表（驱动扩展：新增命令只需加一行）
@@ -126,6 +127,8 @@ static const shell_cmd_t g_cmd_table[] = {
     { "kill",    cmd_kill,    "kill <id>",             "销毁指定 ID 的任务（不可恢复）" },
     { "clear",   cmd_clear,   "clear | cls",           "清屏并将光标移至左上角" },
     { "led",     cmd_led,     "led on | off | toggle", "控制 RP2040 板载 LED (GPIO25)" },
+    { "gpio",    cmd_gpio,    "gpio help | init ... | read <pin> | write <pin> 0|1 | toggle <pin>",
+                                                    "GPIO 子命令：初始化/读/写/翻转任意 RP2040 引脚" },
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
@@ -368,6 +371,158 @@ static int cmd_syscalls(int argc, char **argv) {
 }
 
 /* ================================================================
+ * gpio 子命令解析（预编译指令集风格，底层复用 HAL hal_gpio_*）
+ *
+ * 子命令表（对应 Linux GPIO sysfs / raspi-gpio 风格）：
+ *   gpio help
+ *   gpio init  <pin> in                    # 输入浮空
+ *   gpio init  <pin> out    [0|1]          # 推挽输出，可选初始电平(默认低)
+ *   gpio init  <pin> out_od [0|1]          # 开漏输出，可选初始电平
+ *   gpio init  <pin> af <af_num>           # 复用功能（SPI/I2C/UART等 FUNCn）
+ *   gpio read  <pin>                       # 读引脚电平，输出 0 / 1
+ *   gpio write <pin> <0|1>                 # 写输出电平（高/低）
+ *   gpio toggle <pin>                      # 翻转引脚
+ * ================================================================ */
+
+/* 把字符串解析为非负整数（失败返回 -1） */
+static int shell_parse_uint(const char *s, uint32_t *out) {
+    if (!s || !*s) return -1;
+    uint32_t v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10u + (uint32_t)(*p - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+static void gpio_help(void) {
+    shell_puts("GPIO subcommands (pin=0..29 for RP2040, 30+ = QSPI/SWCLK reserved):\r\n");
+    shell_puts("  gpio help                        打印本帮助\r\n");
+    shell_puts("  gpio init  <pin> in              初始化: 浮空输入\r\n");
+    shell_puts("  gpio init  <pin> out   [0|1]     初始化: 推挽输出，可选初始电平(默认0)\r\n");
+    shell_puts("  gpio init  <pin> out_od [0|1]    初始化: 开漏输出，可选初始电平\r\n");
+    shell_puts("  gpio init  <pin> af <af_num>     初始化: 复用功能(0=FUNC0/SPI .. 5=FUNC5/SIO)\r\n");
+    shell_puts("  gpio read  <pin>                 读引脚电平 -> 打印 0 或 1\r\n");
+    shell_puts("  gpio write <pin> <0|1>           设置输出电平\r\n");
+    shell_puts("  gpio toggle <pin>                翻转输出电平\r\n");
+    shell_puts("Examples:\r\n");
+    shell_puts("  gpio init 25 out 1        # GPIO25(板载LED) 推挽输出 初始高电平\r\n");
+    shell_puts("  gpio toggle 25            # 翻转 LED\r\n");
+    shell_puts("  gpio init 0 af 2          # GPIO0=FUNC2(UART0_TX)\r\n");
+    shell_puts("  gpio read 5               # 读 GPIO5 电平\r\n");
+}
+
+static int cmd_gpio(int argc, char **argv) {
+#if OS_CFG_PERIPH_SERVICE
+    /* argv[0] = "gpio"  子命令在 argv[1] */
+    if (argc < 2) { gpio_help(); return 1; }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "help") == 0) {
+        gpio_help();
+        return 0;
+    }
+
+    if (strcmp(sub, "init") == 0) {
+        if (argc < 4) { shell_puts("Usage: gpio init <pin> in | out [0|1] | out_od [0|1] | af <af_num>\r\n"); return 1; }
+        uint32_t pin = 0;
+        if (shell_parse_uint(argv[2], &pin) != 0) {
+            shell_puts("Invalid pin number (must be 0..29)\r\n"); return 1;
+        }
+        const char *mode = argv[3];
+
+        if (strcmp(mode, "in") == 0) {
+            hal_err_t r = hal_gpio_init(pin, HAL_GPIO_IN, 0);
+            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init IN failed (pin invalid)\r\n"); return 1; }
+            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = INPUT (floating)\r\n");
+            return 0;
+        }
+        if (strcmp(mode, "out") == 0) {
+            uint32_t init_val = 0;
+            if (argc >= 5) {
+                if (shell_parse_uint(argv[4], &init_val) != 0 || init_val > 1) {
+                    shell_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
+                }
+            }
+            hal_err_t r = hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
+            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init OUT failed\r\n"); return 1; }
+            hal_gpio_write(pin, init_val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
+            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = OUTPUT-PP, level="); shell_put_uint32(init_val); shell_puts("\r\n");
+            return 0;
+        }
+        if (strcmp(mode, "out_od") == 0) {
+            uint32_t init_val = 0;
+            if (argc >= 5) {
+                if (shell_parse_uint(argv[4], &init_val) != 0 || init_val > 1) {
+                    shell_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
+                }
+            }
+            hal_err_t r = hal_gpio_init(pin, HAL_GPIO_OUT_OD, 0);
+            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init OUT_OD failed\r\n"); return 1; }
+            hal_gpio_write(pin, init_val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
+            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = OUTPUT-OD, level="); shell_put_uint32(init_val); shell_puts("\r\n");
+            return 0;
+        }
+        if (strcmp(mode, "af") == 0) {
+            if (argc < 5) { shell_puts("Usage: gpio init <pin> af <af_num> (0..9 for FUNC0..FUNC9)\r\n"); return 1; }
+            uint32_t af_num = 0;
+            if (shell_parse_uint(argv[4], &af_num) != 0 || af_num > 9) {
+                shell_puts("Invalid af_num (must be 0..9). RP2040: 0=SPI,1=UART0,2=UART1,3=I2C0,4=I2C1,5=SIO,6=PWM,7=SIO/PIO,...\r\n");
+                return 1;
+            }
+            hal_err_t r = hal_gpio_init(pin, HAL_GPIO_AF, af_num);
+            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init AF failed\r\n"); return 1; }
+            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = ALT-FUNC"); shell_put_uint32(af_num); shell_puts("\r\n");
+            return 0;
+        }
+        shell_puts("Unknown gpio mode: '"); shell_puts(mode); shell_puts("' (expected: in|out|out_od|af)\r\n");
+        return 1;
+    }
+
+    if (strcmp(sub, "read") == 0) {
+        if (argc < 3) { shell_puts("Usage: gpio read <pin>\r\n"); return 1; }
+        uint32_t pin = 0;
+        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
+        hal_gpio_level_t lv = hal_gpio_read(pin);
+        shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" = ");
+        shell_puts((lv == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
+        shell_puts("\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "write") == 0) {
+        if (argc < 4) { shell_puts("Usage: gpio write <pin> <0|1>\r\n"); return 1; }
+        uint32_t pin = 0, val = 0;
+        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
+        if (shell_parse_uint(argv[3], &val) != 0 || val > 1) { shell_puts("Invalid value (must be 0 or 1)\r\n"); return 1; }
+        hal_gpio_write(pin, val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
+        shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = "); shell_put_uint32(val); shell_puts("\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "toggle") == 0) {
+        if (argc < 3) { shell_puts("Usage: gpio toggle <pin>\r\n"); return 1; }
+        uint32_t pin = 0;
+        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
+        hal_gpio_toggle(pin);
+        shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" toggled. Now = ");
+        shell_puts((hal_gpio_read(pin) == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
+        shell_puts("\r\n");
+        return 0;
+    }
+
+    shell_puts("Unknown gpio subcommand: '"); shell_puts(sub); shell_puts("' (try 'gpio help')\r\n");
+    return 1;
+
+#else /* !PERIPH_SERVICE */
+    (void)argc; (void)argv;
+    shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, GPIO HAL not linked. Set =1 in os_config.h.\r\n");
+    return 1;
+#endif
+}
+
+/* ================================================================
  * 行解析器：按"空格"拆分 argv[0..argc-1]
  * ================================================================ */
 static int shell_split_argv(char *line, char **argv, int max_args) {
@@ -390,6 +545,27 @@ static int shell_split_argv(char *line, char **argv, int max_args) {
  * 执行单条命令
  * ================================================================ */
 static int shell_exec_line(char *line) {
+    /* 容错：自动跳过行开头的提示符残留（用户粘贴整个会话时最常出现）
+     *   匹配前缀: "mk>" "mk> " ">" "> " "shell>" "shell> "
+     *   只要前缀命中，指针 line 前进到其后的第一个非空白字符。
+     *   这样用户粘贴 "mk> led on" 也能正确解析为命令 "led on"。 */
+    {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "mk>", 3) == 0) {
+            p += 3;
+            if (*p == ' ') p++;
+            line = p;
+        } else if (strncmp(p, "shell>", 6) == 0) {
+            p += 6;
+            if (*p == ' ') p++;
+            line = p;
+        } else if (*p == '>') {
+            p++;
+            if (*p == ' ') p++;
+            line = p;
+        }
+    }
     static char *argv[SHELL_MAX_ARGS];
     int argc = shell_split_argv(line, argv, SHELL_MAX_ARGS);
     if (argc == 0) return 0;   /* 空行 */
@@ -453,13 +629,18 @@ static void task_shell(void *arg) {
         }
 
         if (c != 0) {
-            /* LED 短闪标识收到字符（用 SIO OUT_SET/CLR，不用 sleep 阻塞）。
-             * 注意：此处不做回显，统一在下面 switch 分支里按语义回显，
-             * 避免 \b 退格 / \r 回车 / 可打印字符被双重回显导致乱码。 */
-            *(volatile uint32_t *)(0xD0000000u + 0x014) = 0x02000000u; /* LED ON */
-            __asm volatile ("nop" ::: "memory");
-            __asm volatile ("nop" ::: "memory");
-            *(volatile uint32_t *)(0xD0000000u + 0x018) = 0x02000000u; /* LED OFF */
+            /* 【已移除字符 LED 短闪副作用】
+             *   旧代码每收到一个字符都会做：SIO_OUT_SET(GPIO25) → 2 nop → SIO_OUT_CLR(GPIO25)，
+             *   目的是诊断 USB 字符是否到达；但副作用是：
+             *     · 用户使用 `led on` 或 `gpio write 25 1` 把 GPIO25 设为高电平后，
+             *       每输入一个字母都会被无条件 SIO_OUT_CLR(GPIO25) 强制拉低 → LED 熄灭。
+             *     · 用户命令 `gpio write 25 0` 设为低后，每输入一个字母也会被 SET → 闪干扰。
+             *
+             *   现在 USB 双向链路已完全稳定（hal_console_getc + EP1 旁路都工作正常），
+             *   不再需要这种破坏性的硬件级字符指示，直接移除。
+             *
+             *   如需"收到字符"指示，应用层应通过 shell 回显字符来感知（本 switch 已处理），
+             *   绝不能直接操纵可能被用户业务使用的 GPIO。 */
         } else {
             /* 无字符 → 让渡 CPU 1ms（提高轮询频率） */
             task_sleep(1);

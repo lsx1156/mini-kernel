@@ -133,27 +133,23 @@ static void task_led(void *arg) {
     }
 }
 
-/* USB 诊断用 HAL 层 API（绕过 TinyUSB 接收软件层）*/
-extern uint32_t hal_usb_force_poll_and_snapshot(uint32_t *inte_after, uint32_t *iser_after,
-                                                uint32_t *safe_mask_written,
-                                                uint32_t *dcd_enable_calls);
-extern uint32_t hal_usb_diag_ep1_ring_count(void);
-extern uint32_t hal_usb_diag_ep1_hw_avail(void);
-extern uint32_t hal_usb_diag_setup_count(void);
-extern uint32_t hal_usb_diag_setup_w0(void);
-extern uint32_t hal_usb_diag_setup_w1(void);
-extern uint32_t hal_usb_diag_mask_write_count(void);
-extern uint32_t hal_usb_diag_dcd_handler_count(void);
-extern bool tud_cdc_n_available(uint8_t itf);
-
 /* ================================================================
- * 演示任务 2：心跳日志（每 1s 打印一次系统状态）
- * 前 5 次心跳附带完整 USB 诊断：force_poll → 快照 → 打印
+ * 演示任务 2：心跳日志（每 5s 打印一次系统状态）
+ *
+ * 【日志频率调整说明】
+ *   原版每 1s 打印一次 HEART + 前 10 beat 打印 [U1..U10] USB 诊断，
+ *   与 mem/ctrl 任务一起导致串口每秒 2~3 条日志刷屏，用户根本来不及
+ *   输入 shell 命令（help）。现调整为：
+ *     · heartbeat: 每 5s 打 1 次（频率降为原来的 1/5）
+ *     · mem 压力测试: 每 10s 打 1 次（频率降为原来的 1/5）
+ *     · ctrl 任务: 每 15s 做 1 次 suspend/resume（LED 状态切换间隔拉长）
+ *     · [U...] USB 诊断：**完全移除**（USB 接收链路已经稳定工作）。
+ *                     若以后要诊断 USB 问题，在 shell 里加专门命令。
  * ================================================================ */
 static void task_heartbeat(void *arg) {
     (void)arg;
     uint32_t cnt = 0;
-    demo_puts("[HEART ] Task started, tick=1Hz status log\r\n");
+    demo_puts("[HEART ] Task started, tick=1/5Hz status log\r\n");
 
     while (1) {
         cnt++;
@@ -167,77 +163,21 @@ static void task_heartbeat(void *arg) {
         demo_puts(g_current_task ? g_current_task->name : "?");
         demo_puts("\r\n");
 
-        /* 前 10 beat 做完整 USB 诊断（前 5 次含强制修复，后 5 次验证链路）。
-         *   【INTE/NVIC 状态】
-         *   I0 = poll 前 INTE（TinyUSB 正常时≠0；被 dcd_int_disable 抢占未配对
-         *        恢复时=0，此时触发条件式恢复）
-         *   I  = poll 后 INTE（正常时由 TinyUSB 维护，异常时=0x0009004D 安全掩码）
-         *   V  = poll 后 ISER bit21（NVIC USBCTRL_IRQ 使能位，期望=1）
-         *   MW = 累计手动写 INTE 安全掩码次数（仅在 INTE==0 且 dcd_int_enable
-         *        失败时 +1，正常时应缓慢增长或停滞）
-         *   DH = 累计 dcd_int_handler 调用次数（每次 poll 都 +1，是路径
-         *        畅通的最直接证明）
-         *
-         *   【EP0 SETUP / Control Request（最关键！必须>0 Windows才会发数据）】
-         *   S  = 累计收到的不同 SETUP 包数量
-         *        - S=0: Windows 还没发任何 Control Request（没打开串口 / 没断开重连）
-         *        - S=1: 只收到 1 个（通常是 SET_LINE_CODING 0x20，还差 SET_CONTROL_LINE_STATE）
-         *        - S≥2: 收到 2 个以上（CDC 初始化完成，Windows 应该开始发用户数据了）
-         *   W0 = 最近 SETUP 包字节 0-3（bRequest 在 byte1：0x20=SET_LINE_CODING，0x22=SET_CONTROL_LINE_STATE）
-         *   W1 = 最近 SETUP 包字节 4-7
-         *
-         *   【EP1 OUT 数据接收】
-         *   H  = BUFSTAT.EP1_OUT_AVAIL（主机发了包=1）
-         *   R  = 私有 ring buffer 可读字节数（>0 表示 HAL 读到了）
-         *   A  = TinyUSB tud_cdc_n_available（仅参考） */
-        if (cnt >= 1 && cnt <= 10) {
-            uint32_t inte_before = *(volatile uint32_t *)0x50110014u; /* poll 前 */
-            uint32_t inte_after, iser_after, m_written, c_calls;
-            hal_usb_force_poll_and_snapshot(&inte_after, &iser_after,
-                                            &m_written, &c_calls);
-            uint32_t hw_avail = hal_usb_diag_ep1_hw_avail();
-            uint32_t ring_cnt = hal_usb_diag_ep1_ring_count();
-            uint32_t sw_avail = (uint32_t)tud_cdc_n_available(0);
-            uint32_t sc = hal_usb_diag_setup_count();
-            uint32_t s0 = hal_usb_diag_setup_w0();
-            uint32_t s1 = hal_usb_diag_setup_w1();
-            uint32_t mw = hal_usb_diag_mask_write_count();
-            uint32_t dh = hal_usb_diag_dcd_handler_count();
-            (void)m_written;  /* 单次返回值未使用，改用累计计数器 mw */
-            (void)c_calls;    /* 同上 */
+        /* 每次 beat 都保持一次 hal_usb_poll（含条件式 INTE 恢复 + EP1 OUT 搬）
+         * 以维持 USB CDC 双向通畅，**但不再打印 USB 诊断**。 */
+        extern void hal_usb_poll(void);
+        hal_usb_poll();
 
-            demo_puts("[U"); demo_put_uint32(cnt);
-            demo_puts("]I0="); demo_put_hex32(inte_before);
-            demo_puts(" I=");  demo_put_hex32(inte_after);
-            demo_puts(" V=");  demo_put_uint32(iser_after);
-            demo_puts(" MW="); demo_put_uint32(mw);
-            demo_puts(" DH="); demo_put_uint32(dh);
-            demo_puts(" S=");  demo_put_uint32(sc);
-            demo_puts(" W0="); demo_put_hex32(s0);
-            demo_puts(" W1="); demo_put_hex32(s1);
-            demo_puts(" H=");  demo_put_uint32(hw_avail);
-            demo_puts(" R=");  demo_put_uint32(ring_cnt);
-            demo_puts(" A=");  demo_put_uint32(sw_avail);
-            demo_puts("\r\n");
-            if (cnt == 1) {
-                demo_puts("[U1提示] 操作步骤：1)关闭当前串口 2)重新打开(或断开重连USB线) 3)在输入框输入 help 回车。观察：S应从0变≥2（收到Control Request），然后H=1且R>0（收到help字符）。W0 byte1=0x20(SET_LINE_CODING)/0x22(SET_CONTROL_LINE_STATE)。MW正常时应停滞或缓慢增长（仅在INTE=0异常时+1）。\r\n");
-            }
-        } else {
-            /* 非诊断 beat 也保持 poll（含条件式 INTE 恢复 + EP1 OUT 搬） */
-            extern void hal_usb_poll(void);
-            hal_usb_poll();
-        }
-
-        task_sleep(1000);
+        task_sleep(5000);   /* 5s at 1kHz tick */
     }
 }
 
 /* ================================================================
- * 演示任务 3：内存压力测试（每 2s 一轮 alloc/free）
+ * 演示任务 3：内存压力测试（每 10s 一轮 alloc/free）
  * ================================================================ */
 static void task_mem_stress(void *arg) {
     (void)arg;
-    demo_puts("[MEM   ] Task started, stress test every 2s\r\n");
+    demo_puts("[MEM   ] Task started, stress test every 10s\r\n");
     uint32_t round = 0;
 
     while (1) {
@@ -297,7 +237,7 @@ static void task_mem_stress(void *arg) {
             demo_puts("\r\n");
         }
 
-        task_sleep(2000);
+        task_sleep(10000);   /* 10s at 1kHz tick */
     }
 }
 
@@ -306,12 +246,12 @@ static void task_mem_stress(void *arg) {
  * ================================================================ */
 static void task_ctrl(void *arg) {
     (void)arg;
-    demo_puts("[CTRL  ] Task started, suspend/resume LED every 5s\r\n");
+    demo_puts("[CTRL  ] Task started, suspend/resume LED every 15s\r\n");
     int suspended = 0;
 
     while (1) {
-        /* 先等 5 秒让它跑一会儿 */
-        task_sleep(5000);
+        /* 先等 15 秒让它跑一会儿 */
+        task_sleep(15000);
 
         if (g_demo_led_task) {
             if (!suspended) {
@@ -329,11 +269,25 @@ static void task_ctrl(void *arg) {
 
 /* ================================================================
  * Demo 总入口（由 kernel_main 在启动调度器前调用）
+ *
+ * 【架构调整 — 仅命令触发输出】
+ *   用户需求："每次输入完指令后才会回复日志及操作的返回结果"。
+ *   这意味着系统需要是"纯同步交互式"的，任何异步后台任务（heartbeat
+ *   每秒 1 条 / mem 每 2s 1 轮 / ctrl 每 5s 1 次 / LED 任务 500ms 闪烁）
+ *   都不应该再向串口周期性打印日志 —— 否则会打断用户输入，并且与
+ *   "仅命令触发" 的交互模型冲突。
+ *
+ *  策略：
+ *    · 不再创建 led / heartbeat / mem_stress / ctrl 4 个演示任务
+ *      （这些任务的功能都可以通过 shell 命令手动触发）
+ *    · 只保留 shell 任务：用户输入命令 → 解析 → 操作硬件 → 打印结果
+ *    · hal_usb_poll() 由 shell 主循环的 hal_console_getc /
+ *      getchar_timeout_us 路径内部维持，无需 heartbeat 任务。
  * ================================================================ */
 void demo_app_init(void) {
     demo_puts("\r\n");
     demo_puts("========================================\r\n");
-    demo_puts("  Mini Kernel Demo App Starting...\r\n");
+    demo_puts("  Mini Kernel Demo Platform Ready\r\n");
     demo_puts("========================================\r\n");
     demo_puts("Kernel version: ");
     demo_puts(k_version());
@@ -356,36 +310,19 @@ void demo_app_init(void) {
     demo_puts("\r\n");
     demo_puts("========================================\r\n\r\n");
 
-    /* 创建各演示任务 —— 栈大小、权重不同，体现权重调度效果
-     * 检查返回值，防止内存不足时继续执行导致崩溃 */
-    g_demo_led_task       = task_create("led",       task_led,       NULL, 384, 1);
-    if (!g_demo_led_task) {
-        demo_puts("[BOOT  ] WARN: LED task creation FAILED (heap may be low)\r\n");
-    }
-    
-    g_demo_heartbeat_task = task_create("heartbeat", task_heartbeat, NULL, 768, 2);  /* 权重高一点 */
-    if (!g_demo_heartbeat_task) {
-        demo_puts("[BOOT  ] WARN: Heartbeat task creation FAILED\r\n");
-    }
-    
-    tcb_t *mem_task = task_create("mem",    task_mem_stress, NULL, 768, 1);
-    if (!mem_task) {
-        demo_puts("[BOOT  ] WARN: Mem task creation FAILED\r\n");
-    }
-    
-    tcb_t *ctrl_task = task_create("ctrl",   task_ctrl,       NULL, 384, 1);
-    if (!ctrl_task) {
-        demo_puts("[BOOT  ] WARN: Ctrl task creation FAILED\r\n");
-    }
+    demo_puts("[BOOT  ] Mode: Sync-Interactive (commands only, no async logs)\r\n");
+    demo_puts("[BOOT  ] Supported buses: GPIO ");
+#if OS_CFG_PERIPH_SERVICE
+    demo_puts("SPI I2C UART ");
+#endif
+    demo_puts("\r\n");
+    demo_puts("[BOOT  ] Creating interactive shell task...\r\n");
 
-    demo_puts("[BOOT  ] 4 demo tasks created. Starting scheduler...\r\n");
-    demo_dump_task_list();
-
-    /* 创建交互式 Shell 任务（OS_CFG_SHELL=1 → USB CDC + UART0 双通道 SSH 风格交互）
-       会自动再向 task pool 申请 1 个 TCB（=共 5 个用户任务 + 1 idle） */
+    /* 创建交互式 Shell 任务（USB CDC + UART0 双通道）
+     *   这是本平台唯一持续运行的用户任务。
+     *   Shell 模式：输入命令 → 同步执行 → 打印结果 → 等待下一条命令。 */
     shell_start();
-    demo_puts("[BOOT  ] Interactive shell task started.\r\n");
-    demo_puts("[BOOT  ] Connect USB CDC COMx / UART0 115200 and type 'help'.\r\n\r\n");
+    demo_puts("[BOOT  ] Shell ready. Connect USB CDC COMx and type 'help' or 'gpio help'.\r\n\r\n");
 }
 
 #else /* !OS_CFG_DEMO_APP —— 关闭 demo 时的空桩，保证链接无未定义符号 */

@@ -29,7 +29,7 @@
 /* ================================================================
  * 3. 扩展模块裁剪（按需开启，关闭后代码完全不编入）
  * ================================================================ */
-#define OS_CFG_PERIPH_SERVICE         0   /* 共享总线服务（SPI/I2C/UART）—— 模块暂未实现 */
+#define OS_CFG_PERIPH_SERVICE         1   /* 共享总线服务（GPIO/SPI/I2C/UART）—— shell 命令直接操纵 */
 #define OS_CFG_SHELL                  1   /* 命令行终端                   */
 #define OS_CFG_VFS                    0   /* 虚拟文件系统接口 —— 模块暂未实现 */
 #define OS_CFG_FATFS                  0   /* 裁剪版 FatFs（需 VFS=1）      */

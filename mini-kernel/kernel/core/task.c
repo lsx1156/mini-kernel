@@ -133,7 +133,9 @@ void task_destroy(tcb_t *task) {
      * 调用者应先 task_suspend(task) 再等下一次调度后销毁，或仅销毁非自身任务。 */
     if (task == g_current_task) return;
 
-    /* 关中断保护队列操作和状态修改 */
+    /* 关中断保护队列操作和状态修改，保存/恢复 PRIMASK */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     
     /* 从所在队列移除（就绪队列或睡眠队列）。
@@ -158,7 +160,7 @@ void task_destroy(tcb_t *task) {
     }
     task->state = TASK_STATE_DEAD;
     
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 
     /* 释放栈与 TCB（kfree 内部有关中断保护） */
     if (task->stack_base) {
@@ -185,29 +187,30 @@ void task_sleep(uint32_t ticks) {
     tcb_t *task = g_current_task;
     if (!task) return;
 
-    /* 关中断保护队列操作：防止 TIMER_IRQ_0 在 ready_remove 与 sleep_enqueue
-     * 之间触发 PendSV → sched_do_switch 此时任务不在任何队列 → 任务永久丢失。
-     * 顺序：关中断 → 改状态+移队列 → 设 PendSV → 开中断（PendSV 立即生效）。
-     * 使用内部版本避免重复关中断。 */
+    /* 保存/恢复 PRIMASK，使用内部版本避免重复关中断 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     task->state = TASK_STATE_SLEEP;
     task->ticks_to_sleep = ticks;
     _sched_ready_remove(task);
     _sched_sleep_enqueue(task);
     hal_yield_trigger();        /* 设 PendSV pending（此时中断关着，不会立即触发） */
-    __asm volatile ("cpsie i" ::: "memory");  /* 开中断 → PendSV 立即进入 */
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");  /* 恢复 → PendSV 立即进入 */
 }
 
 void task_wakeup(tcb_t *task) {
     if (!task || task->state != TASK_STATE_SLEEP) return;
 
-    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    /* 保存/恢复 PRIMASK，使用内部版本避免重复关中断 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     _sched_sleep_remove(task);
     task->state = TASK_STATE_READY;
     task->ticks_to_sleep = 0;
     _sched_ready_enqueue(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 /* ================================================================
@@ -221,7 +224,9 @@ void task_suspend(tcb_t *task) {
     if (!task || task == &g_idle_task) return;
     int self_suspend = 0;
     
-    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    /* 保存/恢复 PRIMASK，使用内部版本避免重复关中断 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     
     switch (task->state) {
@@ -236,12 +241,12 @@ void task_suspend(tcb_t *task) {
             self_suspend = 1;
             break;
         default:
-            __asm volatile ("cpsie i" ::: "memory");
+            __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
             return;  /* DEAD / SUSPEND 等不处理 */
     }
     task->state = TASK_STATE_SUSPEND;
     
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
     
     /* 自我挂起时主动触发 PendSV，让调度器切到下一个任务。
      * sched_do_switch 看到 from->state != RUNNING 不会把当前任务入就绪队列。 */
@@ -253,12 +258,14 @@ void task_suspend(tcb_t *task) {
 void task_resume(tcb_t *task) {
     if (!task || task->state != TASK_STATE_SUSPEND) return;
     
-    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    /* 保存/恢复 PRIMASK，使用内部版本避免重复关中断 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
     __asm volatile ("cpsid i" ::: "memory");
     /* 恢复到 READY 状态（原 SLEEP 任务直接就绪，忽略剩余睡眠） */
     task->state = TASK_STATE_READY;
     _sched_ready_enqueue(task);
-    __asm volatile ("cpsie i" ::: "memory");
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
 }
 
 /* ================================================================
