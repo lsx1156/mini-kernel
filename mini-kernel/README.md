@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.2.2 ✅ STABLE`（已在 RP2040 demo 上通过 build.bat 完整编译验证）
+> **当前版本**：`2.2.3 ✅ STABLE`（已在 RP2040 demo 上通过 build.bat clean rebuild 验证；修复首启动死机 Bug）
 >
 > **v2.2 大版本亮点**
 > - ✨ USB 插电脑 **同时弹出**：CDC 串口（命令行调试 COMx）**+** MSC 可读写 U 盘盘符
@@ -83,7 +83,8 @@ project/
 | **v0.2.1** | ✅ Archived | **启动速度优化**：10s+ → <500ms；新增 `MK_BOOT_DIAG_LED` 宏（默认 0）；删除 5s USB 枚举忙等 |
 | **v2.2.0** | ✅ Released | **大版本**：USB Composite (CDC+MSC) + FatFs FAT16 + Shell 目录命令 + 三分区 Flash 布局 |
 | **v2.2.1** | ✅ Released | README 彻底重写（补全特性表/分区图/命令手册/架构图）+ 可移植内核独立 FatFs 初始化（不依赖 demo_app.c） |
-| **v2.2.2** | ✅ **当前稳定** | 🛑 **定位澄清：≠RTOS**（两个 README 新增 RTOS vs 分时内核对比表；仓库首页 project/README 从 v0.1 同步到 v2.2，删除错误"轻量级 RTOS 内核"命名） |
+| **v2.2.2** | ✅ Released | 🛑 **定位澄清：≠RTOS**（两个 README 新增 RTOS vs 分时内核对比表；仓库首页 project/README 从 v0.1 同步到 v2.2，删除错误"轻量级 RTOS 内核"命名） |
+| **v2.2.3** | ✅ **当前稳定** | 🐛 **修复首启动死机 v2.2.1 回归**：① boot_setup_task 栈 1024 → 2048（f_mkfs 格式化最坏栈溢出写坏 kmem/TCB → HardFault）；② fatfs_init_and_mount() 从 demo_app_init 之前挪到之后（恢复 v2.2.0 时序：shell_start → mount；OS_CFG_DEMO_APP=0 空桩后仍独立执行）；③ demo_app.c 默认 KERNEL_VERSION_STR 从 2.2.0 UNTESTED 同步到 v2.2.3 |
 | v2.3 | 📋 规划 | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示 |
 | v3.0 | 🗓️ 规划 | VFS 抽象层 + 多分区 + SD Card (SPI1) |
 | v3.5 | 🗓️ 规划 | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植 |
@@ -229,7 +230,7 @@ E:\ppCD\project\rp2040demo\build\build.log         ← 编译日志（失败看 
 ========================================
   Mini Kernel Demo Platform Ready
 ========================================
-Kernel version: 2.2.2 ✅ STABLE
+Kernel version: 2.2.3 ✅ STABLE
 Config: MAX_TASKS=16  HEAP=8192B  TICK_HZ=1000  TIME_SLICE=5
 PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
 ========================================
@@ -258,7 +259,7 @@ PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
 
 ========================================
   Mini Kernel Interactive Shell Ready
-  Version: 2.2.2 ✅ STABLE
+  Version: 2.2.3 ✅ STABLE
   Type 'help' to list commands.
 ========================================
 

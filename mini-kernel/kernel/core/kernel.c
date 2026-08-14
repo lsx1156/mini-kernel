@@ -165,29 +165,6 @@ static void _boot_setup_task(void *arg) {
     /* 阶段 12：横幅打印完成，准备创建 demo 任务 */
     _led_stage(12);
 
-    /* ── v2.2: FatFs / MSC 分区初始化（可移植内核独立完成，不依赖 demo 应用）
-     *
-     *   为什么放在 kernel.c 而非 examples/demo_app.c：
-     *     · mini-kernel 的可移植定位是"对外提供内核服务 + 文件系统"；
-     *     · OS_CFG_DEMO_APP=0（关闭示例 app）时，用户自有应用也应该
-     *       能用到 FatFs + Shell 的目录命令，不能要求用户自己调用
-     *       fatfs_init_and_mount()。
-     *
-     *   幂等安全：fatfs_init_and_mount() 内部 s_fs_mounted=true 直接返回 FR_OK，
-     *     所以 demo_app.c / shell.c 再次调用也不会重复挂载 / 重复 mkfs。
-     *
-     *   头文件隔离：fatfs_api.h 内部 #include "ff.h"，当 OS_CFG_FATFS=0 时
-     *     fatfs shim 目录不在 include path，直接 #include 会编译错。因此用
-     *     extern 前向声明，整个块也放在 #if OS_CFG_FATFS 中，关闭时被
-     *     预处理器彻底移除。
-     * ──────────────────────────────────────────────────────────────── */
-#if OS_CFG_FATFS
-    {
-        extern int fatfs_init_and_mount(void);   /* FRESULT 与 int 兼容 */
-        (void)fatfs_init_and_mount();            /* 结果忽略：demo app / Shell banner 会做更详细诊断打印 */
-    }
-#endif
-
     /* ── Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） ──
      * 【v0.2.0-beta 修复：**绝对不要在 demo_app_init 返回后再写 GPIO25！**】
      *   之前的 bug：demo_app_init 内部调用 shell_start() → bootscript_run_all()
@@ -207,6 +184,44 @@ static void _boot_setup_task(void *arg) {
     if (&demo_app_init != NULL) {
         demo_app_init();
     }
+
+    /* ── v2.2.3: FatFs / MSC 分区初始化（可移植内核独立完成，不依赖 demo 应用）
+     *
+     *  ⚠️ 【为什么放在 demo_app_init 之后（= 原 v2.2.0 位置），不能在前面？】
+     *  1. 【修复死机 Bug v2.2.1】boot_setup_task 栈很小（虽然已经从 1024 扩到
+     *     2048），首启动空片时 fatfs_init_and_mount → f_mkfs() 内部调用链极深
+     *     （FatFs 格式化计算 FAT 表、分簇、大量局部变量），demo_app_init() 内部
+     *     的 shell_start() 会调用 bootscript_run_all()，boot_setup_task 的
+     *     调用栈深度如果在 banner 打印帧 + 前置函数帧基础上，再立刻跑
+     *     f_mkfs，容易在 1024 栈顶时硬爆栈 → 写坏 kmem 链表头 / 就绪队列
+     *     → 调度器 HardFault 死机，用户看到"根本开不了机"。
+     *  2. 【时序一致】OS_CFG_DEMO_APP=1（RP2040 demo 默认开）时，demo_app_init()
+     *     里本来就已经调用过 fatfs_init_and_mount()（见 demo_app.c L398），
+     *     我们放在它之后，s_fs_mounted=true 直接返回 FR_OK（幂等安全），
+     *     不会重复 mkfs；而且运行顺序严格恢复到 v2.2.0 用户验证通过的：
+     *        shell_start() → fatfs_init_and_mount()
+     *  3. 【OS_CFG_DEMO_APP=0 不依赖 example】demo_app_init 是空桩直接返回，
+     *     我们仍在这之后执行 fatfs_init_and_mount()，确保关闭示例应用时
+     *     用户自有应用也能自动用到 FatFs + Shell 目录命令。
+     *
+     *  ⚠️ 【boot_setup_task 栈大小说明 v2.2.3】
+     *     task_create("boot_setup", 栈 1024 → 2048)：f_mkfs 在 FF_USE_LFN=0
+     *     下的最坏栈也需要 ~800B（DIR + FILINFO + MKFS_PARM + FatFs 内部
+     *     多层调用帧），1024 字节在 banner 打印帧之后的连续调用下，留的
+     *     安全边界只有 ~150B，首启动触发格式化时 100% 越界写。
+     *     扩到 2048 后给格式化 / Shell 启动命令回放留 1KB 安全边界。
+     *
+     *   头文件隔离：fatfs_api.h 内部 #include "ff.h"，当 OS_CFG_FATFS=0 时
+     *     fatfs shim 目录不在 include path，直接 #include 会编译错。因此用
+     *     extern 前向声明，整个块也放在 #if OS_CFG_FATFS 中，关闭时被
+     *     预处理器彻底移除。
+     * ──────────────────────────────────────────────────────────────── */
+#if OS_CFG_FATFS
+    {
+        extern int fatfs_init_and_mount(void);   /* FRESULT 与 int 兼容（返回值 0-20，枚举 1 字节，ARM AAPCS r0 返回） */
+        (void)fatfs_init_and_mount();            /* 结果忽略：demo app / Shell banner 会做更详细诊断打印 */
+    }
+#endif
 
     /* — Step 4: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
     task_suspend(g_current_task);
@@ -271,8 +286,8 @@ void kernel_main(void) {
     /* —— 冷初始化 Step 3: 调度器（空队列安全） —— */
     sched_init();
 
-    /* —— 冷初始化 Step 4: 创建 boot_setup 启动任务（栈增大到 1024 以容纳 demo_app_init） —— */
-    task_create("boot_setup", _boot_setup_task, NULL, 1024, 3);
+    /* —— 冷初始化 Step 4: 创建 boot_setup 启动任务（栈增大到 2048 以容纳 demo_app_init + f_mkfs 最坏栈） —— */
+    task_create("boot_setup", _boot_setup_task, NULL, 2048, 3);
 
     /* 阶段 5：boot_setup 任务创建完成 */
     _led_stage(5);
