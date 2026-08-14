@@ -31,8 +31,8 @@
  * ================================================================ */
 #define OS_CFG_PERIPH_SERVICE         1   /* 共享总线服务（GPIO/SPI/I2C/UART）—— shell 命令直接操纵 */
 #define OS_CFG_SHELL                  1   /* 命令行终端                   */
-#define OS_CFG_VFS                    0   /* 虚拟文件系统接口 —— 模块暂未实现 */
-#define OS_CFG_FATFS                  0   /* 裁剪版 FatFs（需 VFS=1）      */
+#define OS_CFG_VFS                    0   /* 虚拟文件系统接口 —— 模块暂未实现（v2.2 直接用 FatFs，不经过 VFS 抽象）*/
+#define OS_CFG_FATFS                  1   /* Elm FatFs（FAT16，MSC U 盘 + 本机文件目录命令）*/
 #define OS_CFG_LOADER                 0   /* 用户程序加载器（需 VFS=1）    */
 #define OS_CFG_DEMO_APP               1   /* 启动演示应用（4 个演示任务）  */
 

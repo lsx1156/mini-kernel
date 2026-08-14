@@ -223,6 +223,15 @@ target_include_directories(hal_port PRIVATE
     $<TARGET_PROPERTY:hardware_spi,INTERFACE_INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:hardware_i2c,INTERFACE_INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:hardware_irq,INTERFACE_INCLUDE_DIRECTORIES>
+    "${PICO_SDK_PATH}/lib/tinyusb/src"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/cdc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/msc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/common"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/device"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/osal"
+    "${PICO_SDK_PATH}/src/rp2_common/pico_stdio_usb/include"
+    "${PICO_SDK_PATH}/src/rp2_common/tinyusb"
+    "${CMAKE_BINARY_DIR}/generated/pico-sdk"
 )
 target_compile_options(hal_port PRIVATE ${COMMON_FLAGS})
 
@@ -259,6 +268,112 @@ add_module_if_enabled(shell_module ${MINIK_ROOT}/kernel/modules/shell OS_CFG_SHE
 add_module_if_enabled(vfs_module ${MINIK_ROOT}/kernel/modules/vfs OS_CFG_VFS)
 add_module_if_enabled(fatfs_module ${MINIK_ROOT}/kernel/modules/vfs/fatfs OS_CFG_FATFS)
 add_module_if_enabled(loader_module ${MINIK_ROOT}/kernel/modules/loader OS_CFG_LOADER)
+
+# ================================================================
+# 6.1 FatFs 模块：额外引入 Pico SDK 自带的 Elm FatFs 源文件 + 配置头
+#       （add_module_if_enabled 只添加我们自己的 diskio.c / ffconf.h）
+# ================================================================
+if(fatfs_module_ENABLED)
+    set(FATFS_SDK_SRC "${PICO_SDK_PATH}/lib/lib/fatfs/source")
+    if(EXISTS "${FATFS_SDK_SRC}/ff.c" AND EXISTS "${FATFS_SDK_SRC}/ffunicode.c")
+        # 【关键修复】SDK ff.c 中 #include "ffconf.h" 的 "" 语法会优先在 ff.c
+        # 所在目录（= SDK FatFs 源目录）搜索 SDK 自带的 ffconf.h，而 SDK 的
+        # ffconf.h 里 FF_USE_MKFS=0 且没有 #ifndef 可被 override 的 guard，
+        # 导致即使 -I 放我们的 ffconf.h 路径在前，"" include 也会找到 SDK 的，
+        # 最终 f_mkfs() 不编译 → 链接 undefined reference to f_mkfs。
+        #
+        # 解决：在当前 build 目录里生成一个 fatfs_shim/ 子目录，把 SDK 的
+        # ff.c / ffunicode.c 复制过去，并把"我们的 ffconf.h"也放进该目录。
+        # 由于编译的是 shim 目录下的 ff.c，它的 #include "ffconf.h" 会
+        # 解析为同目录下（shim/）我们自己的 ffconf.h，从此 FF_USE_MKFS=1 生效。
+        # ff.c 还需要 #include "ff.h" → 通过 -I${FATFS_SDK_SRC} 从 SDK 取。
+        set(FATFS_SHIM_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs_shim")
+        file(MAKE_DIRECTORY "${FATFS_SHIM_DIR}")
+
+        # 【关键】把 SDK 的 ff.h 也复制到 shim 目录。
+        # 原因：ff.h 内部 `#include "ffconf.h"` 是 "" include，会先在 ff.h
+        # 所在目录搜 ffconf.h。如果 ff.h 还在 SDK 原目录，它会取 SDK 的
+        # ffconf.h（FF_USE_MKFS=0），导致 f_mkfs 不编译。
+        # 把 ff.h 也复制到 shim/ 后，它同目录的 ffconf.h 就是我们那份（MKFS=1）。
+        configure_file(
+            "${FATFS_SDK_SRC}/ff.h"
+            "${FATFS_SHIM_DIR}/ff.h"
+            COPYONLY
+        )
+        # 复制 SDK FatFs 源码到 shim 目录
+        configure_file(
+            "${FATFS_SDK_SRC}/ff.c"
+            "${FATFS_SHIM_DIR}/ff.c"
+            COPYONLY
+        )
+        configure_file(
+            "${FATFS_SDK_SRC}/ffunicode.c"
+            "${FATFS_SHIM_DIR}/ffunicode.c"
+            COPYONLY
+        )
+        # 把我们自己的 ffconf.h 也复制到 shim 目录（同目录被 ff.h / ff.c 的 "" include 优先找到）
+        configure_file(
+            "${MINIK_ROOT}/kernel/modules/vfs/fatfs/ffconf.h"
+            "${FATFS_SHIM_DIR}/ffconf.h"
+            COPYONLY
+        )
+        message(STATUS "[fatfs_module] Shim dir created: ${FATFS_SHIM_DIR} (ff.h + ff.c + ffunicode.c + our ffconf.h → FF_USE_MKFS=1 works)")
+
+        # 编译 shim 目录下的源码（而不是 SDK 原目录的）
+        target_sources(fatfs_module PRIVATE
+            "${FATFS_SHIM_DIR}/ff.c"
+            "${FATFS_SHIM_DIR}/ffunicode.c"
+        )
+
+        # include 顺序：
+        #   0) SHIM dir (ff.h+ffconf.h)        → 所有编译单元 #include "ff.h" 先取 shim 版，
+        #                                           它同目录 ffconf.h 就是我们的（MKFS=1）。
+        #   1) MINIK fatfs dir                 → fatfs_api.h / diskio.h
+        #   2) SDK FatFs src (FAKLLBACK)       → shim 找不到其他头时兜底；shim ff.h 不存在
+        #                                           的内部头（如 ffunicode.c 内部头）从 SDK 取。
+        #   3) MINIK include                   → os_config.h（ffconf.h 里 include 它）
+        target_include_directories(fatfs_module PUBLIC
+            "${FATFS_SHIM_DIR}"
+            "${MINIK_ROOT}/kernel/modules/vfs/fatfs"
+            "${FATFS_SDK_SRC}"
+            "${MINIK_ROOT}/include"
+        )
+        # os_config.h 里的 include "os_config.h" 需要从 MINIK include 取，但
+        # shim 目录复制的 ffconf.h 里也写了 #include "os_config.h"，保证
+        # MINIK_ROOT/include 在 include path 中（上面已加）。
+
+        # 传给下游（hal_port / shell / 可执行）的总开关
+        target_compile_definitions(fatfs_module PUBLIC OS_CFG_FATFS=1)
+    else()
+        message(FATAL_ERROR "OS_CFG_FATFS=1 but Pico SDK FatFs source missing at ${FATFS_SDK_SRC}/ff.c (download Pico SDK submodules)")
+    endif()
+endif()
+
+# ================================================================
+# 6.1.1 shell ↔ fatfs 跨模块头文件依赖：
+#       shell_fs.c 在 shell_module 里编译，但它要 #include "ff.h" / fatfs_api.h
+#       这两个在 fatfs_module 的 include dirs。PUBLIC include 会随 target_link
+#       传播，所以只要 shell_module 依赖 fatfs_module 即可自动继承 include path。
+# ================================================================
+if(shell_module_ENABLED AND fatfs_module_ENABLED)
+    target_link_libraries(shell_module PUBLIC fatfs_module)
+endif()
+
+# ================================================================
+# 6.2 TinyUSB MSC：为 SDK 的 tinyusb_device_common 打开 MSC class，
+#       并为 hal_port 提供 tinyusb 头文件路径（msc_usb.c 需要 tusb.h）
+# ================================================================
+# CFG_TUD_MSC=1 会让 TinyUSB 在构建时编译 src/class/msc/msc_device.c
+# 同时我们的 msc_usb.c 覆盖 SDK 的 weak 描述符回调 + 提供 MSC callbacks。
+if(TARGET tinyusb_device_common)
+    target_compile_definitions(tinyusb_device_common INTERFACE
+        CFG_TUD_MSC=1
+        CFG_TUD_MSC_EP_BUFSIZE=512
+    )
+else()
+    # Fallback（如果 target 尚未创建：在全局编译定义里加宏，小概率但保险）
+    add_compile_definitions(CFG_TUD_MSC=1 CFG_TUD_MSC_EP_BUFSIZE=512)
+endif()
 
 # ================================================================
 # 7. 最终固件目标

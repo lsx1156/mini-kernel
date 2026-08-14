@@ -16,6 +16,7 @@
 #include "hal_interface.h"
 #include "os_config.h"
 #include "syscall_contract.h"
+#include "shell_core.h"        /* v2.2 扩展命令注册 API（shell_register/shell_ext_*）*/
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -62,10 +63,12 @@ extern const char *k_version(void);
 
 /* ================================================================
  * 控制台输出辅助（避免依赖 k_printf 的完整实现）
+ *   注意：函数名加 sh_ 前缀，避免和 shell_core.h 中扩展 API
+ *   sh_putc(shell_ctx_t*, char) 发生"同名但签名不同"的类型冲突。
  * ================================================================ */
-static void shell_putc(char c)          { hal_console_putc(c); }
-static void shell_puts(const char *s)   { while (*s) hal_console_putc(*s++); }
-static void shell_crlf(void)            { shell_puts("\r\n"); }
+static void sh_putc(char c)           { hal_console_putc(c); }
+static void sh_puts(const char *s)    { while (*s) hal_console_putc(*s++); }
+static void sh_crlf(void)             { sh_puts("\r\n"); }
 
 static void shell_put_uint32(uint32_t v) {
     char buf[16];
@@ -101,7 +104,7 @@ static void shell_put_err(int err) {
         default: break;
     }
     if (name) {
-        shell_puts(name);
+        sh_puts(name);
         hal_console_putc('(');
     }
     /* 有符号十进制：先出负号再绝对值 */
@@ -214,55 +217,76 @@ static const shell_cmd_t g_cmd_table[] = {
 /* help [cmd] */
 static int cmd_help(int argc, char **argv) {
     if (argc >= 2) {
-        /* 过滤具体命令的帮助 */
+        /* 过滤具体命令的帮助 —— 先静态表、再扩展表 */
         const char *name = argv[1];
         for (size_t i = 0; i < SHELL_CMD_NUM; i++) {
-            if (!g_cmd_table[i].usage) continue;   /* 跳过别名 */
+            if (!g_cmd_table[i].usage) continue;
             if (strcmp(g_cmd_table[i].name, name) == 0) {
-                shell_puts("Usage  : "); shell_puts(g_cmd_table[i].usage); shell_crlf();
-                shell_puts("Summary: "); shell_puts(g_cmd_table[i].help ? g_cmd_table[i].help : ""); shell_crlf();
+                sh_puts("Usage  : "); sh_puts(g_cmd_table[i].usage); sh_crlf();
+                sh_puts("Summary: "); sh_puts(g_cmd_table[i].help ? g_cmd_table[i].help : ""); sh_crlf();
                 return 0;
             }
         }
-        shell_puts("Unknown command: "); shell_puts(name); shell_crlf();
+        shell_cmd_fn_ext_t extfn = NULL;
+        const char *eu = NULL, *eh = NULL;
+        if (shell_ext_lookup(name, &extfn, &eu, &eh) >= 0) {
+            sh_puts("Usage  : "); sh_puts(eu ? eu : ""); sh_crlf();
+            sh_puts("Summary: "); sh_puts(eh ? eh : ""); sh_crlf();
+            return 0;
+        }
+        sh_puts("Unknown command: "); sh_puts(name); sh_crlf();
         return 1;
     }
-    shell_puts("=== Mini Kernel Shell Help ===\r\n");
-    shell_puts("Command          Description\r\n");
-    shell_puts("----------------------------------------\r\n");
+    sh_puts("=== Mini Kernel Shell Help ===\r\n");
+    sh_puts("Command          Description\r\n");
+    sh_puts("----------------------------------------\r\n");
     for (size_t i = 0; i < SHELL_CMD_NUM; i++) {
         if (!g_cmd_table[i].usage) continue;
-        shell_puts(g_cmd_table[i].name);
+        sh_puts(g_cmd_table[i].name);
         int pad = 17 - (int)strlen(g_cmd_table[i].name);
         if (pad < 0) pad = 0;
         shell_pad_spaces(pad);
-        shell_puts(g_cmd_table[i].help ? g_cmd_table[i].help : "");
-        shell_crlf();
+        sh_puts(g_cmd_table[i].help ? g_cmd_table[i].help : "");
+        sh_crlf();
     }
-    shell_puts("----------------------------------------\r\n");
-    shell_puts("Tips: 支持退格键(\\b)。任务ID用 'ps' 命令查询。\r\n");
+    /* v2.2 新增：扩展命令（msc / ls / cd / pwd / mkdir / rmdir / rm / cat） */
+    int ext_n = shell_ext_count();
+    for (int i = 0; i < ext_n; i++) {
+        const char *nm = NULL, *eu = NULL, *eh = NULL;
+        shell_cmd_fn_ext_t fn;
+        if (!shell_ext_get(i, &nm, &fn, &eu, &eh)) continue;
+        if (!eu) continue;   /* 跳过别名（usage=NULL） */
+        sh_puts(nm);
+        int pad = 17 - (int)strlen(nm);
+        if (pad < 0) pad = 0;
+        shell_pad_spaces(pad);
+        sh_puts(eh ? eh : "");
+        sh_crlf();
+    }
+    sh_puts("----------------------------------------\r\n");
+    sh_puts("Tips: 支持退格键(\\b)。任务ID用 'ps' 命令查询。\r\n");
     return 0;
 }
 
 /* ps */
 static int cmd_ps(int argc, char **argv) {
     (void)argc; (void)argv;
-    shell_crlf();
-    shell_puts("--- Task List ---\r\n");
-    shell_puts("ID  Name        State     TicksLeft  StackBase  StackSize  StackOK\r\n");
+    sh_crlf();
+    sh_puts("--- Task List ---\r\n");
+    sh_puts("ID  Name        State     TicksLeft  StackBase  StackSize  StackOK\r\n");
     for (int i = 0; i < OS_CFG_MAX_TASKS; i++) {
         tcb_t *t = g_task_pool[i];
         if (!t) continue;
         /* ID */
         shell_put_uint32(t->id);
-        shell_puts("   ");
+        sh_puts("   ");
         /* Name + pad */
-        shell_puts(t->name);
+        sh_puts(t->name);
         int pad = 12 - (int)strlen(t->name);
         if (pad < 0) pad = 0;
         shell_pad_spaces(pad);
         /* State */
-        shell_puts(task_state_str(t->state));
+        sh_puts(task_state_str(t->state));
         shell_pad_spaces(9 - (int)strlen(task_state_str(t->state)));
         /* TicksLeft */
         shell_put_uint32(t->ticks_to_sleep);
@@ -275,39 +299,39 @@ static int cmd_ps(int argc, char **argv) {
         hal_console_putc(' ');
         /* Stack guard check */
         hal_console_putc(task_stack_check(t) ? 'Y' : 'N');
-        shell_crlf();
+        sh_crlf();
     }
     /* Current running task */
-    shell_puts("Cur: ");
-    shell_puts(g_current_task ? g_current_task->name : "<null>");
-    shell_crlf();
-    shell_puts("-----------------\r\n");
+    sh_puts("Cur: ");
+    sh_puts(g_current_task ? g_current_task->name : "<null>");
+    sh_crlf();
+    sh_puts("-----------------\r\n");
     return 0;
 }
 
 /* heap */
 static int cmd_heap(int argc, char **argv) {
     (void)argc; (void)argv;
-    shell_puts("Heap free     = "); shell_put_uint32(kmem_free_size());         shell_puts(" B\r\n");
-    shell_puts("Heap max blk  = "); shell_put_uint32(kmem_max_free_block());    shell_puts(" B\r\n");
+    sh_puts("Heap free     = "); shell_put_uint32(kmem_free_size());         sh_puts(" B\r\n");
+    sh_puts("Heap max blk  = "); shell_put_uint32(kmem_max_free_block());    sh_puts(" B\r\n");
     return 0;
 }
 
 /* tick */
 static int cmd_tick(int argc, char **argv) {
     (void)argc; (void)argv;
-    shell_puts("Tick = ");
+    sh_puts("Tick = ");
     shell_put_uint32(hal_systick_get_tick());
-    shell_puts("  (@"); shell_put_uint32(OS_CFG_TICK_HZ); shell_puts(" Hz)\r\n");
+    sh_puts("  (@"); shell_put_uint32(OS_CFG_TICK_HZ); sh_puts(" Hz)\r\n");
     return 0;
 }
 
 /* version / ver */
 static int cmd_version(int argc, char **argv) {
     (void)argc; (void)argv;
-    shell_puts("Mini Kernel version: ");
-    shell_puts(k_version());
-    shell_crlf();
+    sh_puts("Mini Kernel version: ");
+    sh_puts(k_version());
+    sh_crlf();
     return 0;
 }
 
@@ -321,53 +345,53 @@ static tcb_t *find_task_by_id(uint32_t id) {
 
 /* suspend <id> */
 static int cmd_suspend(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: suspend <id> (use 'ps' for IDs)\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: suspend <id> (use 'ps' for IDs)\r\n"); return 1; }
     uint32_t id = 0;
     for (const char *p = argv[1]; *p; p++) {
-        if (*p < '0' || *p > '9') { shell_puts("Invalid ID (not a number)\r\n"); return 1; }
+        if (*p < '0' || *p > '9') { sh_puts("Invalid ID (not a number)\r\n"); return 1; }
         id = id * 10 + (uint32_t)(*p - '0');
     }
     tcb_t *t = find_task_by_id(id);
-    if (!t) { shell_puts("Task id="); shell_put_uint32(id); shell_puts(" not found\r\n"); return 1; }
-    if (t == g_current_task) { shell_puts("Cannot suspend the running shell task itself\r\n"); return 1; }
+    if (!t) { sh_puts("Task id="); shell_put_uint32(id); sh_puts(" not found\r\n"); return 1; }
+    if (t == g_current_task) { sh_puts("Cannot suspend the running shell task itself\r\n"); return 1; }
     task_suspend(t);
-    shell_puts("Task id="); shell_put_uint32(id);
-    shell_puts(" (" ); shell_puts(t->name); shell_puts(") SUSPENDed\r\n");
+    sh_puts("Task id="); shell_put_uint32(id);
+    sh_puts(" (" ); sh_puts(t->name); sh_puts(") SUSPENDed\r\n");
     return 0;
 }
 
 /* resume <id> */
 static int cmd_resume(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: resume <id>\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: resume <id>\r\n"); return 1; }
     uint32_t id = 0;
     for (const char *p = argv[1]; *p; p++) {
-        if (*p < '0' || *p > '9') { shell_puts("Invalid ID\r\n"); return 1; }
+        if (*p < '0' || *p > '9') { sh_puts("Invalid ID\r\n"); return 1; }
         id = id * 10 + (uint32_t)(*p - '0');
     }
     tcb_t *t = find_task_by_id(id);
-    if (!t) { shell_puts("Task id="); shell_put_uint32(id); shell_puts(" not found\r\n"); return 1; }
+    if (!t) { sh_puts("Task id="); shell_put_uint32(id); sh_puts(" not found\r\n"); return 1; }
     task_resume(t);
-    shell_puts("Task id="); shell_put_uint32(id);
-    shell_puts(" (" ); shell_puts(t->name); shell_puts(") RESUMEd\r\n");
+    sh_puts("Task id="); shell_put_uint32(id);
+    sh_puts(" (" ); sh_puts(t->name); sh_puts(") RESUMEd\r\n");
     return 0;
 }
 
 /* kill <id> */
 static int cmd_kill(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: kill <id>\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: kill <id>\r\n"); return 1; }
     uint32_t id = 0;
     for (const char *p = argv[1]; *p; p++) {
-        if (*p < '0' || *p > '9') { shell_puts("Invalid ID\r\n"); return 1; }
+        if (*p < '0' || *p > '9') { sh_puts("Invalid ID\r\n"); return 1; }
         id = id * 10 + (uint32_t)(*p - '0');
     }
     tcb_t *t = find_task_by_id(id);
-    if (!t) { shell_puts("Task id="); shell_put_uint32(id); shell_puts(" not found\r\n"); return 1; }
-    if (t == g_current_task) { shell_puts("Cannot kill the shell task itself\r\n"); return 1; }
+    if (!t) { sh_puts("Task id="); shell_put_uint32(id); sh_puts(" not found\r\n"); return 1; }
+    if (t == g_current_task) { sh_puts("Cannot kill the shell task itself\r\n"); return 1; }
     char name_buf[16];
     memcpy(name_buf, t->name, 12); name_buf[12] = 0;
     task_destroy(t);
-    shell_puts("Task id="); shell_put_uint32(id);
-    shell_puts(" (" ); shell_puts(name_buf); shell_puts(") KILLed (TCB returned to pool)\r\n");
+    sh_puts("Task id="); shell_put_uint32(id);
+    sh_puts(" (" ); sh_puts(name_buf); sh_puts(") KILLed (TCB returned to pool)\r\n");
     return 0;
 }
 
@@ -375,8 +399,8 @@ static int cmd_kill(int argc, char **argv) {
 static int cmd_clear(int argc, char **argv) {
     (void)argc; (void)argv;
     /* VT100 兼容：Putty, TeraTerm, cmder, screen, minicom, Windows Terminal 全部支持 */
-    shell_puts("\033[2J");    /* ESC[2J 清屏 */
-    shell_puts("\033[H");     /* ESC[H  光标回左上角 (row1,col1) */
+    sh_puts("\033[2J");    /* ESC[2J 清屏 */
+    sh_puts("\033[H");     /* ESC[H  光标回左上角 (row1,col1) */
     return 0;
 }
 
@@ -386,51 +410,51 @@ static int cmd_clear(int argc, char **argv) {
  *       这样可以区分"命令没执行"和"命令执行了但硬件没响应"两种情况。 */
 static int cmd_led(int argc, char **argv) {
 #if OS_CFG_PERIPH_SERVICE
-    if (argc < 2) { shell_puts("Usage: led on | off | toggle\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: led on | off | toggle\r\n"); return 1; }
     /* RP2040 板载 LED 固定是 GPIO25（Pico非W版），这里直接用 hal_gpio 接口 */
     const uint32_t pin = 25;
     hal_err_t ir = hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
     if (ir != HAL_OK) {
-        shell_puts("ERROR: led: hal_gpio_init(GPIO25, OUT_PP) returned ");
-        shell_put_err((int)ir); shell_puts(" (OS_CFG_PERIPH_SERVICE ON?)\r\n");
+        sh_puts("ERROR: led: hal_gpio_init(GPIO25, OUT_PP) returned ");
+        shell_put_err((int)ir); sh_puts(" (OS_CFG_PERIPH_SERVICE ON?)\r\n");
         return 1;
     }
     hal_gpio_level_t want = HAL_GPIO_LOW;
     if (strcmp(argv[1], "on") == 0) {
         want = HAL_GPIO_HIGH;
         hal_gpio_write(pin, HAL_GPIO_HIGH);
-        shell_puts("LED GPIO25 ON\r\n");
+        sh_puts("LED GPIO25 ON\r\n");
     } else if (strcmp(argv[1], "off") == 0) {
         want = HAL_GPIO_LOW;
         hal_gpio_write(pin, HAL_GPIO_LOW);
-        shell_puts("LED GPIO25 OFF\r\n");
+        sh_puts("LED GPIO25 OFF\r\n");
     } else if (strcmp(argv[1], "toggle") == 0) {
         hal_gpio_level_t cur = hal_gpio_read(pin);
         want = (cur == HAL_GPIO_HIGH) ? HAL_GPIO_LOW : HAL_GPIO_HIGH;
         hal_gpio_toggle(pin);
-        shell_puts("LED GPIO25 toggled\r\n");
+        sh_puts("LED GPIO25 toggled\r\n");
     } else {
-        shell_puts("Unknown led op (use: on | off | toggle)\r\n");
+        sh_puts("Unknown led op (use: on | off | toggle)\r\n");
         return 1;
     }
     /* 回读校验：SIO 寄存器的读回必须等于预期，否则输出 FAIL 标志（这就是用户常说的
      *   "命令执行了但灯没亮" 时最直接的自检证据）。 */
     hal_gpio_level_t got = hal_gpio_read(pin);
     if (got != want) {
-        shell_puts("  ↳ FAIL: GPIO25 readback ");
-        shell_puts((got == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
-        shell_puts(" but expected ");
-        shell_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
-        shell_puts(" (HW problem?)\r\n");
+        sh_puts("  ↳ FAIL: GPIO25 readback ");
+        sh_puts((got == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+        sh_puts(" but expected ");
+        sh_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+        sh_puts(" (HW problem?)\r\n");
         return 1;
     }
-    shell_puts("  ↳ OK: GPIO25=");
-    shell_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
-    shell_puts(" (verified via SIO readback)\r\n");
+    sh_puts("  ↳ OK: GPIO25=");
+    sh_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+    sh_puts(" (verified via SIO readback)\r\n");
     return 0;
 #else
     (void)argc; (void)argv;
-    shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, hal_gpio not linked\r\n");
+    sh_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, hal_gpio not linked\r\n");
     return 1;
 #endif
 }
@@ -439,11 +463,11 @@ static int cmd_led(int argc, char **argv) {
 static int cmd_syscalls(int argc, char **argv) {
     (void)argc; (void)argv;
     size_t total = syscall_table_size();
-    shell_puts("\r\n=== Syscall Contract Table (");
+    sh_puts("\r\n=== Syscall Contract Table (");
     shell_put_uint32((uint32_t)total);
-    shell_puts(" entries) ===\r\n");
-    shell_puts("ID    Name            Params  Return     Signature\r\n");
-    shell_puts("----------------------------------------------------------\r\n");
+    sh_puts(" entries) ===\r\n");
+    sh_puts("ID    Name            Params  Return     Signature\r\n");
+    sh_puts("----------------------------------------------------------\r\n");
     for (size_t i = 0; i < total; i++) {
         const syscall_entry_t *e = syscall_get_entry(i);
         if (!e) break;
@@ -451,19 +475,19 @@ static int cmd_syscalls(int argc, char **argv) {
         shell_put_uint32((uint32_t)e->id);
         shell_pad_spaces(6 - (int)(e->id / 10 + 1));
         /* Name */
-        shell_puts(e->name);
+        sh_puts(e->name);
         shell_pad_spaces(16 - (int)strlen(e->name));
         /* Params */
         shell_put_uint32(e->param_count);
         shell_pad_spaces(8);
         /* Return type */
-        shell_puts(e->return_type);
+        sh_puts(e->return_type);
         shell_pad_spaces(11 - (int)strlen(e->return_type));
         /* Signature */
-        shell_puts(e->signature);
-        shell_crlf();
+        sh_puts(e->signature);
+        sh_crlf();
     }
-    shell_puts("----------------------------------------------------------\r\n");
+    sh_puts("----------------------------------------------------------\r\n");
     return 0;
 }
 
@@ -494,20 +518,20 @@ static int shell_parse_uint(const char *s, uint32_t *out) {
 }
 
 static void gpio_help(void) {
-    shell_puts("GPIO subcommands (pin=0..29 for RP2040, 30+ = QSPI/SWCLK reserved):\r\n");
-    shell_puts("  gpio help                        打印本帮助\r\n");
-    shell_puts("  gpio init  <pin> in              初始化: 浮空输入\r\n");
-    shell_puts("  gpio init  <pin> out   [0|1]     初始化: 推挽输出，可选初始电平(默认0)\r\n");
-    shell_puts("  gpio init  <pin> out_od [0|1]    初始化: 开漏输出，可选初始电平\r\n");
-    shell_puts("  gpio init  <pin> af <af_num>     初始化: 复用功能(0=FUNC0/SPI .. 5=FUNC5/SIO)\r\n");
-    shell_puts("  gpio read  <pin>                 读引脚电平 -> 打印 0 或 1\r\n");
-    shell_puts("  gpio write <pin> <0|1>           设置输出电平\r\n");
-    shell_puts("  gpio toggle <pin>                翻转输出电平\r\n");
-    shell_puts("Examples:\r\n");
-    shell_puts("  gpio init 25 out 1        # GPIO25(板载LED) 推挽输出 初始高电平\r\n");
-    shell_puts("  gpio toggle 25            # 翻转 LED\r\n");
-    shell_puts("  gpio init 0 af 2          # GPIO0=FUNC2(UART0_TX)\r\n");
-    shell_puts("  gpio read 5               # 读 GPIO5 电平\r\n");
+    sh_puts("GPIO subcommands (pin=0..29 for RP2040, 30+ = QSPI/SWCLK reserved):\r\n");
+    sh_puts("  gpio help                        打印本帮助\r\n");
+    sh_puts("  gpio init  <pin> in              初始化: 浮空输入\r\n");
+    sh_puts("  gpio init  <pin> out   [0|1]     初始化: 推挽输出，可选初始电平(默认0)\r\n");
+    sh_puts("  gpio init  <pin> out_od [0|1]    初始化: 开漏输出，可选初始电平\r\n");
+    sh_puts("  gpio init  <pin> af <af_num>     初始化: 复用功能(0=FUNC0/SPI .. 5=FUNC5/SIO)\r\n");
+    sh_puts("  gpio read  <pin>                 读引脚电平 -> 打印 0 或 1\r\n");
+    sh_puts("  gpio write <pin> <0|1>           设置输出电平\r\n");
+    sh_puts("  gpio toggle <pin>                翻转输出电平\r\n");
+    sh_puts("Examples:\r\n");
+    sh_puts("  gpio init 25 out 1        # GPIO25(板载LED) 推挽输出 初始高电平\r\n");
+    sh_puts("  gpio toggle 25            # 翻转 LED\r\n");
+    sh_puts("  gpio init 0 af 2          # GPIO0=FUNC2(UART0_TX)\r\n");
+    sh_puts("  gpio read 5               # 读 GPIO5 电平\r\n");
 }
 
 static int cmd_gpio(int argc, char **argv) {
@@ -522,99 +546,99 @@ static int cmd_gpio(int argc, char **argv) {
     }
 
     if (strcmp(sub, "init") == 0) {
-        if (argc < 4) { shell_puts("Usage: gpio init <pin> in | out [0|1] | out_od [0|1] | af <af_num>\r\n"); return 1; }
+        if (argc < 4) { sh_puts("Usage: gpio init <pin> in | out [0|1] | out_od [0|1] | af <af_num>\r\n"); return 1; }
         uint32_t pin = 0;
         if (shell_parse_uint(argv[2], &pin) != 0) {
-            shell_puts("Invalid pin number (must be 0..29)\r\n"); return 1;
+            sh_puts("Invalid pin number (must be 0..29)\r\n"); return 1;
         }
         const char *mode = argv[3];
 
         if (strcmp(mode, "in") == 0) {
             hal_err_t r = hal_gpio_init(pin, HAL_GPIO_IN, 0);
-            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init IN failed (pin invalid)\r\n"); return 1; }
-            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = INPUT (floating)\r\n");
+            if (r != HAL_OK) { sh_puts("GPIO"); shell_put_uint32(pin); sh_puts(" init IN failed (pin invalid)\r\n"); return 1; }
+            sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" = INPUT (floating)\r\n");
             return 0;
         }
         if (strcmp(mode, "out") == 0) {
             uint32_t init_val = 0;
             if (argc >= 5) {
                 if (shell_parse_uint(argv[4], &init_val) != 0 || init_val > 1) {
-                    shell_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
+                    sh_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
                 }
             }
             hal_err_t r = hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
-            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init OUT failed\r\n"); return 1; }
+            if (r != HAL_OK) { sh_puts("GPIO"); shell_put_uint32(pin); sh_puts(" init OUT failed\r\n"); return 1; }
             hal_gpio_write(pin, init_val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
-            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = OUTPUT-PP, level="); shell_put_uint32(init_val); shell_puts("\r\n");
+            sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" = OUTPUT-PP, level="); shell_put_uint32(init_val); sh_puts("\r\n");
             return 0;
         }
         if (strcmp(mode, "out_od") == 0) {
             uint32_t init_val = 0;
             if (argc >= 5) {
                 if (shell_parse_uint(argv[4], &init_val) != 0 || init_val > 1) {
-                    shell_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
+                    sh_puts("Invalid initial value (must be 0 or 1)\r\n"); return 1;
                 }
             }
             hal_err_t r = hal_gpio_init(pin, HAL_GPIO_OUT_OD, 0);
-            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init OUT_OD failed\r\n"); return 1; }
+            if (r != HAL_OK) { sh_puts("GPIO"); shell_put_uint32(pin); sh_puts(" init OUT_OD failed\r\n"); return 1; }
             hal_gpio_write(pin, init_val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
-            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = OUTPUT-OD, level="); shell_put_uint32(init_val); shell_puts("\r\n");
+            sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" = OUTPUT-OD, level="); shell_put_uint32(init_val); sh_puts("\r\n");
             return 0;
         }
         if (strcmp(mode, "af") == 0) {
-            if (argc < 5) { shell_puts("Usage: gpio init <pin> af <af_num> (0..9 for FUNC0..FUNC9)\r\n"); return 1; }
+            if (argc < 5) { sh_puts("Usage: gpio init <pin> af <af_num> (0..9 for FUNC0..FUNC9)\r\n"); return 1; }
             uint32_t af_num = 0;
             if (shell_parse_uint(argv[4], &af_num) != 0 || af_num > 9) {
-                shell_puts("Invalid af_num (must be 0..9). RP2040: 0=SPI,1=UART0,2=UART1,3=I2C0,4=I2C1,5=SIO,6=PWM,7=SIO/PIO,...\r\n");
+                sh_puts("Invalid af_num (must be 0..9). RP2040: 0=SPI,1=UART0,2=UART1,3=I2C0,4=I2C1,5=SIO,6=PWM,7=SIO/PIO,...\r\n");
                 return 1;
             }
             hal_err_t r = hal_gpio_init(pin, HAL_GPIO_AF, af_num);
-            if (r != HAL_OK) { shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" init AF failed\r\n"); return 1; }
-            shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = ALT-FUNC"); shell_put_uint32(af_num); shell_puts("\r\n");
+            if (r != HAL_OK) { sh_puts("GPIO"); shell_put_uint32(pin); sh_puts(" init AF failed\r\n"); return 1; }
+            sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" = ALT-FUNC"); shell_put_uint32(af_num); sh_puts("\r\n");
             return 0;
         }
-        shell_puts("Unknown gpio mode: '"); shell_puts(mode); shell_puts("' (expected: in|out|out_od|af)\r\n");
+        sh_puts("Unknown gpio mode: '"); sh_puts(mode); sh_puts("' (expected: in|out|out_od|af)\r\n");
         return 1;
     }
 
     if (strcmp(sub, "read") == 0) {
-        if (argc < 3) { shell_puts("Usage: gpio read <pin>\r\n"); return 1; }
+        if (argc < 3) { sh_puts("Usage: gpio read <pin>\r\n"); return 1; }
         uint32_t pin = 0;
-        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
+        if (shell_parse_uint(argv[2], &pin) != 0) { sh_puts("Invalid pin number\r\n"); return 1; }
         hal_gpio_level_t lv = hal_gpio_read(pin);
-        shell_puts("GPIO"); shell_put_uint32(pin); shell_puts(" = ");
-        shell_puts((lv == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
-        shell_puts("\r\n");
+        sh_puts("GPIO"); shell_put_uint32(pin); sh_puts(" = ");
+        sh_puts((lv == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
+        sh_puts("\r\n");
         return 0;
     }
 
     if (strcmp(sub, "write") == 0) {
-        if (argc < 4) { shell_puts("Usage: gpio write <pin> <0|1>\r\n"); return 1; }
+        if (argc < 4) { sh_puts("Usage: gpio write <pin> <0|1>\r\n"); return 1; }
         uint32_t pin = 0, val = 0;
-        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
-        if (shell_parse_uint(argv[3], &val) != 0 || val > 1) { shell_puts("Invalid value (must be 0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint(argv[2], &pin) != 0) { sh_puts("Invalid pin number\r\n"); return 1; }
+        if (shell_parse_uint(argv[3], &val) != 0 || val > 1) { sh_puts("Invalid value (must be 0 or 1)\r\n"); return 1; }
         hal_gpio_write(pin, val ? HAL_GPIO_HIGH : HAL_GPIO_LOW);
-        shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" = "); shell_put_uint32(val); shell_puts("\r\n");
+        sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" = "); shell_put_uint32(val); sh_puts("\r\n");
         return 0;
     }
 
     if (strcmp(sub, "toggle") == 0) {
-        if (argc < 3) { shell_puts("Usage: gpio toggle <pin>\r\n"); return 1; }
+        if (argc < 3) { sh_puts("Usage: gpio toggle <pin>\r\n"); return 1; }
         uint32_t pin = 0;
-        if (shell_parse_uint(argv[2], &pin) != 0) { shell_puts("Invalid pin number\r\n"); return 1; }
+        if (shell_parse_uint(argv[2], &pin) != 0) { sh_puts("Invalid pin number\r\n"); return 1; }
         hal_gpio_toggle(pin);
-        shell_puts("OK: GPIO"); shell_put_uint32(pin); shell_puts(" toggled. Now = ");
-        shell_puts((hal_gpio_read(pin) == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
-        shell_puts("\r\n");
+        sh_puts("OK: GPIO"); shell_put_uint32(pin); sh_puts(" toggled. Now = ");
+        sh_puts((hal_gpio_read(pin) == HAL_GPIO_HIGH) ? "1 (HIGH)" : "0 (LOW)");
+        sh_puts("\r\n");
         return 0;
     }
 
-    shell_puts("Unknown gpio subcommand: '"); shell_puts(sub); shell_puts("' (try 'gpio help')\r\n");
+    sh_puts("Unknown gpio subcommand: '"); sh_puts(sub); sh_puts("' (try 'gpio help')\r\n");
     return 1;
 
 #else /* !PERIPH_SERVICE */
     (void)argc; (void)argv;
-    shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, GPIO HAL not linked. Set =1 in os_config.h.\r\n");
+    sh_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, GPIO HAL not linked. Set =1 in os_config.h.\r\n");
     return 1;
 #endif
 }
@@ -664,22 +688,22 @@ static int shell_parse_uint_auto(const char *s, uint32_t *out) {
 }
 
 static void i2c_help(void) {
-    shell_puts("I2C subcommands (7-bit device addresses, no auto-left-shift):\r\n");
-    shell_puts("  i2c init <bus> <sda> <scl> <hz>      Init + pinmux I2C bus (bus=0|1)\r\n");
-    shell_puts("         RP2040 AF: bus0 pins=GP4(SDA)/GP5(SCL), bus1=GP6/GP7\r\n");
-    shell_puts("         Typical hz: 100000 / 400000 / 1000000\r\n");
-    shell_puts("  i2c scan <bus>                      Scan 7-bit addresses 0x08..0x77\r\n");
-    shell_puts("  i2c wr   <bus> <addr> <b1> [..bn]   Raw write 1..N bytes\r\n");
-    shell_puts("  i2c rd   <bus> <addr> <len>         Raw read len bytes\r\n");
-    shell_puts("  i2c cmds <bus> <addr> <c1> [..cn]   SSD1306-style: 0x00 (Co=0,D/C=0) + N command bytes\r\n");
-    shell_puts("  i2c fill <bus> <addr> <byte> <cnt>  SSD1306-style: 0x40 (Co=0,D/C=1) + cnt×byte (GDRAM fill)\r\n");
-    shell_puts("  i2c memwr <bus> <addr> <reg> <b1> [..]   Write device register (mem 16-bit)\r\n");
-    shell_puts("  i2c memrd <bus> <addr> <reg> <len>       Read device register (mem 16-bit)\r\n");
-    shell_puts("Examples:\r\n");
-    shell_puts("  i2c init 0 4 5 100000                # Standard-mode on default pins\r\n");
-    shell_puts("  i2c scan 0                           # Show connected devices\r\n");
-    shell_puts("  i2c wr 0 0x3C 0x00 0xAF              # Write 2 bytes to OLED at 0x3C\r\n");
-    shell_puts("  i2c memrd 0 0x50 0x00 16             # Read 16 bytes from AT24Cxx EEPROM @ 0\r\n");
+    sh_puts("I2C subcommands (7-bit device addresses, no auto-left-shift):\r\n");
+    sh_puts("  i2c init <bus> <sda> <scl> <hz>      Init + pinmux I2C bus (bus=0|1)\r\n");
+    sh_puts("         RP2040 AF: bus0 pins=GP4(SDA)/GP5(SCL), bus1=GP6/GP7\r\n");
+    sh_puts("         Typical hz: 100000 / 400000 / 1000000\r\n");
+    sh_puts("  i2c scan <bus>                      Scan 7-bit addresses 0x08..0x77\r\n");
+    sh_puts("  i2c wr   <bus> <addr> <b1> [..bn]   Raw write 1..N bytes\r\n");
+    sh_puts("  i2c rd   <bus> <addr> <len>         Raw read len bytes\r\n");
+    sh_puts("  i2c cmds <bus> <addr> <c1> [..cn]   SSD1306-style: 0x00 (Co=0,D/C=0) + N command bytes\r\n");
+    sh_puts("  i2c fill <bus> <addr> <byte> <cnt>  SSD1306-style: 0x40 (Co=0,D/C=1) + cnt×byte (GDRAM fill)\r\n");
+    sh_puts("  i2c memwr <bus> <addr> <reg> <b1> [..]   Write device register (mem 16-bit)\r\n");
+    sh_puts("  i2c memrd <bus> <addr> <reg> <len>       Read device register (mem 16-bit)\r\n");
+    sh_puts("Examples:\r\n");
+    sh_puts("  i2c init 0 4 5 100000                # Standard-mode on default pins\r\n");
+    sh_puts("  i2c scan 0                           # Show connected devices\r\n");
+    sh_puts("  i2c wr 0 0x3C 0x00 0xAF              # Write 2 bytes to OLED at 0x3C\r\n");
+    sh_puts("  i2c memrd 0 0x50 0x00 16             # Read 16 bytes from AT24Cxx EEPROM @ 0\r\n");
 }
 
 /* 打印一个字节为 2 位十六进制，前缀空格 */
@@ -700,12 +724,12 @@ static int cmd_i2c(int argc, char **argv) {
     }
 
     if (strcmp(sub, "init") == 0) {
-        if (argc < 6) { shell_puts("Usage: i2c init <bus> <sda_pin> <scl_pin> <hz>\r\n"); return 1; }
+        if (argc < 6) { sh_puts("Usage: i2c init <bus> <sda_pin> <scl_pin> <hz>\r\n"); return 1; }
         uint32_t bus, sda, scl, hz;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &sda) != 0 || sda > 29) { shell_puts("Invalid SDA pin (0..29)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[4], &scl) != 0 || scl > 29) { shell_puts("Invalid SCL pin (0..29)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[5], &hz)  != 0 || hz == 0)  { shell_puts("Invalid hz (non-zero)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &sda) != 0 || sda > 29) { sh_puts("Invalid SDA pin (0..29)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &scl) != 0 || scl > 29) { sh_puts("Invalid SCL pin (0..29)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &hz)  != 0 || hz == 0)  { sh_puts("Invalid hz (non-zero)\r\n"); return 1; }
 
         /* RP2040 GPIO_FUNC_I2C = 3，SDK 自动按 pin 路由到 I2C0/I2C1
          * 注：Pico SDK i2c_init 会自动 gpio_set_function，但不会自动开上拉！
@@ -726,33 +750,33 @@ static int cmd_i2c(int argc, char **argv) {
         hal_err_t r1 = hal_gpio_init(sda, HAL_GPIO_AF, 3);
         hal_err_t r2 = hal_gpio_init(scl, HAL_GPIO_AF, 3);
         hal_err_t r3 = hal_i2c_init(bus, hz);
-        if (r1 != HAL_OK || r2 != HAL_OK) { shell_puts("I2C pinmux FAILED\r\n"); return 1; }
-        if (r3 != HAL_OK) { shell_puts("I2C init FAILED\r\n"); return 1; }
+        if (r1 != HAL_OK || r2 != HAL_OK) { sh_puts("I2C pinmux FAILED\r\n"); return 1; }
+        if (r3 != HAL_OK) { sh_puts("I2C init FAILED\r\n"); return 1; }
 
-        shell_puts("OK: I2C"); shell_put_uint32(bus);
-        shell_puts(" SDA=GP"); shell_put_uint32(sda);
-        shell_puts(" SCL=GP"); shell_put_uint32(scl);
-        shell_puts(" @"); shell_put_uint32(hz); shell_puts("Hz\r\n");
+        sh_puts("OK: I2C"); shell_put_uint32(bus);
+        sh_puts(" SDA=GP"); shell_put_uint32(sda);
+        sh_puts(" SCL=GP"); shell_put_uint32(scl);
+        sh_puts(" @"); shell_put_uint32(hz); sh_puts("Hz\r\n");
         return 0;
     }
 
     if (strcmp(sub, "scan") == 0) {
-        if (argc < 3) { shell_puts("Usage: i2c scan <bus>\r\n"); return 1; }
+        if (argc < 3) { sh_puts("Usage: i2c scan <bus>\r\n"); return 1; }
         uint32_t bus;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
-        shell_puts("Scanning I2C"); shell_put_uint32(bus);
-        shell_puts(" (7-bit addresses 0x08..0x77):\r\n   ");
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        sh_puts("Scanning I2C"); shell_put_uint32(bus);
+        sh_puts(" (7-bit addresses 0x08..0x77):\r\n   ");
         for (uint8_t col = 0; col < 16; col++) {
-            shell_print_hex8(col); shell_putc(' ');
+            shell_print_hex8(col); sh_putc(' ');
         }
-        shell_crlf();
+        sh_crlf();
         for (uint8_t row = 0; row < 8; row++) {
             shell_print_hex8(row << 4);
-            shell_putc(':'); shell_putc(' ');
+            sh_putc(':'); sh_putc(' ');
             for (uint8_t col = 0; col < 16; col++) {
                 uint8_t addr = (uint8_t)((row << 4) | col);
                 if (addr < 0x08 || addr > 0x77) {
-                    shell_puts("-- ");
+                    sh_puts("-- ");
                     continue;
                 }
                 /* 标准探测（RP2040 Pico SDK 推荐方式）：
@@ -764,38 +788,38 @@ static int cmd_i2c(int argc, char **argv) {
                 uint8_t dummy;
                 hal_err_t pr = hal_i2c_rx(bus, addr, &dummy, 1);
                 if (pr == HAL_OK) {
-                    shell_print_hex8(addr); shell_putc(' ');
+                    shell_print_hex8(addr); sh_putc(' ');
                 } else {
-                    shell_puts("-- ");
+                    sh_puts("-- ");
                 }
             }
-            shell_crlf();
+            sh_crlf();
         }
-        shell_puts("Done.\r\n");
+        sh_puts("Done.\r\n");
         return 0;
     }
 
     if (strcmp(sub, "wr") == 0) {
-        if (argc < 5) { shell_puts("Usage: i2c wr <bus> <addr> <B1> [B2 ...]\r\n"); return 1; }
+        if (argc < 5) { sh_puts("Usage: i2c wr <bus> <addr> <B1> [B2 ...]\r\n"); return 1; }
         uint32_t bus, addr;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr (0x00..0x7F)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr (0x00..0x7F)\r\n"); return 1; }
         int nbytes = argc - 4;
-        if (nbytes > 256) { shell_puts("Too many bytes (>256)\r\n"); return 1; }
+        if (nbytes > 256) { sh_puts("Too many bytes (>256)\r\n"); return 1; }
         uint8_t buf[256];
         for (int i = 0; i < nbytes; i++) {
             uint32_t v;
             if (shell_parse_uint_auto(argv[4 + i], &v) != 0 || v > 0xFF) {
-                shell_puts("Invalid byte at pos "); shell_put_uint32(i); shell_puts(": "); shell_puts(argv[4 + i]); shell_crlf();
+                sh_puts("Invalid byte at pos "); shell_put_uint32(i); sh_puts(": "); sh_puts(argv[4 + i]); sh_crlf();
                 return 1;
             }
             buf[i] = (uint8_t)v;
         }
         hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, buf, (size_t)nbytes);
-        if (r != HAL_OK) { shell_puts("I2C WR NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" WR 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
-        shell_puts("] ("); shell_put_uint32(nbytes); shell_puts(" bytes)\r\n");
+        if (r != HAL_OK) { sh_puts("I2C WR NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf(); return 1; }
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" WR 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) sh_putc(' '); shell_print_hex8(buf[i]); }
+        sh_puts("] ("); shell_put_uint32(nbytes); sh_puts(" bytes)\r\n");
         return 0;
     }
 
@@ -803,29 +827,29 @@ static int cmd_i2c(int argc, char **argv) {
      *   SHELL_MAX_ARGS=10 时：cmd=cmds + bus + addr + 最多 7 个命令字节 / 次。
      *   长初始化序列多分几次 i2c cmds 调用即可。 */
     if (strcmp(sub, "cmds") == 0) {
-        if (argc < 5) { shell_puts("Usage: i2c cmds <bus> <addr> <C1> [C2 ... C7]\r\n"); return 1; }
+        if (argc < 5) { sh_puts("Usage: i2c cmds <bus> <addr> <C1> [C2 ... C7]\r\n"); return 1; }
         uint32_t bus, addr;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr\r\n"); return 1; }
         int ncmd = argc - 4;
-        if (ncmd > 255) { shell_puts("Too many commands (>255)\r\n"); return 1; }
+        if (ncmd > 255) { sh_puts("Too many commands (>255)\r\n"); return 1; }
         /* buf[0] = 0x00 控制前缀，buf[1..ncmd] = 命令字节 */
         uint8_t buf[257];
         buf[0] = 0x00;
         for (int i = 0; i < ncmd; i++) {
             uint32_t v;
             if (shell_parse_uint_auto(argv[4 + i], &v) != 0 || v > 0xFF) {
-                shell_puts("Invalid cmd byte at pos "); shell_put_uint32(i); shell_crlf();
+                sh_puts("Invalid cmd byte at pos "); shell_put_uint32(i); sh_crlf();
                 return 1;
             }
             buf[1 + i] = (uint8_t)v;
         }
         hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, buf, (size_t)(ncmd + 1));
-        if (r != HAL_OK) { shell_puts("I2C CMDS NACK/ERROR @0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" CMDS 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts(" prefix=0x00 + [");
-        for (int i = 0; i < ncmd; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[1 + i]); }
-        shell_puts("] ("); shell_put_uint32(ncmd); shell_puts(" commands)\r\n");
+        if (r != HAL_OK) { sh_puts("I2C CMDS NACK/ERROR @0x"); shell_print_hex8((uint8_t)addr); sh_crlf(); return 1; }
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" CMDS 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts(" prefix=0x00 + [");
+        for (int i = 0; i < ncmd; i++) { if (i) sh_putc(' '); shell_print_hex8(buf[1 + i]); }
+        sh_puts("] ("); shell_put_uint32(ncmd); sh_puts(" commands)\r\n");
         return 0;
     }
 
@@ -834,12 +858,12 @@ static int cmd_i2c(int argc, char **argv) {
      *            OLED 清屏      = fill 0x3C 0x00 1024
      *            OLED 条纹     = fill 0x3C 0xAA 1024 */
     if (strcmp(sub, "fill") == 0) {
-        if (argc < 6) { shell_puts("Usage: i2c fill <bus> <addr> <byte> <cnt>\r\n"); return 1; }
+        if (argc < 6) { sh_puts("Usage: i2c fill <bus> <addr> <byte> <cnt>\r\n"); return 1; }
         uint32_t bus, addr, bytev, count;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[4], &bytev) != 0 || bytev > 0xFF) { shell_puts("Invalid fill byte (0x00..0xFF)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[5], &count) != 0 || count == 0 || count > 8192) { shell_puts("Invalid cnt (1..8192)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &bytev) != 0 || bytev > 0xFF) { sh_puts("Invalid fill byte (0x00..0xFF)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &count) != 0 || count == 0 || count > 8192) { sh_puts("Invalid cnt (1..8192)\r\n"); return 1; }
 
         /* 分块发送：每块最多 256 字节（控制前缀 0x40 + 最多 255 数据字节）
          *   SSD1306 的列指针自动递增，D/C=1 流可以被多次 I2C START 断续发送，
@@ -853,87 +877,87 @@ static int cmd_i2c(int argc, char **argv) {
             size_t chunk = (remaining > 255) ? 255u : (size_t)remaining;
             hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, block, chunk + 1);
             if (r != HAL_OK) {
-                shell_puts("I2C FILL NACK/ERROR @chunk #");
+                sh_puts("I2C FILL NACK/ERROR @chunk #");
                 shell_put_uint32(chunks);
-                shell_puts(" bytes left="); shell_put_uint32(remaining); shell_crlf();
+                sh_puts(" bytes left="); shell_put_uint32(remaining); sh_crlf();
                 return 1;
             }
             remaining -= chunk;
             chunks++;
         }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" FILL 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts(" byte=0x"); shell_print_hex8((uint8_t)bytev);
-        shell_puts(" ×"); shell_put_uint32(count);
-        shell_puts(" bytes ("); shell_put_uint32(chunks); shell_puts(" chunks)\r\n");
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" FILL 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts(" byte=0x"); shell_print_hex8((uint8_t)bytev);
+        sh_puts(" ×"); shell_put_uint32(count);
+        sh_puts(" bytes ("); shell_put_uint32(chunks); sh_puts(" chunks)\r\n");
         return 0;
     }
 
     if (strcmp(sub, "rd") == 0) {
-        if (argc < 5) { shell_puts("Usage: i2c rd <bus> <addr> <len>\r\n"); return 1; }
+        if (argc < 5) { sh_puts("Usage: i2c rd <bus> <addr> <len>\r\n"); return 1; }
         uint32_t bus, addr, len;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[4], &len) != 0 || len == 0 || len > 256) { shell_puts("Invalid len (1..256)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &len) != 0 || len == 0 || len > 256) { sh_puts("Invalid len (1..256)\r\n"); return 1; }
         uint8_t buf[256];
         hal_err_t r = hal_i2c_rx(bus, (uint8_t)addr, buf, (size_t)len);
-        if (r != HAL_OK) { shell_puts("I2C RD NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" RD 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
-        shell_puts("] ("); shell_put_uint32(len); shell_puts(" bytes)\r\n");
+        if (r != HAL_OK) { sh_puts("I2C RD NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf(); return 1; }
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" RD 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) sh_putc(' '); shell_print_hex8(buf[i]); }
+        sh_puts("] ("); shell_put_uint32(len); sh_puts(" bytes)\r\n");
         return 0;
     }
 
     if (strcmp(sub, "memwr") == 0) {
-        if (argc < 6) { shell_puts("Usage: i2c memwr <bus> <addr> <reg> <B1> [..Bn]\r\n"); return 1; }
+        if (argc < 6) { sh_puts("Usage: i2c memwr <bus> <addr> <reg> <B1> [..Bn]\r\n"); return 1; }
         uint32_t bus, addr, reg;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { shell_puts("Invalid reg (0..0xFFFF, 16-bit mem addr)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { sh_puts("Invalid reg (0..0xFFFF, 16-bit mem addr)\r\n"); return 1; }
         int nbytes = argc - 5;
-        if (nbytes <= 0 || nbytes > 254) { shell_puts("Need 1..254 data bytes\r\n"); return 1; }
+        if (nbytes <= 0 || nbytes > 254) { sh_puts("Need 1..254 data bytes\r\n"); return 1; }
         uint8_t buf[254];
         for (int i = 0; i < nbytes; i++) {
             uint32_t v;
             if (shell_parse_uint_auto(argv[5 + i], &v) != 0 || v > 0xFF) {
-                shell_puts("Invalid byte at pos "); shell_put_uint32(i); shell_crlf();
+                sh_puts("Invalid byte at pos "); shell_put_uint32(i); sh_crlf();
                 return 1;
             }
             buf[i] = (uint8_t)v;
         }
         hal_err_t r = hal_i2c_mem_write(bus, (uint8_t)addr, (uint16_t)reg, buf, (size_t)nbytes);
-        if (r != HAL_OK) { shell_puts("I2C MEMWR ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
-                           shell_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); shell_crlf(); return 1; }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" MEMWR 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
-        shell_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
-        shell_puts("]\r\n");
+        if (r != HAL_OK) { sh_puts("I2C MEMWR ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
+                           sh_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); sh_crlf(); return 1; }
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" MEMWR 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
+        sh_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) sh_putc(' '); shell_print_hex8(buf[i]); }
+        sh_puts("]\r\n");
         return 0;
     }
 
     if (strcmp(sub, "memrd") == 0) {
-        if (argc < 6) { shell_puts("Usage: i2c memrd <bus> <addr> <reg> <len>\r\n"); return 1; }
+        if (argc < 6) { sh_puts("Usage: i2c memrd <bus> <addr> <reg> <len>\r\n"); return 1; }
         uint32_t bus, addr, reg, len;
-        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { shell_puts("Invalid reg (0..0xFFFF)\r\n"); return 1; }
-        if (shell_parse_uint_auto(argv[5], &len) != 0 || len == 0 || len > 256) { shell_puts("Invalid len (1..256)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { sh_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { sh_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { sh_puts("Invalid reg (0..0xFFFF)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &len) != 0 || len == 0 || len > 256) { sh_puts("Invalid len (1..256)\r\n"); return 1; }
         uint8_t buf[256];
         hal_err_t r = hal_i2c_mem_read(bus, (uint8_t)addr, (uint16_t)reg, buf, (size_t)len);
-        if (r != HAL_OK) { shell_puts("I2C MEMRD ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
-                           shell_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); shell_crlf(); return 1; }
-        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" MEMRD 0x"); shell_print_hex8((uint8_t)addr);
-        shell_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
-        shell_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
-        shell_puts("]\r\n");
+        if (r != HAL_OK) { sh_puts("I2C MEMRD ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
+                           sh_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); sh_crlf(); return 1; }
+        sh_puts("OK: I2C"); shell_put_uint32(bus); sh_puts(" MEMRD 0x"); shell_print_hex8((uint8_t)addr);
+        sh_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
+        sh_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) sh_putc(' '); shell_print_hex8(buf[i]); }
+        sh_puts("]\r\n");
         return 0;
     }
 
-    shell_puts("Unknown i2c subcommand: '"); shell_puts(sub); shell_puts("' (try 'i2c help')\r\n");
+    sh_puts("Unknown i2c subcommand: '"); sh_puts(sub); sh_puts("' (try 'i2c help')\r\n");
     return 1;
 
 #else /* !PERIPH_SERVICE */
     (void)argc; (void)argv;
-    shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, I2C HAL not linked.\r\n");
+    sh_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, I2C HAL not linked.\r\n");
     return 1;
 #endif
 }
@@ -942,7 +966,7 @@ static int cmd_i2c(int argc, char **argv) {
 static int cmd_bootscript_status(int argc, char **argv);   /* 前向声明，定义在下方 */
 
 static int cmd_boot(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: boot exec | boot flash_test | boot status\r\n"
+    if (argc < 2) { sh_puts("Usage: boot exec | boot flash_test | boot status\r\n"
                                "  exec       - 立即执行全部固化命令（与开机同路径）\r\n"
                                "  flash_test - (B线路SPI) 擦+写双备份扇区后校验一致性\r\n"
                                "  status     - 查看 RAM 中上次开机 bootscript 回放结果（解决启动时 USB 输出被丢看不到）\r\n"); return 1; }
@@ -951,20 +975,20 @@ static int cmd_boot(int argc, char **argv) {
     if (strcmp(sub, "status") == 0)      return cmd_bootscript_status(argc, argv);
     if (strcmp(sub, "flash_test") == 0) {
         hal_err_t e = bootscript_erase_test();
-        if (e != HAL_OK) { shell_puts("B-LINE SPI: ERASE FAILED\r\n"); return 1; }
+        if (e != HAL_OK) { sh_puts("B-LINE SPI: ERASE FAILED\r\n"); return 1; }
         bool ok = bootscript_verify();
-        if (!ok)     { shell_puts("B-LINE SPI: BACKUP MISMATCH/CRC FAIL\r\n"); return 1; }
-        shell_puts("B-LINE SPI: Flash backup sectors A/B erase→write OK, headers consistent.\r\n");
+        if (!ok)     { sh_puts("B-LINE SPI: BACKUP MISMATCH/CRC FAIL\r\n"); return 1; }
+        sh_puts("B-LINE SPI: Flash backup sectors A/B erase→write OK, headers consistent.\r\n");
         /* 追加并再校验，压力测试单个 slot write 路径 */
         e = bootscript_append("led on");
-        if (e != HAL_OK) { shell_puts("B-LINE SPI: APPEND FAILED (rc="); shell_put_uint32(e); shell_puts(")\r\n"); return 1; }
+        if (e != HAL_OK) { sh_puts("B-LINE SPI: APPEND FAILED (rc="); shell_put_uint32(e); sh_puts(")\r\n"); return 1; }
         ok = bootscript_verify();
-        if (!ok) { shell_puts("B-LINE SPI: POST-APPEND BACKUP MISMATCH\r\n"); return 1; }
+        if (!ok) { sh_puts("B-LINE SPI: POST-APPEND BACKUP MISMATCH\r\n"); return 1; }
         (void)bootscript_clear_all();
-        shell_puts("B-LINE SPI: Append + dual-copy CRC check PASSED.\r\n");
+        sh_puts("B-LINE SPI: Append + dual-copy CRC check PASSED.\r\n");
         return 0;
     }
-    shell_puts("Unknown boot subcommand: '"); shell_puts(sub); shell_puts("'\r\n"); return 1;
+    sh_puts("Unknown boot subcommand: '"); sh_puts(sub); sh_puts("'\r\n"); return 1;
 }
 
 /* —— boot status: 打印 RAM 中保存的上次 bootscript_run_all 回放结果 ——
@@ -983,66 +1007,66 @@ static int cmd_boot(int argc, char **argv) {
 static int cmd_bootscript_status(int argc, char **argv) {
     (void)argc; (void)argv;
     const bootscript_status_t *st = bootscript_get_status();
-    shell_puts("==============================================================\r\n");
-    shell_puts("  Bootscript Playback Status (RAM resident, since power-on)\r\n");
-    shell_puts("==============================================================\r\n");
+    sh_puts("==============================================================\r\n");
+    sh_puts("  Bootscript Playback Status (RAM resident, since power-on)\r\n");
+    sh_puts("==============================================================\r\n");
     if (!st->ran) {
-        shell_puts("  · bootscript_run_all() has NOT been called this boot.\r\n");
-        shell_puts("  · Possible reasons: OS_CFG_SHELL=0, or shell_start() never invoked.\r\n");
-        shell_puts("  · Tip: try 'boot exec' to run it now (same path as power-on).\r\n");
-        shell_puts("==============================================================\r\n");
+        sh_puts("  · bootscript_run_all() has NOT been called this boot.\r\n");
+        sh_puts("  · Possible reasons: OS_CFG_SHELL=0, or shell_start() never invoked.\r\n");
+        sh_puts("  · Tip: try 'boot exec' to run it now (same path as power-on).\r\n");
+        sh_puts("==============================================================\r\n");
         return 1;
     }
-    shell_puts("  · Called        : YES (current boot)\r\n");
-    shell_puts("  · Total slots   : "); shell_put_uint32(st->total); shell_crlf();
-    shell_puts("  · Executed OK   : "); shell_put_uint32(st->ok_count); shell_crlf();
-    shell_puts("  · Executed FAIL : "); shell_put_uint32(st->fail_count); shell_crlf();
-    shell_puts("  · GPIO25 level  : ");
+    sh_puts("  · Called        : YES (current boot)\r\n");
+    sh_puts("  · Total slots   : "); shell_put_uint32(st->total); sh_crlf();
+    sh_puts("  · Executed OK   : "); shell_put_uint32(st->ok_count); sh_crlf();
+    sh_puts("  · Executed FAIL : "); shell_put_uint32(st->fail_count); sh_crlf();
+    sh_puts("  · GPIO25 level  : ");
     if (st->final_gpio25_level == 0xFFu) {
-        shell_puts("UNKNOWN (no PERIPH service or 0 entries)\r\n");
+        sh_puts("UNKNOWN (no PERIPH service or 0 entries)\r\n");
     } else if (st->final_gpio25_level == 1u) {
-        shell_puts("HIGH — LED SHOULD BE ON (bootscript `led on` took effect)\r\n");
+        sh_puts("HIGH — LED SHOULD BE ON (bootscript `led on` took effect)\r\n");
     } else {
-        shell_puts("LOW — LED IS OFF (if you expected ON, check `led on` rc below)\r\n");
+        sh_puts("LOW — LED IS OFF (if you expected ON, check `led on` rc below)\r\n");
     }
-    shell_puts("--------------------------------------------------------------\r\n");
+    sh_puts("--------------------------------------------------------------\r\n");
     if (st->total == 0) {
-        shell_puts("  (No persistent commands stored at boot time. 'list' may show new saves since.)\r\n");
+        sh_puts("  (No persistent commands stored at boot time. 'list' may show new saves since.)\r\n");
     } else {
-        shell_puts("  # | RC  | Result | Command line\r\n");
-        shell_puts("----+-----+--------+---------------------------------------------\r\n");
+        sh_puts("  # | RC  | Result | Command line\r\n");
+        sh_puts("----+-----+--------+---------------------------------------------\r\n");
         for (uint8_t i = 0; i < st->total; i++) {
             const bootscript_log_entry_t *e = &st->entries[i];
             /* 序号 */
-            shell_pad_spaces(3); shell_put_uint32(i); shell_puts(" | ");
+            shell_pad_spaces(3); shell_put_uint32(i); sh_puts(" | ");
             /* rc: 最多 4 位 + 符号 */
             int rc = e->exec_rc;
-            if (rc == -999) shell_puts("CRC  ");  /* 特殊：读失败 */
+            if (rc == -999) sh_puts("CRC  ");  /* 特殊：读失败 */
             else {
                 if (rc < 0) { hal_console_putc('-'); rc = -rc; }
                 else hal_console_putc(' ');
-                if (rc >= 100) { shell_put_uint32((uint32_t)rc / 100); } else shell_putc(' ');
-                if (rc >= 10)  { shell_put_uint32(((uint32_t)rc / 10) % 10); } else shell_putc(' ');
+                if (rc >= 100) { shell_put_uint32((uint32_t)rc / 100); } else sh_putc(' ');
+                if (rc >= 10)  { shell_put_uint32(((uint32_t)rc / 10) % 10); } else sh_putc(' ');
                 shell_put_uint32((uint32_t)rc % 10);
             }
-            shell_puts(" | ");
+            sh_puts(" | ");
             /* result */
-            if (e->exec_rc == 0)       shell_puts("PASS   | ");
-            else if (e->exec_rc == -999) shell_puts("BAD SLOT| ");
-            else                        shell_puts("FAIL   | ");
+            if (e->exec_rc == 0)       sh_puts("PASS   | ");
+            else if (e->exec_rc == -999) sh_puts("BAD SLOT| ");
+            else                        sh_puts("FAIL   | ");
             /* command line（最多 60 字，超长截断 … ） */
             {
                 const char *p = e->cmd_line[0] ? e->cmd_line : "(empty)";
                 int shown = 0;
                 while (*p && shown < 60) { hal_console_putc(*p++); shown++; }
-                if (*p) shell_puts("...");
+                if (*p) sh_puts("...");
             }
-            shell_crlf();
+            sh_crlf();
         }
     }
-    shell_puts("==============================================================\r\n");
-    shell_puts("  Tip: To force re-run and refresh this status, use:  boot exec\r\n");
-    shell_puts("==============================================================\r\n");
+    sh_puts("==============================================================\r\n");
+    sh_puts("  Tip: To force re-run and refresh this status, use:  boot exec\r\n");
+    sh_puts("==============================================================\r\n");
     return 0;
 }
 
@@ -1108,37 +1132,37 @@ static void argv_rejoin(int argc, char **argv, int arg_start, char *buf, size_t 
  *       6. 如果 total == 0（且 HAL 已就绪），**主动 dump A/B 扇区诊断**，
  *          防止"save 成功 list 看到、重启却 count=0"的扇区双写不一致被静默掩盖。 */
 int bootscript_run_all(void) {
-    shell_puts("==============================================================\r\n");
-    shell_puts("=====         BOOTSCRIPT START (persistent cmd playback)        =====\r\n");
-    shell_puts("==============================================================\r\n");
+    sh_puts("==============================================================\r\n");
+    sh_puts("=====         BOOTSCRIPT START (persistent cmd playback)        =====\r\n");
+    sh_puts("==============================================================\r\n");
     uint8_t total = bootscript_count();
     bootscript_rec_begin(total);                 /* ← RAM 记录：begin */
     if (total == 0) {
-        shell_puts("[BOOT ] bootscript_count()==0 — No persistent commands saved yet.\r\n");
-        shell_puts("[BOOT ] (Use 'save <cmd>' to queue, or '!<cmd>' to exec-then-save)\r\n");
+        sh_puts("[BOOT ] bootscript_count()==0 — No persistent commands saved yet.\r\n");
+        sh_puts("[BOOT ] (Use 'save <cmd>' to queue, or '!<cmd>' to exec-then-save)\r\n");
         /* 诊断：A/B 扇区 dump 出来，防止用户 save 后重启显示空、
          *       但是实际上只是双备份 A 或 B 某一侧 CRC/写入没成功。 */
         bootscript_diag_dump();
-        shell_puts("==============================================================\r\n");
-        shell_puts("=====         BOOTSCRIPT DONE (0 entries, idle)                =====\r\n");
-        shell_puts("==============================================================\r\n");
+        sh_puts("==============================================================\r\n");
+        sh_puts("=====         BOOTSCRIPT DONE (0 entries, idle)                =====\r\n");
+        sh_puts("==============================================================\r\n");
         bootscript_rec_end(0, 0, 0xFFu);           /* ← RAM 记录：end (0 entries, GPIO unknown) */
         return 0;
     }
-    shell_puts("[BOOT ] Will run "); shell_put_uint32(total); shell_puts(" persistent command(s):\r\n");
+    sh_puts("[BOOT ] Will run "); shell_put_uint32(total); sh_puts(" persistent command(s):\r\n");
     int failed = 0;
     uint8_t ok_cnt = 0;
     for (uint8_t i = 0; i < total; i++) {
         char line[SHELL_LINE_SIZE];
-        shell_puts("[BOOT ] --- BEGIN #"); shell_put_uint32(i); shell_puts(" ---\r\n");
+        sh_puts("[BOOT ] --- BEGIN #"); shell_put_uint32(i); sh_puts(" ---\r\n");
         if (!bootscript_get(i, line, sizeof(line))) {
-            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": FAILED to read slot (CRC corrupt?)\r\n");
+            sh_puts("[BOOT ] #"); shell_put_uint32(i); sh_puts(": FAILED to read slot (CRC corrupt?)\r\n");
             failed++;
             bootscript_rec_entry(i, "<slot CRC corrupt>", -999);
-            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" FAIL (read)\r\n");
+            sh_puts("[BOOT ] --- END #"); shell_put_uint32(i); sh_puts(" FAIL (read)\r\n");
             continue;
         }
-        shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": $ "); shell_puts(line); shell_crlf();
+        sh_puts("[BOOT ] #"); shell_put_uint32(i); sh_puts(": $ "); sh_puts(line); sh_crlf();
         /* 【hotfix2: shell_exec_line 内部会用 strtok/strsep 把空格换成 '\0'，
          *  所以在此之前先快照一份原始命令行，供 bootscript_rec_entry 记录使用。
          *  否则 boot status 里会看到 "led"（第一个 token）而不是完整的 "led on"。*/
@@ -1149,13 +1173,13 @@ int bootscript_run_all(void) {
         int rc = shell_exec_line(line);
         bootscript_rec_entry(i, line_snap, rc);          /* ← RAM 记录：每条命令结果（完整原始行） */
         if (rc != 0) {
-            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": exit code=");
-            shell_put_err((int)rc); shell_crlf();
+            sh_puts("[BOOT ] #"); shell_put_uint32(i); sh_puts(": exit code=");
+            shell_put_err((int)rc); sh_crlf();
             failed++;
-            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" FAIL (exec)\r\n");
+            sh_puts("[BOOT ] --- END #"); shell_put_uint32(i); sh_puts(" FAIL (exec)\r\n");
         } else {
             ok_cnt++;
-            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" OK\r\n");
+            sh_puts("[BOOT ] --- END #"); shell_put_uint32(i); sh_puts(" OK\r\n");
         }
     }
     /* 回放结束，给用户视觉锚点：GPIO25 电平直接汇报（用户最关心的就是 LED 是否亮） */
@@ -1164,72 +1188,72 @@ int bootscript_run_all(void) {
     {
         hal_gpio_level_t lvl = hal_gpio_read(25);
         gpio25_after = (lvl == HAL_GPIO_HIGH) ? 1u : 0u;
-        shell_puts("[BOOT ] GPIO25 (LED) level after bootscript = ");
-        shell_puts((lvl == HAL_GPIO_HIGH) ? "HIGH (LED should be ON)\r\n" : "LOW (LED OFF)\r\n");
+        sh_puts("[BOOT ] GPIO25 (LED) level after bootscript = ");
+        sh_puts((lvl == HAL_GPIO_HIGH) ? "HIGH (LED should be ON)\r\n" : "LOW (LED OFF)\r\n");
     }
 #endif
-    shell_puts("[BOOT ] Summary: ");
+    sh_puts("[BOOT ] Summary: ");
     shell_put_uint32((uint32_t)(total - (uint8_t)failed));
-    shell_puts(" ok / ");
+    sh_puts(" ok / ");
     shell_put_uint32((uint32_t)((failed < 0) ? 0 : failed));
-    shell_puts(" failed (total="); shell_put_uint32(total); shell_puts(")\r\n");
-    shell_puts("==============================================================\r\n");
-    shell_puts("=====         BOOTSCRIPT DONE                                   =====\r\n");
-    shell_puts("==============================================================\r\n");
+    sh_puts(" failed (total="); shell_put_uint32(total); sh_puts(")\r\n");
+    sh_puts("==============================================================\r\n");
+    sh_puts("=====         BOOTSCRIPT DONE                                   =====\r\n");
+    sh_puts("==============================================================\r\n");
     bootscript_rec_end(ok_cnt, (uint8_t)((failed < 0) ? 0 : failed), gpio25_after);
     return failed;
 }
 
 static int cmd_bootscript_save(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: save <command line...>\r\n  e.g. save i2c init 0 4 5 100000\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: save <command line...>\r\n  e.g. save i2c init 0 4 5 100000\r\n"); return 1; }
     char line[SHELL_LINE_SIZE];
     argv_rejoin(argc, argv, 1, line, sizeof(line));
     hal_err_t r = bootscript_append(line);
     if (r == HAL_OK) { uint8_t n = bootscript_count();
-        shell_puts("OK: Saved as #"); shell_put_uint32((uint32_t)(n - 1));
-        shell_puts(" (total "); shell_put_uint32(n); shell_puts("/32, Remaining: ");
-        shell_put_uint32(32u - (uint32_t)n); shell_puts(" slots). Persistent across reset.\r\n"); return 0; }
-    if (r == HAL_ERR_FULL)  shell_puts("ERROR: bootscript full (max 32 entries). Use 'unsave <idx>'.\r\n");
-    else if (r == HAL_ERR_PARAM) shell_puts("ERROR: command too long (>123 B) or empty.\r\n");
-    else if (r == HAL_ERR_NOMEM) shell_puts("ERROR: kmalloc 4KB staging failed.\r\n");
-    else { shell_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); }
+        sh_puts("OK: Saved as #"); shell_put_uint32((uint32_t)(n - 1));
+        sh_puts(" (total "); shell_put_uint32(n); sh_puts("/32, Remaining: ");
+        shell_put_uint32(32u - (uint32_t)n); sh_puts(" slots). Persistent across reset.\r\n"); return 0; }
+    if (r == HAL_ERR_FULL)  sh_puts("ERROR: bootscript full (max 32 entries). Use 'unsave <idx>'.\r\n");
+    else if (r == HAL_ERR_PARAM) sh_puts("ERROR: command too long (>123 B) or empty.\r\n");
+    else if (r == HAL_ERR_NOMEM) sh_puts("ERROR: kmalloc 4KB staging failed.\r\n");
+    else { sh_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); sh_puts(").\r\n"); }
     return 1;
 }
 
 static int cmd_bootscript_unsave(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: unsave <idx> | unsave all\r\n"); return 1; }
+    if (argc < 2) { sh_puts("Usage: unsave <idx> | unsave all\r\n"); return 1; }
     if (strcmp(argv[1], "all") == 0) {
         hal_err_t r = bootscript_clear_all();
-        if (r == HAL_OK) { shell_puts("OK: All persistent commands erased. Remaining: 32/32 slots (free).\r\n"); return 0; }
-        shell_puts("ERROR: Flash erase failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); return 1;
+        if (r == HAL_OK) { sh_puts("OK: All persistent commands erased. Remaining: 32/32 slots (free).\r\n"); return 0; }
+        sh_puts("ERROR: Flash erase failed (code="); shell_put_err((int)r); sh_puts(").\r\n"); return 1;
     }
     uint32_t idx;
     extern int shell_parse_uint_auto(const char *s, uint32_t *out);   /* same file, defined earlier */
-    if (shell_parse_uint_auto(argv[1], &idx) != 0) { shell_puts("ERROR: bad index\r\n"); return 1; }
+    if (shell_parse_uint_auto(argv[1], &idx) != 0) { sh_puts("ERROR: bad index\r\n"); return 1; }
     uint8_t count = bootscript_count();
-    if (idx >= count) { shell_puts("ERROR: index out of range (have "); shell_put_uint32(count); shell_puts(" entries)\r\n"); return 1; }
+    if (idx >= count) { sh_puts("ERROR: index out of range (have "); shell_put_uint32(count); sh_puts(" entries)\r\n"); return 1; }
     hal_err_t r = bootscript_remove((uint8_t)idx);
     if (r == HAL_OK) { uint8_t left = bootscript_count();
-        shell_puts("OK: Removed #"); shell_put_uint32(idx);
-        shell_puts(" (used "); shell_put_uint32(left); shell_puts("/32, Remaining: ");
-        shell_put_uint32(32u - (uint32_t)left); shell_puts(" slots)\r\n"); return 0; }
-    shell_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); return 1;
+        sh_puts("OK: Removed #"); shell_put_uint32(idx);
+        sh_puts(" (used "); shell_put_uint32(left); sh_puts("/32, Remaining: ");
+        shell_put_uint32(32u - (uint32_t)left); sh_puts(" slots)\r\n"); return 0; }
+    sh_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); sh_puts(").\r\n"); return 1;
 }
 
 static int cmd_bootscript_list(int argc, char **argv) {
     (void)argc; (void)argv;
     uint8_t n = bootscript_count();
     uint32_t rem = 32u - (uint32_t)n;
-    shell_puts("Persistent commands (used "); shell_put_uint32(n);
-    shell_puts(", free "); shell_put_uint32(rem); shell_puts("/32 slots, Flash 2x backup):\r\n");
+    sh_puts("Persistent commands (used "); shell_put_uint32(n);
+    sh_puts(", free "); shell_put_uint32(rem); sh_puts("/32 slots, Flash 2x backup):\r\n");
     for (uint8_t i = 0; i < n; i++) {
         char line[SHELL_LINE_SIZE];
         if (!bootscript_get(i, line, sizeof(line))) {
-            shell_puts("  #"); shell_put_uint32(i); shell_puts(": <CRC CORRUPT>\r\n"); continue;
+            sh_puts("  #"); shell_put_uint32(i); sh_puts(": <CRC CORRUPT>\r\n"); continue;
         }
-        shell_puts("  #"); shell_put_uint32(i); shell_puts(": "); shell_puts(line); shell_crlf();
+        sh_puts("  #"); shell_put_uint32(i); sh_puts(": "); sh_puts(line); sh_crlf();
     }
-    if (n == 0) shell_puts("  (empty. Try: save i2c init 0 4 5 100000)\r\n");
+    if (n == 0) sh_puts("  (empty. Try: save i2c init 0 4 5 100000)\r\n");
     return 0;
 }
 
@@ -1257,30 +1281,30 @@ static int cmd_bootscript_boot_exec(int argc, char **argv) {
 static int cmd_factory_reset(int argc, char **argv) {
     /* 第 1 步：无 confirm → 只打印警告 */
     if (argc < 2 || strcmp(argv[1], "confirm") != 0) {
-        shell_puts("****************************************************************\r\n");
-        shell_puts("*                    FACTORY RESET WARNING                     *\r\n");
-        shell_puts("****************************************************************\r\n");
-        shell_puts("  此命令将把系统恢复到刚刷完固件的出厂状态：\r\n");
-        shell_puts("   ✓ 保留：内核 + demo_app 固件本身（操作系统完整保留）\r\n");
-        shell_puts("   ✗ 清除：所有固化指令 (save / ! 保存的 bootscript 全部条目)\r\n");
-        shell_puts("   ✗ 清除：板载 SPI Flash 最后 64KB 保留区 (16 sectors)\r\n");
-        shell_puts("   ✗ 清除：任何应用层写入的持久化用户数据\r\n");
-        shell_puts("  操作不可恢复！请确保已备份重要配置。\r\n");
-        shell_puts("  要继续，请输入:  factory_reset confirm\r\n");
-        shell_puts("****************************************************************\r\n");
+        sh_puts("****************************************************************\r\n");
+        sh_puts("*                    FACTORY RESET WARNING                     *\r\n");
+        sh_puts("****************************************************************\r\n");
+        sh_puts("  此命令将把系统恢复到刚刷完固件的出厂状态：\r\n");
+        sh_puts("   ✓ 保留：内核 + demo_app 固件本身（操作系统完整保留）\r\n");
+        sh_puts("   ✗ 清除：所有固化指令 (save / ! 保存的 bootscript 全部条目)\r\n");
+        sh_puts("   ✗ 清除：板载 SPI Flash 最后 64KB 保留区 (16 sectors)\r\n");
+        sh_puts("   ✗ 清除：任何应用层写入的持久化用户数据\r\n");
+        sh_puts("  操作不可恢复！请确保已备份重要配置。\r\n");
+        sh_puts("  要继续，请输入:  factory_reset confirm\r\n");
+        sh_puts("****************************************************************\r\n");
         return 0;
     }
 
-    shell_puts("[FACTORY_RESET] Starting... Will erase tail 64KB of SPI Flash (keep kernel FW).\r\n");
+    sh_puts("[FACTORY_RESET] Starting... Will erase tail 64KB of SPI Flash (keep kernel FW).\r\n");
 
     /* 先快速清 bootscript 双备份（带 CRC 的 2 个扇区），之后即使断电也不会残留 */
     hal_err_t r = bootscript_clear_all();
     if (r != HAL_OK) {
-        shell_puts("[FACTORY_RESET] FAIL: bootscript_clear_all returned ");
-        shell_put_err((int)r); shell_crlf();
+        sh_puts("[FACTORY_RESET] FAIL: bootscript_clear_all returned ");
+        shell_put_err((int)r); sh_crlf();
         return 1;
     }
-    shell_puts("[FACTORY_RESET] Bootscript (2×4KB) cleared OK.\r\n");
+    sh_puts("[FACTORY_RESET] Bootscript (2×4KB) cleared OK.\r\n");
 
     /* 再擦剩余 14 个扇区（共 16 个）：从 FACTORY_RESET_BASE 往上到末尾 */
     uint32_t base = (uint32_t)PICO_FLASH_SIZE_BYTES - (uint32_t)FACTORY_RESET_SECTORS * HAL_FLASH_SECTOR_SIZE;
@@ -1290,24 +1314,24 @@ static int cmd_factory_reset(int argc, char **argv) {
          *   再擦一遍也没问题；但为了"进度汇报"统一，这里统一都擦并计数。 */
         hal_err_t er = hal_flash_erase_sector(off);
         if (er != HAL_OK) {
-            shell_puts("[FACTORY_RESET] FAIL at sector "); shell_put_uint32(s);
-            shell_puts(" (offset="); shell_put_hex32(off);
-            shell_puts(") code="); shell_put_err((int)er); shell_crlf();
+            sh_puts("[FACTORY_RESET] FAIL at sector "); shell_put_uint32(s);
+            sh_puts(" (offset="); shell_put_hex32(off);
+            sh_puts(") code="); shell_put_err((int)er); sh_crlf();
             return 1;
         }
         if (((s + 1) % 4) == 0 || s == FACTORY_RESET_SECTORS - 1) {
-            shell_puts("[FACTORY_RESET] Erased "); shell_put_uint32(s + 1);
-            shell_puts("/"); shell_put_uint32(FACTORY_RESET_SECTORS);
-            shell_puts(" sectors (");
+            sh_puts("[FACTORY_RESET] Erased "); shell_put_uint32(s + 1);
+            sh_puts("/"); shell_put_uint32(FACTORY_RESET_SECTORS);
+            sh_puts(" sectors (");
             shell_put_uint32((s + 1) * HAL_FLASH_SECTOR_SIZE / 1024u);
-            shell_puts(" KB)\r\n");
+            sh_puts(" KB)\r\n");
         }
     }
 
-    shell_puts("[FACTORY_RESET] DONE. System restored to factory state (v");
-    shell_puts(k_version());
-    shell_puts(").\r\n");
-    shell_puts("[FACTORY_RESET] Please POWER-CYCLE (拔插 USB) or press RUN 键重新上电以进入全新状态。\r\n");
+    sh_puts("[FACTORY_RESET] DONE. System restored to factory state (v");
+    sh_puts(k_version());
+    sh_puts(").\r\n");
+    sh_puts("[FACTORY_RESET] Please POWER-CYCLE (拔插 USB) or press RUN 键重新上电以进入全新状态。\r\n");
     return 0;
 }
 
@@ -1366,9 +1390,9 @@ static int shell_exec_line(char *line) {
     bool overflowed = false;
     int argc = shell_split_argv(line, argv, SHELL_MAX_ARGS, &overflowed);
     if (overflowed) {
-        shell_puts("WARNING: Too many tokens! Only first ");
+        sh_puts("WARNING: Too many tokens! Only first ");
         shell_put_uint32(SHELL_MAX_ARGS);
-        shell_puts(" parsed. Increase SHELL_MAX_ARGS.\r\n");
+        sh_puts(" parsed. Increase SHELL_MAX_ARGS.\r\n");
     }
     if (argc == 0) return 0;   /* 空行 */
     const char *name = argv[0];
@@ -1381,12 +1405,21 @@ static int shell_exec_line(char *line) {
             break;
         }
     }
+    /* v2.2 新增：如果静态表没找到，查"扩展命令表"（msc/ls/cd/pwd/mkdir/rmdir/rm/cat）
+     *   扩展函数签名多一个 ctx 参数（我们永远传 NULL）。 */
+    if (!found) {
+        shell_cmd_fn_ext_t fn = NULL;
+        if (shell_ext_lookup(name, &fn, NULL, NULL) >= 0) {
+            found = true;
+            rc = fn(argc, argv, NULL);
+        }
+    }
     /* 只有命令表里完全没命中才打印 "Unknown command"；handler 返回 1 只是表示失败（此时
      *   handler 自己应该已经打印了具体错误信息），不能误报"未知命令"。*/
     if (!found) {
-        shell_puts("Unknown command: ");
-        shell_puts(name);
-        shell_puts(" (try 'help')\r\n");
+        sh_puts("Unknown command: ");
+        sh_puts(name);
+        sh_puts(" (try 'help')\r\n");
     }
 
     /* ! 糖衣：执行成功 → 追加 Flash；成功/失败都汇报剩余 slots */
@@ -1395,11 +1428,11 @@ static int shell_exec_line(char *line) {
         if (br == HAL_OK) {
             uint8_t n = bootscript_count();
             uint8_t rem = (uint8_t)(32u - (uint32_t)n);
-            shell_puts("  → Auto-saved as #"); shell_put_uint32((uint32_t)(n - 1));
-            shell_puts(" (persistent on Flash. Remaining: "); shell_put_uint32(rem); shell_puts("/32 slots)\r\n");
+            sh_puts("  → Auto-saved as #"); shell_put_uint32((uint32_t)(n - 1));
+            sh_puts(" (persistent on Flash. Remaining: "); shell_put_uint32(rem); sh_puts("/32 slots)\r\n");
         } else {
-            shell_puts("  → FAILED to save to Flash (code=");
-            shell_put_err((int)br); shell_puts(")\r\n");
+            sh_puts("  → FAILED to save to Flash (code=");
+            shell_put_err((int)br); sh_puts(")\r\n");
         }
     }
     return rc;
@@ -1413,14 +1446,47 @@ static void task_shell(void *arg) {
     static char line_buf[SHELL_LINE_SIZE];
     int pos = 0;
 
-    shell_crlf();
-    shell_puts("========================================\r\n");
-    shell_puts("  Mini Kernel Interactive Shell Ready\r\n");
-    shell_puts("  Version: "); shell_puts(k_version()); shell_crlf();
-    shell_puts("  Type 'help' to list commands.\r\n");
-    shell_puts("========================================\r\n");
-    shell_crlf();
-    shell_puts(SHELL_PROMPT_STR);
+    /* v2.2 ① 先注册扩展命令（msc/ls/cd/pwd/mkdir/rmdir/rm/cat）到 shell_register
+     *        动态命令表。这样 help + dispatch 都能立即看到它们。 */
+    shell_fs_register();
+
+#if OS_CFG_FATFS
+    /* v2.2 ② 挂载 FatFs（空片时会自动 f_mkfs FAT16）
+     *   fatfs_init_and_mount 自己会处理 ejected 状态互斥（格式化完会 ejected=true）。 */
+    {
+        extern int fatfs_init_and_mount(void);   /* 原型在 fatfs_api.h，但 fatfs_api.h 含 ff.h → 避免此处 ff.h 依赖 */
+        extern bool fatfs_is_mounted(void);
+        extern bool fatfs_mkfs_done_this_boot(void);
+        extern bool msc_blockdev_is_ejected(void);
+        int fr = fatfs_init_and_mount();
+        if (fr == 0 /* FR_OK */) {
+            sh_crlf();
+            if (fatfs_mkfs_done_this_boot()) {
+                sh_puts("[FS   ] Fresh FAT16 formatted (blank chip). Data disk now 1016KiB.\r\n");
+            } else {
+                sh_puts("[FS   ] FatFs FAT16 mounted OK.\r\n");
+            }
+            sh_puts("[FS   ] Shell R/W EXCLUSIVE (host USB sees ejected).\r\n");
+            sh_puts("[FS   ] Run `msc mount` to let host see the drive, then `msc eject` to write files from shell.\r\n");
+        } else {
+            sh_crlf();
+            sh_puts("[FS   ] FatFs mount failed (code=");
+            /* 用 shell_put_err 打印 —— FatFs FRESULT 也是 0=ok <0 错误码相同约定 */
+            extern void shell_put_err(int);
+            shell_put_err((int)fr);
+            sh_puts("). Run `msc format` if disk is blank or corrupted.\r\n");
+        }
+    }
+#endif /* OS_CFG_FATFS */
+
+    sh_crlf();
+    sh_puts("========================================\r\n");
+    sh_puts("  Mini Kernel Interactive Shell Ready\r\n");
+    sh_puts("  Version: "); sh_puts(k_version()); sh_crlf();
+    sh_puts("  Type 'help' to list commands.\r\n");
+    sh_puts("========================================\r\n");
+    sh_crlf();
+    sh_puts(SHELL_PROMPT_STR);
 
     while (1) {
         char c = 0;
@@ -1474,20 +1540,20 @@ static void task_shell(void *arg) {
         switch (c) {
             case '\r':   /* 回车 → Mac/Windows 终端行结束 */
             case '\n':   /* 换行 → Unix 终端行结束 */
-                shell_crlf();
+                sh_crlf();
                 line_buf[pos] = '\0';
                 shell_exec_line(line_buf);
                 pos = 0;
-                shell_puts(SHELL_PROMPT_STR);
+                sh_puts(SHELL_PROMPT_STR);
                 break;
 
             case '\b':   /* 退格：VT100 序列：打印 \b 空格 \b */
             case 0x7F:   /* DEL：也当作退格 */
                 if (pos > 0) {
                     pos--;
-                    shell_putc('\b');
-                    shell_putc(' ');
-                    shell_putc('\b');
+                    sh_putc('\b');
+                    sh_putc(' ');
+                    sh_putc('\b');
                 }
                 break;
 
@@ -1496,7 +1562,7 @@ static void task_shell(void *arg) {
                 if ((c >= 0x20 && c < 0x7F) || c == '\t') {
                     if (pos + 1 < SHELL_LINE_SIZE) {
                         line_buf[pos++] = c;
-                        shell_putc(c);   /* 本地回显（仅此一次） */
+                        sh_putc(c);   /* 本地回显（仅此一次） */
                     }
                 }
                 break;

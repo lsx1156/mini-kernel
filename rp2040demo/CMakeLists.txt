@@ -97,6 +97,22 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
 )
 
+# v2.2: USB Composite (CDC+MSC) 强制 TinyUSB 打开 MSC class。
+#   CFG_TUD_MSC 控制 tinyusb_device 是否编译 src/class/msc/msc_device.c，
+#   我们的 msc_usb.c 依赖这些 MSC API (tud_msc_inquiry_cb 等)。
+#   同时设置 CFG_TUD_MSC_EP_BUFSIZE=512 (与 MSC_BLOCKDEV_SECTOR_BYTES 一致)。
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    CFG_TUD_MSC=1
+    CFG_TUD_MSC_EP_BUFSIZE=512
+)
+# 同时直接作用于 SDK 的 tinyusb_device_common 目标（如果已创建）。
+if(TARGET tinyusb_device_common)
+    target_compile_definitions(tinyusb_device_common INTERFACE
+        CFG_TUD_MSC=1
+        CFG_TUD_MSC_EP_BUFSIZE=512
+    )
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     # demo_app.c 需要内核头文件（task.h, sched.h, hal_interface.h 等）
@@ -142,6 +158,30 @@ endif()
 # Pico SDK USB/UART 双 stdio + UF2 输出
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
+
+# ===== v2.2：移除 Pico SDK 自带的默认 USB 描述符（仅 CDC），
+#       我们在 mini-kernel/port/rp2040/msc_usb.c 里提供 Composite
+#       (CDC+MSC) 的描述符。否则会出现 multiple definition 链接错误。
+#       pico_stdio_usb 是 INTERFACE 库：修改其 INTERFACE_SOURCES 属性，
+#       过滤掉 stdio_usb_descriptors.c，保留 reset_interface.c + stdio_usb.c
+#       （后者提供 CDC ACM 的读写逻辑）。
+if(TARGET pico_stdio_usb)
+    get_target_property(_STDIO_USB_IFACE_SRCS pico_stdio_usb INTERFACE_SOURCES)
+    if(_STDIO_USB_IFACE_SRCS)
+        set(_STDIO_USB_FILTERED "")
+        foreach(_s ${_STDIO_USB_IFACE_SRCS})
+            get_filename_component(_s_name "${_s}" NAME)
+            if(NOT "${_s_name}" STREQUAL "stdio_usb_descriptors.c")
+                list(APPEND _STDIO_USB_FILTERED "${_s}")
+            endif()
+        endforeach()
+        set_target_properties(pico_stdio_usb PROPERTIES
+            INTERFACE_SOURCES "${_STDIO_USB_FILTERED}"
+        )
+        message(STATUS "[rp2040demo v2.2] Removed stdio_usb_descriptors.c from pico_stdio_usb (using msc_usb.c Composite descriptors)")
+    endif()
+endif()
+
 pico_add_extra_outputs(${PROJECT_NAME})
 
 # ================================================================

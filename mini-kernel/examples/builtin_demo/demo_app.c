@@ -32,6 +32,10 @@ extern const char *k_version(void);
 void demo_app_init(void);
 /* shell_start 由 shell.c 提供（OS_CFG_SHELL=1 时创建交互 shell 任务）*/
 extern void shell_start(void);
+/* fatfs_init_and_mount 由 fatfs_api.h 提供（v2.2，首次启动自动格式化 FAT16）*/
+#if OS_CFG_FATFS
+#include "fatfs_api.h"
+#endif
 
 #if OS_CFG_DEMO_APP
 
@@ -307,6 +311,9 @@ void demo_app_init(void) {
     demo_puts(OS_CFG_SHELL ? "ON" : "OFF");
     demo_puts("  VFS=");
     demo_puts(OS_CFG_VFS ? "ON" : "OFF");
+#if OS_CFG_FATFS
+    demo_puts("  FatFs=ON  USB-MSC=ON");
+#endif
     demo_puts("\r\n");
     demo_puts("========================================\r\n\r\n");
 
@@ -378,6 +385,31 @@ void demo_app_init(void) {
      *   交互模式。LED / I2C 的回放结果都在那个大 banner 里体现。 */
     shell_start();
     demo_puts("[BOOT  ] Shell ready. Connect USB CDC COMx and type 'help' or 'gpio help'.\r\n\r\n");
+
+    /* ── v2.2: FatFs + USB MSC 初始化（在 bootscript_run_all 跑完 + shell 就绪后）
+     *   初始化顺序很关键：
+     *     1. shell_start() → 已经向命令表注册了 msc/ls/cd/... 扩展命令
+     *     2. fatfs_init_and_mount() → 检测空片自动 f_mkfs FAT16 + 挂载
+     *     3. 首启动完成后 ejected=true（Shell 独占写模式，防止主机 USB 竞争写）
+     *   用户若想电脑看见 U 盘盘符，显式执行 `msc mount` 即可。
+     * ─────────────────────────────────────────────────────────────────── */
+#if OS_CFG_FATFS
+    {
+        FRESULT fr = fatfs_init_and_mount();
+        if (fr == FR_OK) {
+            if (fatfs_mkfs_done_this_boot()) {
+                demo_puts("[BOOT  ] MSC: Blank flash → auto-f_mkfs FAT16 (1012KiB data partition).\r\n");
+            }
+            demo_puts("[BOOT  ] MSC: FatFs mounted OK. Mode = SHELL-EXCLUSIVE (ejected=true).\r\n");
+            demo_puts("[BOOT  ] MSC: To expose drive to host PC, run:  msc mount\r\n");
+            demo_puts("[BOOT  ] MSC: Shell commands (mkdir/rm/cat) work now; no `msc eject` needed.\r\n\r\n");
+        } else {
+            demo_puts("[BOOT  ] MSC: FatFs mount SKIPPED (code=");
+            demo_put_uint32((uint32_t)fr);
+            demo_puts("). Run `msc status` then `msc mount` or `msc format`.\r\n\r\n");
+        }
+    }
+#endif
 }
 
 #else /* !OS_CFG_DEMO_APP —— 关闭 demo 时的空桩，保证链接无未定义符号 */
@@ -390,34 +422,31 @@ void demo_app_init(void) {
 
 /* ================================================================
  * 版本字符串（k_version 必须始终提供，kernel.h 已声明）
- *   0.2.0-beta-hotfix1: 修复"固化 led on 重启后不亮" + 新增 boot status 诊断
- *     · 根因：demo_app_init → shell_start → bootscript → led on 后，
- *             boot_setup_task 还调用 _led_stage(13) 做 13 次闪烁指示，
- *             每次最后 SIO_OUT_CLR 把 GPIO25 强制 OFF，覆盖用户固化的设置。
- *     · 修复：把 _led_stage(13) 提前到 demo_app_init 之前跑完（kernel.c），
- *             demo_app_init 返回之后 **永不** 无条件写 GPIO25。
- *     · 新增 boot status 命令：RAM 常驻回放结果，用户打开终端后随时查询
- *             每条固化命令的执行结果，不再依赖启动时刚好打开终端接串口。
- *     · ✅ 2026-08-15 用户硬件实测通过：BOOTSCRIPT banner 打印 → GPIO25=HIGH →
- *             boot status 显示所有字段正确 → LED 重启后稳定常亮。
  *
- *   0.2.0-beta-hotfix2: boot status 命令行完整显示修复
- *     · 根因：shell_exec_line(line) 内部 strtok 把空格改 '\0' 拆 argv，
- *             调用后再把 line 传给 bootscript_rec_entry，导致 strlen()
- *             只取到第一个 token（显示 "led" 而不是 "led on"）。
- *     · 修复：在 shell_exec_line 之前 memcpy 一份 line_snap 快照，
- *             bootscript_rec_entry 传入 line_snap（完整原始命令行）。
+ *   2.2: 【大版本】Composite USB：CDC（串口命令行）+ MSC（U 盘）同时枚举。
+ *          · Flash 三分区：
+ *              0x000000..0x0FFFFF (1 MiB)          → 固件区
+ *              0x100000..0x1FEFFF (2032×512=1016KB) → MSC U 盘 FAT16 数据盘
+ *              0x1FF000..0x1FFFFF (2×4KiB)         → bootscript 双备份固化区
+ *          · Shell 目录命令（真正的文件系统，不是"地址索引"）：
+ *              ls / cd / pwd / mkdir / rmdir / rm / cat
+ *          · msc 子命令切换主机/本机写互斥：
+ *              msc mount   → 主机 USB 可写 U 盘（Shell 只读）
+ *              msc eject   → 主机 USB 显示"无介质"（Shell 可 mkdir/rm/cat）
+ *              msc status  → 查看分区容量 / eject / 是否格式化 / mounted
+ *              msc format  → 两步确认后重建 FAT16
+ *          · 首次上电自动 f_mkfs 创建 FAT16，Windows 拷贝的文件、
+ *            子目录、Shell 端 cat 看到完全一致（共用同一 Flash 后端）。
  *
  *   0.2.1: 启动速度大幅优化（10s+ → <500ms）
  *     · 新增 MK_BOOT_DIAG_LED 宏（默认 0 = 发布版，不跑 LED 诊断）
  *     · 删除 50M nop ~5s "USB 枚举忙等"（已有 boot status + WITHOUT_DTR=1
  *       兜底，不需要死等 5 秒让用户"打开终端再开机"）
- *     · _led_stage 1-12 的所有闪烁 + 阶段间 1s 停顿默认折叠为空函数，
- *       将来启动崩溃只需把 kernel.c 顶部 MK_BOOT_DIAG_LED 改 1 即可重新
- *       启用数闪定位。
+ *     · _led_stage 1-12 默认折叠为空函数，将来崩溃时改 MK_BOOT_DIAG_LED=1
+ *       即可重新启用数闪定位。
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "0.2.1"
+#define KERNEL_VERSION_STR  "2.2.0 [UNTESTED]"
 #endif
 
 const char *k_version(void) {
