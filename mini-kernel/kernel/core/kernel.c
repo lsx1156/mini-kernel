@@ -165,6 +165,29 @@ static void _boot_setup_task(void *arg) {
     /* 阶段 12：横幅打印完成，准备创建 demo 任务 */
     _led_stage(12);
 
+    /* ── v2.2: FatFs / MSC 分区初始化（可移植内核独立完成，不依赖 demo 应用）
+     *
+     *   为什么放在 kernel.c 而非 examples/demo_app.c：
+     *     · mini-kernel 的可移植定位是"对外提供内核服务 + 文件系统"；
+     *     · OS_CFG_DEMO_APP=0（关闭示例 app）时，用户自有应用也应该
+     *       能用到 FatFs + Shell 的目录命令，不能要求用户自己调用
+     *       fatfs_init_and_mount()。
+     *
+     *   幂等安全：fatfs_init_and_mount() 内部 s_fs_mounted=true 直接返回 FR_OK，
+     *     所以 demo_app.c / shell.c 再次调用也不会重复挂载 / 重复 mkfs。
+     *
+     *   头文件隔离：fatfs_api.h 内部 #include "ff.h"，当 OS_CFG_FATFS=0 时
+     *     fatfs shim 目录不在 include path，直接 #include 会编译错。因此用
+     *     extern 前向声明，整个块也放在 #if OS_CFG_FATFS 中，关闭时被
+     *     预处理器彻底移除。
+     * ──────────────────────────────────────────────────────────────── */
+#if OS_CFG_FATFS
+    {
+        extern int fatfs_init_and_mount(void);   /* FRESULT 与 int 兼容 */
+        (void)fatfs_init_and_mount();            /* 结果忽略：demo app / Shell banner 会做更详细诊断打印 */
+    }
+#endif
+
     /* ── Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） ──
      * 【v0.2.0-beta 修复：**绝对不要在 demo_app_init 返回后再写 GPIO25！**】
      *   之前的 bug：demo_app_init 内部调用 shell_start() → bootscript_run_all()
