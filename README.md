@@ -1,123 +1,117 @@
-# PP CD · Project Repository v0.1
+# Mini Kernel · Project Repository（GitHub 仓库根入口）
+
+> **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
+> **当前版本**：v2.2.2 · 2026-08
+> **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
+
+---
+
+## ⚠️ 项目定位澄清（先看我，避免误解）
+
+**❌ 本项目 ≠ RTOS（实时操作系统）。**
+
+很多朋友一看到"内核"+"多任务"就归类成 RTOS，这里明确划清边界：
+
+| 类别 | **RTOS 必须满足（FreeRTOS / Zephyr / RT-Thread）** | **本 Mini Kernel** |
+|---|---|---|
+| 调度方式 | **优先级抢占**：高优先级任务可以在**任意时刻**打断低优先级任务（中途强抢） | **时间片轮转 + 权重，非抢占**：只有任务主动 yield / 睡眠 / IO 等待，或用完整个时间片才切走 |
+| 实时性 | **硬实时有界**：最坏中断/任务切换延迟有严格上限（微秒级确定值） | **不承诺硬实时**：延迟受当前时间片剩余影响，非目标第 1 条明确写死不追求 |
+| 调度算法核心 | 必须有 **优先级**（位图 O(1)、多级队列等） | **无优先级概念**：就绪队列 FIFO + 时间片权重（sched.c 不看 priority 字段做决策） |
+
+**定位一句话**：填补「裸机开发门槛高（自己写状态机很复杂）、RTOS 偏向工业硬实时控制（对非工控场景功能又太重）、Linux 无法运行在小 RAM MCU」之间的中间空白地带——给玩具、教学、DIY 小项目、非实时外设驱动封装提供一个「够轻、够干净、带文件系统和 U 盘」的多任务底座。
+
+---
+
+## 📦 仓库单仓结构（project/）
 
 ```
-project/                          ← 本仓库（单仓）
-├── mini-kernel/                  ← 轻量级 RTOS 内核（RP2040 端口）
-│   ├── include/                  公共头（include/kernel.h 是用户态唯一入口）
-│   ├── kernel/core/              内核核心（sched / task / mem / kernel_main）
-│   ├── kernel/syscall/           Syscall 契约表（静态编译期 X-Macro）
-│   ├── kernel/modules/shell/     交互式命令行（help/ps/heap/syscalls 等）
-│   ├── kernel/modules/periph/    外设服务（GPIO/SPI/I2C/UART，按裁剪宏）
-│   ├── examples/builtin_demo/    内置 demo 任务（LED/心跳/内存压力）
-│   ├── port/rp2040/              Cortex-M0+ 移植（PendSV / SVC / HAL）
-│   ├── tests/                    单元测试 + 诊断固件
-│   ├── cmake/check_size.cmake    体积红线检查脚本
-│   └── CMakeLists.txt
-└── rp2040demo/                   ← 独立应用工程（引用 mini-kernel 作静态库）
-    ├── src/main.c                应用入口（强 main() 覆盖内核的弱 main）
-    └── CMakeLists.txt
+project/                          ← 本仓库根目录（单仓 · monorepo）
+│
+├── mini-kernel/                  📚 【可移植内核库】——对外提供的纯 C + 移植汇编内核
+│   │                               （硬件无关代码 100% 在这；RP2040 demo 通过的所有 Bug 修复
+│   │                                 全部同步回此目录，rp2040demo/ 不维护任何内核副本）
+│   │
+│   ├── include/                  对外头文件入口
+│   │   ├── os_config.h           ✂️ 内核裁剪宏（开/关功能用这个）
+│   │   ├── hal/                  HAL 统一接口（移植新 MCU 时实现）
+│   │   │   └── flash_layout.h    Flash 三分区布局宏定义（1MiB FW / 1012KiB MSC / 8KiB Bootscript）
+│   │   └── kernel.h              用户态唯一 API 入口（os_task_create / os_time_dly_ms 等）
+│   │
+│   ├── kernel/                   内核核心 + 可裁剪扩展模块（100% 硬件无关，可移植）
+│   │   ├── core/                 kernel.c / sched.c / task.c / mem/heap.c（最底层核心）
+│   │   ├── syscall/              SVC 异常契约表（X-Macro 静态生成）
+│   │   ├── modules/shell/        交互式 Shell（命令 + 文件系统目录命令）
+│   │   ├── modules/fatfs_shim/   FatFs 适配层（含 f_mkfs 实现、Flash HAL 读写、单写者互斥）
+│   │   ├── modules/periph/       外设服务（GPIO / SPI / I2C / UART，按 OS_CFG 裁剪）
+│   │   └── examples/builtin_demo/ 可选示例任务（LED/心跳/bootscript 执行）
+│   │
+│   ├── port/                     🔌 硬件移植层（每款 MCU 一个子目录；当前已实现 rp2040/）
+│   │   └── rp2040/
+│   │       ├── context_switch.S  Cortex-M0+ SVC + PendSV 上下文切换（r4-r11 完整保存）
+│   │       ├── hal_impl.c        HAL Flash / Time / Uart 具体实现
+│   │       └── msc_usb.c         USB Composite（CDC 串口 + MSC U 盘）描述符 + SCSI 回调
+│   │
+│   ├── tests/                    单元测试 + 诊断固件（可选）
+│   ├── cmake/check_size.cmake    体积红线检查脚本（内核本体 Flash ≤ 20KB / RAM ≤ 8KB）
+│   ├── README.md                 📖 **完整详细文档请点这里**（特性表/命令手册/架构/移植指南）
+│   └── CMakeLists.txt            mini-kernel 作为 CMake 静态库的构建
+│
+└── rp2040demo/                   🛠️ 【RP2040 演示平台】——真正烧录到 RP2040 的示例工程
+    │                               （用 add_subdirectory(../mini-kernel) 直接引用内核库，
+    │                                 + Pico SDK；产生可拖拽的 .uf2 固件）
+    ├── src/main.c                应用入口（强符号 main() 覆盖内核的弱 main）
+    ├── CMakeLists.txt
+    ├── build.bat                 Windows 一键构建（会自动拉 Pico SDK + 生成 uf2）
+    └── build/rp2040demo.uf2      构建产物（烧录用）
 ```
 
-## v0.1 里程碑
+---
 
-* Cortex-M0+ 时间片轮转调度（支持权重比例）
+## 🚀 从这里开始（3 步烧录）
 
-* 固定内存池 + 零碎片堆（含临界区保护）
+详细文档在 → [**mini-kernel/README.md**](./mini-kernel/README.md)（包含完整特性表、Flash 分区图、Shell 命令手册、典型使用流程、裁剪宏、架构分层、移植指南）。
 
-* USB CDC 控制台（硬件 EP1 OUT 轮询旁路）
-
-* 交互式 Shell（含 syscalls 契约表查询命令）
-
-* 完整上下文切换（保存 r4-r11 callee-saved 寄存器）
-
-* Pico SDK 可集成：既可顶层固件，也能被独立工程 add\_subdirectory 引用
-
-* **体积约束**：精简版 Flash ≤ 10KB / RAM ≤ 4KB（不含 Pico SDK）；完整基础版 ≤ 20KB/8KB
-
-## 架构设计
-
-### 分层架构
-
-```
-┌─────────────────────────────────────────┐
-│         应用层 (Application)             │
-│   独立应用 / 内置演示任务                │
-├─────────────────────────────────────────┤
-│         系统调用层 (Syscall)             │
-│   SVC 异常 / X-Macro 契约表             │
-├─────────────────────────────────────────┤
-│         内核核心 (Kernel Core)           │
-│   调度器 / 任务 / 内存 / 中断管理        │
-├─────────────────────────────────────────┤
-│         硬件抽象层 (HAL)                │
-│   统一接口 / 平台相关实现               │
-├─────────────────────────────────────────┤
-│         硬件 (Hardware)                 │
-│   Cortex-M0+ / RP2040                   │
-└─────────────────────────────────────────┘
-```
-
-### 关键特性
-
-* **时间片轮转调度**：固定时间片 + 权重比例，非抢占式
-
-* **零碎片内存**：固定池 + 隐式空闲链表堆
-
-* **临界区保护**：kmalloc/kfree 和任务队列操作均使用 cpsid/cpsie
-
-* **上下文切换**：PendSV 保存/恢复 r4-r11 寄存器
-
-## 构建
-
-### mini-kernel 内置 demo 固件
-
-```bash
-cd mini-kernel
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
-cmake --build build -j4
-```
-
-### rp2040demo 独立应用固件
-
-```bash
+**最快上手**：
+```powershell
 cd rp2040demo
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
-cmake --build build -j4
+.\build.bat
 ```
+构建成功后把 `rp2040demo/build/rp2040demo.uf2` 拖进 RP2040 的 `RPI-RP2` 盘符即可。烧录后：
+- 🖥️ USB 串口（115200-8-N-1）：看启动 banner、打 Shell 命令
+- 💾 USB 可移动磁盘（≈ 1012 KiB FAT16 U 盘）：电脑直接读写，Shell 也能 `ls/cd/cat/mkdir`
 
-## 烧录
+---
 
-将生成的 `.uf2` 文件拖入 RP2040 的 `RPI-RP2` 盘符即可。
+## 🗂️ 版本状态速览（与 mini-kernel/README 一致）
 
-烧录后用 PuTTY / TeraTerm 打开 USB 虚拟串口（115200-8-N-1），看到：
+| 版本 | 状态 | 关键词 |
+|---|---|---|
+| v2.2.x | ✅ **当前稳定**（仓库 HEAD） | 三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / 诊断闪灯 / mkfs 实现 / 8 项内核 Bug 同步 |
+| v2.3 | 📅 规划中（下一版） | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp 复制 / mv 重命名） |
+| v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |
+| v3.5 | 📅 远期规划 | RP2350 多核（SMP）+ RISC-V（CH32V/bl702）移植 |
 
-```
-============================================================
+---
 
- === Mini Kernel Boot ===
+## 🔗 快速跳转
 
-============================================================
-```
+| 文档/文件 | 链接 |
+|---|---|
+| 📖 完整详细主文档（必看）| [mini-kernel/README.md](./mini-kernel/README.md) |
+| 🧩 裁剪宏总开关 | [mini-kernel/include/os_config.h](./mini-kernel/include/os_config.h) |
+| 🧠 内核主入口（启动顺序+FatFs自动初始化）| [mini-kernel/kernel/core/kernel.c](./mini-kernel/kernel/core/kernel.c) |
+| 🔄 调度器（非抢占 FIFO + 时间片） | [mini-kernel/kernel/core/sched.c](./mini-kernel/kernel/core/sched.c) |
+| 🔀 Cortex-M0+ 上下文切换（SVC+PendSV） | [mini-kernel/port/rp2040/context_switch.S](./mini-kernel/port/rp2040/context_switch.S) |
+| 💾 Flash 三分区布局宏 | [mini-kernel/include/hal/flash_layout.h](./mini-kernel/include/hal/flash_layout.h) |
+| 🔌 USB Composite (CDC+MSC) 描述符 | [mini-kernel/port/rp2040/msc_usb.c](./mini-kernel/port/rp2040/msc_usb.c) |
+| 🐚 Shell 文件系统目录命令（ls/cd/pwd/mkdir） | [mini-kernel/kernel/modules/shell/shell_fs.c](./mini-kernel/kernel/modules/shell/shell_fs.c) |
+| 🛠️ 一键构建脚本（RP2040 演示固件） | [rp2040demo/build.bat](./rp2040demo/build.bat) |
 
-输入 `help` / `tasks` / `syscalls` 查看可用命令。
+---
 
-## 版本历史
+## 🏷️ 为什么叫 "Mini Kernel" 不叫 "Mini RTOS"
 
-### v0.1.0 (当前)
+就是因为前面那张对比表写死的三条：**无优先级抢占、无硬实时承诺、调度不看优先级**。
+RTOS 是有严格工程定义的术语，不能随便贴标签。本项目老老实实做自己的定位——
 
-* ✅ 基础内核调度器（时间片轮转 + 权重）
-
-* ✅ 任务管理（创建/销毁/睡眠/唤醒）
-
-* ✅ 内存管理（固定池 + 堆，零碎片）
-
-* ✅ Shell 命令行（help/tasks/mem/syscalls）
-
-* ✅ USB CDC 控制台
-
-* ✅ 临界区保护（内存/任务队列操作）
-
-* ✅ 上下文切换（PendSV/SVC，完整寄存器保存）
-
-* ✅ 单仓结构（mini-kernel + rp2040demo）
-
+> **轻量分时通用 32 位 MCU 内核：裸机和 RTOS 之间、够用、干净、带 U 盘 + 文件系统命令的多任务小底座。**

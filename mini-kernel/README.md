@@ -5,10 +5,21 @@
 **完整基础版（Shell + 外设服务 + 指令固化）** Flash ~20KB / RAM ~8KB；
 **RP2040 演示版（v2.2，含 Pico SDK + USB Composite(CDC+MSC) + FatFs）** Flash ~111KB / RAM ~20KB。
 
-> **定位**：填补「裸机开发门槛高、RTOS 偏向实时控制、Linux 无法运行」的中间空白地带。
+> **定位**：填补「裸机开发门槛高、RTOS 偏向工业硬实时控制（对非工控场景又太重）、Linux 无法运行」的中间空白地带。
+>
+> **🛑 重要澄清：本项目 ≠ RTOS** — 不要把 Mini Kernel 叫 RTOS，RTOS 有严格工程定义：
+>
+> | 判断维度 | RTOS（FreeRTOS/Zephyr/RT-Thread）必须 | 本 Mini Kernel 实际 |
+> |---|---|---|
+> | 调度语义 | **优先级抢占**（高优先级可中途强抢低优先级任务） | **时间片轮转+权重，非抢占**（仅 yield/睡眠/时间片耗尽时切走） |
+> | 实时性 | **硬实时有界**（最坏延迟微秒级确定值） | **不承诺硬实时**（延迟受时间片剩余影响，非目标§1明确不追求） |
+> | 调度算法 | 核心必须基于**优先级** | **无优先级概念**（就绪队列 FIFO + 时间片权重，不看 priority 做决策） |
+>
+> 📌 **一句话定义**：轻量分时通用 32 位 MCU 内核 —— 裸机和 RTOS 之间、够用、干净、带 U 盘和文件系统命令的多任务小底座。
+>
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.2.0 [UNTESTED]`
+> **当前版本**：`2.2.2 ✅ STABLE`（已在 RP2040 demo 上通过 build.bat 完整编译验证）
 >
 > **v2.2 大版本亮点**
 > - ✨ USB 插电脑 **同时弹出**：CDC 串口（命令行调试 COMx）**+** MSC 可读写 U 盘盘符
@@ -70,8 +81,9 @@ project/
 | **v0.2.0-beta** | ✅ Archived | **指令固化机制** (`!`/`save`/`unsave`/`list`/`boot exec`) + hal_flash + `factory_reset` + 开机自动回放 |
 | **v0.2.0-hotfix1** | ✅ Archived | **修复 led on 固化后被 _led_stage(13) 覆盖**；新增 `boot status` RAM 常驻回放结果；`Unknown command` 误报修复 |
 | **v0.2.1** | ✅ Archived | **启动速度优化**：10s+ → <500ms；新增 `MK_BOOT_DIAG_LED` 宏（默认 0）；删除 5s USB 枚举忙等 |
-| **v2.2.0** | ⚠️ UNTESTED | **大版本**：USB Composite (CDC+MSC) + FatFs FAT16 + Shell 目录命令 + 三分区 Flash 布局 |
-| v2.2.x | 🛠️ 进行中 | v2.2 README 梳理 + 可移植内核独立初始化 FatFs（即本次 v2.2.1） |
+| **v2.2.0** | ✅ Released | **大版本**：USB Composite (CDC+MSC) + FatFs FAT16 + Shell 目录命令 + 三分区 Flash 布局 |
+| **v2.2.1** | ✅ Released | README 彻底重写（补全特性表/分区图/命令手册/架构图）+ 可移植内核独立 FatFs 初始化（不依赖 demo_app.c） |
+| **v2.2.2** | ✅ **当前稳定** | 🛑 **定位澄清：≠RTOS**（两个 README 新增 RTOS vs 分时内核对比表；仓库首页 project/README 从 v0.1 同步到 v2.2，删除错误"轻量级 RTOS 内核"命名） |
 | v2.3 | 📋 规划 | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示 |
 | v3.0 | 🗓️ 规划 | VFS 抽象层 + 多分区 + SD Card (SPI1) |
 | v3.5 | 🗓️ 规划 | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植 |
@@ -217,7 +229,7 @@ E:\ppCD\project\rp2040demo\build\build.log         ← 编译日志（失败看 
 ========================================
   Mini Kernel Demo Platform Ready
 ========================================
-Kernel version: 2.2.0 [UNTESTED]
+Kernel version: 2.2.2 ✅ STABLE
 Config: MAX_TASKS=16  HEAP=8192B  TICK_HZ=1000  TIME_SLICE=5
 PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
 ========================================
@@ -246,7 +258,7 @@ PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
 
 ========================================
   Mini Kernel Interactive Shell Ready
-  Version: 2.2.0 [UNTESTED]
+  Version: 2.2.2 ✅ STABLE
   Type 'help' to list commands.
 ========================================
 
@@ -507,4 +519,4 @@ MIT License
 - [Elm FatFs](http://elm-chan.org/fsw/ff/) — Elm Chan 的 FatFs R0.15（小巧精简、零依赖）
 - [Unity](https://github.com/ThrowTheSwitch/Unity) — 嵌入式 C 单测框架
 - [Renode](https://renode.io/) — 强大的 MCU 模拟器平台（集成测试用）
-- [FreeRTOS](https://www.freertos.org/) / [Zephyr](https://www.zephyrproject.org/) / [RT-Thread](https://www.rt-thread.org/) — 架构设计参考
+- [FreeRTOS](https://www.freertos.org/) / [Zephyr](https://www.zephyrproject.org/) / [RT-Thread](https://www.rt-thread.org/) — 架构分层/API 设计参考（**仅参考，不兼容上述项目 API 或行为；本项目也不是 RTOS**）
