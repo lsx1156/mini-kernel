@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+.pio/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+bat_run*.log
+
+# Firmware binaries (keep source, exclude binaries)
+*.uf2
+*.bin
+*.hex
+*.dis
+*.elf.map
+
+# Backup files
+*.bak
+*.orig
