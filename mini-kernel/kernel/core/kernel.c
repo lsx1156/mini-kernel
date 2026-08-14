@@ -27,6 +27,24 @@
 #  define PICO_DEFAULT_LED_PIN 25
 #endif
 
+/* ================================================================
+ *  v0.2.1 启动速度开关（Startup Performance Knob）
+ *
+ *  MK_BOOT_DIAG_LED = 0   【默认，发布版】跳过所有 _led_stage 诊断闪烁
+ *                            和 5s USB 枚举忙等，启动耗时 < 500ms（USB 枚举
+ *                            + banner 打印 + 任务创建）。诊断保留在代码里，
+ *                            将来如果遇到启动崩溃，把此宏改成 1，
+ *                            数 LED 闪烁次数即可定位崩溃在哪一步。
+ *
+ *  MK_BOOT_DIAG_LED = 1   【调试版】启用阶段 1-12 的 LED 诊断指示
+ *                            （每阶段 count 次闪烁 + 末尾约 1s 停顿），
+ *                            同时保留 50M nop ~5s 的 USB 枚举等待，
+ *                            给用户"打开 PuTTY 再开机"捕捉 banner 的时间。
+ * ================================================================ */
+#ifndef MK_BOOT_DIAG_LED
+#  define MK_BOOT_DIAG_LED   0
+#endif
+
 extern uint8_t __end__;
 /* 内核堆大小统一使用 os_config.h 的 OS_CFG_HEAP_SIZE_BYTES。
  * 默认 4KB，覆盖 boot_setup(768) + idle(256) + led(384) + heartbeat(768)
@@ -81,8 +99,10 @@ static inline void _led_off(void) {
 
 /* LED 诊断辅助函数：通过 LED 闪烁次数指示当前阶段
  * 用法：_led_stage(3) 会让 LED 闪 3 次（每次亮灭各 ~200ms）
- * 这样用户可以告诉我们 LED 闪了几下，就能定位崩溃位置 */
+ * 这样用户可以告诉我们 LED 闪了几下，就能定位崩溃位置。
+ * 【v0.2.1 性能优化】MK_BOOT_DIAG_LED=0 时此函数体折叠为空。 */
 static void _led_stage(uint8_t count) {
+#if MK_BOOT_DIAG_LED
     register const uint32_t sio_base = 0xD0000000u;
     register const uint32_t gpio25_mask = 0x02000000u;
     
@@ -94,6 +114,9 @@ static void _led_stage(uint8_t count) {
     }
     /* 结束后留 1 秒停顿 */
     for (volatile uint32_t j = 0; j < 6250000; j++) __asm("nop");
+#else
+    (void)count;
+#endif
 }
 
 /* boot_setup 任务：调度器首次运行后执行的热初始化阶段
@@ -250,7 +273,18 @@ void kernel_main(void) {
     /* 阶段 7：控制台初始化完成，开始等待 USB 枚举 */
     _led_stage(7);
 
+    /* 【v0.2.1 性能优化】原代码在这里忙等 50,000,000 nop (~5s)，说是
+     * "等 USB 枚举完成"。但实际上 USB 枚举完全由 USBCTRL_IRQ + tud_task()
+     * 驱动，与 CPU 空等无关。并且我们已经设置：
+     *   · PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1（不等待 DTR 握手）
+     *   · PICO_STDIO_USB_STDOUT_TIMEOUT_US=0    （发送不阻塞）
+     *   · boot status 命令（RAM 常驻回放结果）——即使启动时没接串口，
+     *     用户打开终端后仍能看到所有 bootscript 回放结果。
+     * 因此这个 5s 忙等在发布版里 100% 是浪费时间，直接删除。
+     * 调试模式（MK_BOOT_DIAG_LED=1）保留，供崩溃定位用。 */
+#if MK_BOOT_DIAG_LED
     for (volatile uint32_t i = 0; i < 50000000; i++) __asm("nop"); /* ~5s wait for USB enum */
+#endif
 
     /* 阶段 8：USB 枚举完成，准备启动调度器 */
     _led_stage(8);

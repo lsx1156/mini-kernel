@@ -407,9 +407,17 @@ void demo_app_init(void) {
  *             只取到第一个 token（显示 "led" 而不是 "led on"）。
  *     · 修复：在 shell_exec_line 之前 memcpy 一份 line_snap 快照，
  *             bootscript_rec_entry 传入 line_snap（完整原始命令行）。
+ *
+ *   0.2.1: 启动速度大幅优化（10s+ → <500ms）
+ *     · 新增 MK_BOOT_DIAG_LED 宏（默认 0 = 发布版，不跑 LED 诊断）
+ *     · 删除 50M nop ~5s "USB 枚举忙等"（已有 boot status + WITHOUT_DTR=1
+ *       兜底，不需要死等 5 秒让用户"打开终端再开机"）
+ *     · _led_stage 1-12 的所有闪烁 + 阶段间 1s 停顿默认折叠为空函数，
+ *       将来启动崩溃只需把 kernel.c 顶部 MK_BOOT_DIAG_LED 改 1 即可重新
+ *       启用数闪定位。
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "0.2.0-beta-hotfix2"
+#define KERNEL_VERSION_STR  "0.2.1"
 #endif
 
 const char *k_version(void) {
