@@ -3,6 +3,19 @@
 面向资源受限 32 位 MCU 的极简内核，**Flash ≤ 10KB / RAM ≤ 10KB** 即可运行，主打跨芯片可移植、类 POSIX 开发范式、零动态内存碎片。
 
 > **定位**：填补「裸机开发门槛高、RTOS 偏向实时控制、Linux 无法运行」的中间空白地带。
+>
+> **当前版本**：`0.2.0-beta [UNTESTED]`（指令固化 + 出厂重置，**尚未在硬件端完整跑通全链路**，请参考下方 Shell 固化命令验证流程做上电测试）
+
+---
+
+## 🧭 版本路线
+
+| 版本 | 状态 | 关键里程碑 |
+|------|------|-----------|
+| **v0.1.0** | ✅ Released | 基础内核（调度/堆/上下文）+ Shell/外设（GPIO/I2C/UART/SPI）可用 |
+| **v0.2.0-beta** | ⚠️ UNTESTED | 本版本：**指令固化机制** (`!`/`save`/`unsave`/`list`/`boot exec`) + **板载 Flash HAL** + **factory_reset 出厂重置** + 固化命令开机自动执行 |
+| v0.2.0 | 📋 待验证 | 硬件跑通 I2C OLED 固化开机自动亮起 + SPI B线路板载 Flash 自检全 PASS |
+| v0.3.0 | 🗓️ 规划 | VFS + FatFs (SD Card via SPI) + 简单文件读写命令 |
 
 ---
 
@@ -11,13 +24,15 @@
 | 特性 | 指标 |
 |------|------|
 | **最小内核** | Flash ≤ 10KB, RAM ≤ 10KB |     
-| **完整基础版** | Flash ≤ 20KB, RAM ≤ 8KB (含 Shell + VFS + 外设服务) |
+| **完整基础版** | Flash ~76KB, RAM ~9KB (含 Shell + 外设服务 + 固化子系统 + Pico SDK 运行时) |
 | **调度策略** | 时间片轮转 + 权重比例，**无优先级抢占**，非硬实时 |
 | **内存模型** | 固定内存池 + 简易堆，**零碎片** |
 | **架构** | 4 层垂直分层：应用 → 系统调用 → 内核核心 → HAL |
 | **移植** | 仅重写 HAL 层，核心代码 100% 复用 |
 | **支持架构** | Cortex-M 全系列、RISC-V RV32 (规划中) |
-| **首发平台** | RP2040 (Cortex-M0+) |
+| **首发平台** | RP2040 (Cortex-M0+) + 板载 W25Q16JV (2MB SPI Flash) |
+| **✨ v0.2 指令固化** | 双备份扇区 + CRC8 校验；32 × 123B 命令槽；`!` 前缀立即执行+固化；开机自动回放 |
+| **✨ v0.2 出厂重置** | `factory_reset confirm` 擦末尾 64KB 清除所有持久化数据，保留 OS 固件本身 |
 
 ---
 
@@ -224,13 +239,63 @@ k_i2c_write(0, 0x68, reg_addr, 1);  // 任务 A
 k_i2c_read(0, 0x68, buf, 6);        // 任务 B (自动等待 A 完成)
 ```
 
-### Shell 交互
+### Shell 交互 + 指令固化 (v0.2 新增)
 ```bash
-> help
-> tasks        # 查看任务列表
-> mem          # 内存状态
-> syscalls     # 查看系统调用契约表
-> reboot       # 复位
+# 普通执行
+mk> help                       # 查看全部命令
+mk> led on                     # 板载 LED 亮
+mk> i2c init 0 4 5 100000      # I2C0 @ GP4/5 100kHz
+
+# ────────── ✨ v0.2: 指令固化（写入板载 SPI Flash，掉电仍在）──────────
+# 方式 A：语法糖 —— 先执行，成功后自动固化
+mk> ! led on                   # 立即执行 led on + 追加写入 Flash
+                               # 输出: OK + Remaining: 31/32 slots
+
+# 方式 B：先 save，下次开机才执行（不立即执行）
+mk> save i2c init 0 4 5 100000
+mk> save i2c cmds 0 0x3C 0xAE 0x20 0x00 0xC8 0x40 0x81 0x7F   # OLED init
+mk> list                       # 列出全部固化条目 + 汇报剩余 slots
+Persistent commands (used 3, free 29/32 slots, Flash 2x backup):
+  #0: led on
+  #1: i2c init 0 4 5 100000
+  #2: i2c cmds 0 0x3C 0xAE 0x20 0x00 0xC8 0x40 0x81 0x7F
+
+mk> boot exec                  # 立刻跑一遍所有已固化指令 (不等开机)
+mk> unsave 0                   # 删掉第 0 条
+mk> unsave all                 # 一键清空所有固化条目
+
+# 下次按 RUN / 拔插 USB：[BOOT ] banner 之后会自动回放已存的 #0..#n 条，再进 mk>
+```
+
+```bash
+# ────────── ✨ v0.2: 出厂重置（保留 OS 内核 + demo_app 固件）──────────
+mk> factory_reset              # 仅打印警告 + 影响范围（安全，不真正擦除）
+****************************************************************
+*                    FACTORY RESET WARNING                     *
+****************************************************************
+  此命令将把系统恢复到刚刷完固件的出厂状态：
+   ✓ 保留：内核 + demo_app 固件本身（操作系统完整保留）
+   ✗ 清除：所有固化指令 (save / ! 保存的 bootscript 全部条目)
+   ✗ 清除：板载 SPI Flash 最后 64KB 保留区 (16 sectors)
+   ✗ 清除：任何应用层写入的持久化用户数据
+  要继续，请输入:  factory_reset confirm
+****************************************************************
+
+mk> factory_reset confirm      # 真正执行：擦 bootscript 双备份 + 末尾 16 个扇区
+                               # 完成后请重新上电
+```
+
+```bash
+# ────────── 📡 B线路 SPI Flash 自检（v0.2 新增）──────────
+mk> boot flash_test            # 双备份扇区 A/B 擦→写(伪随机)→读→CRC→一致性对比
+                               # PASS=板载 SPI + hal_flash 驱动链路 OK
+```
+
+```bash
+# 其它常用
+mk> ps                         # 任务列表
+mk> heap                       # 堆空闲字节 / 最大块
+mk> gpio help | i2c help       # 外设子命令帮助
 ```
 
 ---

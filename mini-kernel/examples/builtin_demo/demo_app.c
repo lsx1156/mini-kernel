@@ -335,11 +335,14 @@ void demo_app_init(void) {
 
 /* ================================================================
  * 版本字符串（k_version 必须始终提供，kernel.h 已声明）
+ *   0.2.0-beta: 指令固化(!/save/unsave/list/boot) + factory_reset 出厂恢复
+ *               [UNTESTED] 标注：尚未在硬件端完整跑通
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "0.1.0"
+#define KERNEL_VERSION_STR  "0.2.0-beta [UNTESTED]"
 #endif
 
 const char *k_version(void) {
     return KERNEL_VERSION_STR;
 }
+/* (文件结束。多余 '}' 已删去) */

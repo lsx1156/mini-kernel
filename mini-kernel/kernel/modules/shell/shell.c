@@ -41,6 +41,9 @@ void shell_start(void);
 
 #if OS_CFG_SHELL
 
+/* bootscript 固化子系统（放在文件最开头，避免先引用后定义 + include 位置冲突） */
+#include "bootscript.h"
+
 /* 版本字符串（由 demo_app.c 提供的公共实现） */
 extern const char *k_version(void);
 
@@ -80,6 +83,33 @@ static void shell_put_hex32(uint32_t v) {
 
 static void shell_pad_spaces(int n) { while (n-- > 0) hal_console_putc(' '); }
 
+/* 把 hal_err_t / int 错误码打印成 "HAL_ERR_IO(-7)" 的可读形式；无对应名字则打印数值。
+ *   这样用户看到的就不是 4294967289 这种 uint 截断的大数了。 */
+static void shell_put_err(int err) {
+    const char *name = NULL;
+    switch (err) {
+        case  0: name = "HAL_OK"; break;
+        case -1: name = "HAL_ERR";      break;
+        case -2: name = "HAL_ERR_INVAL";break;
+        case -3: name = "HAL_ERR_NOMEM";break;
+        case -4: name = "HAL_ERR_BUSY"; break;
+        case -5: name = "HAL_ERR_TIMEOUT"; break;
+        case -6: name = "HAL_ERR_NOTSUP";  break;
+        case -7: name = "HAL_ERR_IO";      break;
+        case -8: name = "HAL_ERR_PARAM";   break;
+        case -9: name = "HAL_ERR_FULL";    break;
+        default: break;
+    }
+    if (name) {
+        shell_puts(name);
+        hal_console_putc('(');
+    }
+    /* 有符号十进制：先出负号再绝对值 */
+    if (err < 0) { hal_console_putc('-'); err = -err; }
+    shell_put_uint32((uint32_t)err);
+    if (name) hal_console_putc(')');
+}
+
 static const char *task_state_str(task_state_t s) {
     switch (s) {
         case TASK_STATE_READY:   return "READY";
@@ -102,6 +132,13 @@ typedef struct {
     const char     *help;
 } shell_cmd_t;
 
+/* 别名：g_cmd_table 里引用 cmd_save/cmd_unsave/cmd_list，但实现在 bootscript
+ * 代码块里命名为 cmd_bootscript_save 等 —— 命令表初始化之前先 define 做重定向，
+ * 这样 g_cmd_table 中取函数指针时取的就是 bootscript_* 版本。*/
+#define cmd_save    cmd_bootscript_save
+#define cmd_unsave  cmd_bootscript_unsave
+#define cmd_list    cmd_bootscript_list
+
 /* —— 各命令处理函数前向声明 —— */
 static int cmd_help(int argc, char **argv);
 static int cmd_ps(int argc, char **argv);
@@ -116,11 +153,29 @@ static int cmd_led(int argc, char **argv);
 static int cmd_syscalls(int argc, char **argv);
 static int cmd_gpio(int argc, char **argv);
 static int cmd_i2c(int argc, char **argv);
+static int cmd_save(int argc, char **argv);
+static int cmd_unsave(int argc, char **argv);
+static int cmd_list(int argc, char **argv);
+static int cmd_boot(int argc, char **argv);
+static int cmd_factory_reset(int argc, char **argv);
+
+#undef cmd_save
+#undef cmd_unsave
+#undef cmd_list
+
+/* bootscript/shell 内部跨函数引用的前向声明（避免先引用后定义） */
+static int  shell_exec_line(char *line);        /* 定义在 命令解析 dispatch 末尾 */
+static int  cmd_bootscript_boot_exec(int argc, char **argv);  /* 定义在 bootscript 命令块末尾 */
+extern int   bootscript_run_all(void);          /* 定义在 bootscript 命令块前面（非 static，暴露 API） */
 
 /* ================================================================
  * 命令表（驱动扩展：新增命令只需加一行）
+ * 构建命令表之前临时定义 save/unsave/list → cmd_bootscript_* 映射
  * ================================================================ */
 static const shell_cmd_t g_cmd_table[] = {
+#define cmd_save    cmd_bootscript_save
+#define cmd_unsave  cmd_bootscript_unsave
+#define cmd_list    cmd_bootscript_list
     { "help",    cmd_help,    "help [cmd]",            "打印帮助信息" },
     { "ps",      cmd_ps,      "ps",                    "列出所有任务（ID/状态/栈/剩余tick）" },
     { "heap",    cmd_heap,    "heap",                  "打印内核堆空闲字节 / 最大空闲块" },
@@ -135,10 +190,21 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "GPIO 子命令：初始化/读/写/翻转任意 RP2040 引脚" },
     { "i2c",     cmd_i2c,     "i2c help | init ... | scan | wr | rd | memwr | memrd",
                                                     "I2C 主机子命令：扫描总线/读写/寄存器访问" },
+    { "save",    cmd_save,    "save <any command...>",
+                                                    "把任意命令追加到 Flash 固化区（不立即执行；下次开机自动执行）" },
+    { "unsave",  cmd_unsave,  "unsave <idx> | all",   "删除固化命令：按序号或一键清空" },
+    { "list",    cmd_list,    "list",                  "列出所有已固化命令（Flash 双备份 + CRC）" },
+    { "boot",    cmd_boot,    "boot exec | boot flash_test",
+                                                    "boot: 固化指令子系统；exec=立即跑；flash_test=B线路SPI自检" },
+    { "factory_reset", cmd_factory_reset, "factory_reset | factory_reset confirm",
+                                                    "出厂重置：擦除所有持久化数据(bootscript+末尾保留区)；保留内核固件本身" },
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
 };
+#undef cmd_save
+#undef cmd_unsave
+#undef cmd_list
 #define SHELL_CMD_NUM  (sizeof(g_cmd_table) / sizeof(g_cmd_table[0]))
 
 /* ================================================================
@@ -847,6 +913,29 @@ static int cmd_i2c(int argc, char **argv) {
 #endif
 }
 
+/* ========== cmd_boot 包装子命令 ========== */
+static int cmd_boot(int argc, char **argv) {
+    if (argc < 2) { shell_puts("Usage: boot exec | boot flash_test\r\n  exec - 立即执行全部固化命令\r\n  flash_test - (B线路SPI) 擦+写双备份扇区后校验一致性\r\n"); return 1; }
+    const char *sub = argv[1];
+    if (strcmp(sub, "exec") == 0)        return cmd_bootscript_boot_exec(argc, argv);
+    if (strcmp(sub, "flash_test") == 0) {
+        hal_err_t e = bootscript_erase_test();
+        if (e != HAL_OK) { shell_puts("B-LINE SPI: ERASE FAILED\r\n"); return 1; }
+        bool ok = bootscript_verify();
+        if (!ok)     { shell_puts("B-LINE SPI: BACKUP MISMATCH/CRC FAIL\r\n"); return 1; }
+        shell_puts("B-LINE SPI: Flash backup sectors A/B erase→write OK, headers consistent.\r\n");
+        /* 追加并再校验，压力测试单个 slot write 路径 */
+        e = bootscript_append("led on");
+        if (e != HAL_OK) { shell_puts("B-LINE SPI: APPEND FAILED (rc="); shell_put_uint32(e); shell_puts(")\r\n"); return 1; }
+        ok = bootscript_verify();
+        if (!ok) { shell_puts("B-LINE SPI: POST-APPEND BACKUP MISMATCH\r\n"); return 1; }
+        (void)bootscript_clear_all();
+        shell_puts("B-LINE SPI: Append + dual-copy CRC check PASSED.\r\n");
+        return 0;
+    }
+    shell_puts("Unknown boot subcommand: '"); shell_puts(sub); shell_puts("'\r\n"); return 1;
+}
+
 /* ================================================================
  * 行解析器：按"空格"拆分 argv[0..argc-1]
  * ================================================================ */
@@ -869,7 +958,198 @@ static int shell_split_argv(char *line, char **argv, int max_args, bool *overflo
 }
 
 /* ================================================================
- * 执行单条命令
+ * bootscript 命令：固化指令到板载 Flash（开机自动执行）
+ *   save <cmd ...>        → 追加固化（不立即执行）
+ *   unsave <idx>|all      → 删除第 idx 条 / 全部清空
+ *   list                  → 列出所有已固化命令
+ *   boot exec             → 立刻执行全部已固化命令（验证用）
+ *
+ * 另外"!"是语法糖前缀：!<cmd ...>  =  先执行该命令，若成功再 save 固化。
+ *   这个 ! 前缀在 shell_exec_line 入口处剥掉并设置"执行后 append" flag。
+ * ================================================================ */
+/* （bootscript.h 已经在文件顶部 OS_CFG_SHELL 后 include，此处避免重复 include 导致
+ *  conflicting types 编译错误） */
+
+/* 把 (argc, argv) 重新拼成一行字符串（用单空格分隔，每个参数原样）
+ *   cmd_save 里还原回命令行字符串后 append。buf 长 SHELL_LINE_SIZE */
+static void argv_rejoin(int argc, char **argv, int arg_start, char *buf, size_t buf_len) {
+    size_t out = 0;
+    for (int i = arg_start; i < argc; i++) {
+        size_t alen = strlen(argv[i]);
+        if (i > arg_start) {
+            if (out + 1 < buf_len) buf[out++] = ' ';
+        }
+        for (size_t j = 0; j < alen && out + 1 < buf_len; j++) {
+            buf[out++] = argv[i][j];
+        }
+    }
+    buf[out] = '\0';
+}
+
+/* 公开 API：执行 bootscript 中全部已固化命令（boot_setup 开机和 shell "boot exec" 都会调用） */
+int bootscript_run_all(void) {
+    uint8_t total = bootscript_count();
+    if (total == 0) {
+        shell_puts("[BOOT ] No persistent commands saved yet. Use 'save <cmd>' or '!<cmd>'.\r\n");
+        return 0;
+    }
+    shell_puts("[BOOT ] Running "); shell_put_uint32(total); shell_puts(" persistent command(s)...\r\n");
+    int failed = 0;
+    for (uint8_t i = 0; i < total; i++) {
+        char line[SHELL_LINE_SIZE];
+        if (!bootscript_get(i, line, sizeof(line))) {
+            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": FAILED to read slot (CRC corrupt?)\r\n");
+            failed++; continue;
+        }
+        shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": $ "); shell_puts(line); shell_crlf();
+        int rc = shell_exec_line(line);
+        if (rc != 0) {
+            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": exited with code ");
+            shell_put_uint32((uint32_t)((rc < 0) ? -rc : rc)); shell_crlf();
+            failed++;
+        }
+    }
+    shell_puts("[BOOT ] Done. ("); shell_put_uint32(total - (uint8_t)failed);
+    shell_puts(" ok / "); shell_put_uint32((uint32_t)((failed < 0) ? 0 : failed)); shell_puts(" failed)\r\n");
+    return failed;
+}
+
+static int cmd_bootscript_save(int argc, char **argv) {
+    if (argc < 2) { shell_puts("Usage: save <command line...>\r\n  e.g. save i2c init 0 4 5 100000\r\n"); return 1; }
+    char line[SHELL_LINE_SIZE];
+    argv_rejoin(argc, argv, 1, line, sizeof(line));
+    hal_err_t r = bootscript_append(line);
+    if (r == HAL_OK) { uint8_t n = bootscript_count();
+        shell_puts("OK: Saved as #"); shell_put_uint32((uint32_t)(n - 1));
+        shell_puts(" (total "); shell_put_uint32(n); shell_puts("/32, Remaining: ");
+        shell_put_uint32(32u - (uint32_t)n); shell_puts(" slots). Persistent across reset.\r\n"); return 0; }
+    if (r == HAL_ERR_FULL)  shell_puts("ERROR: bootscript full (max 32 entries). Use 'unsave <idx>'.\r\n");
+    else if (r == HAL_ERR_PARAM) shell_puts("ERROR: command too long (>123 B) or empty.\r\n");
+    else if (r == HAL_ERR_NOMEM) shell_puts("ERROR: kmalloc 4KB staging failed.\r\n");
+    else { shell_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); }
+    return 1;
+}
+
+static int cmd_bootscript_unsave(int argc, char **argv) {
+    if (argc < 2) { shell_puts("Usage: unsave <idx> | unsave all\r\n"); return 1; }
+    if (strcmp(argv[1], "all") == 0) {
+        hal_err_t r = bootscript_clear_all();
+        if (r == HAL_OK) { shell_puts("OK: All persistent commands erased. Remaining: 32/32 slots (free).\r\n"); return 0; }
+        shell_puts("ERROR: Flash erase failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); return 1;
+    }
+    uint32_t idx;
+    extern int shell_parse_uint_auto(const char *s, uint32_t *out);   /* same file, defined earlier */
+    if (shell_parse_uint_auto(argv[1], &idx) != 0) { shell_puts("ERROR: bad index\r\n"); return 1; }
+    uint8_t count = bootscript_count();
+    if (idx >= count) { shell_puts("ERROR: index out of range (have "); shell_put_uint32(count); shell_puts(" entries)\r\n"); return 1; }
+    hal_err_t r = bootscript_remove((uint8_t)idx);
+    if (r == HAL_OK) { uint8_t left = bootscript_count();
+        shell_puts("OK: Removed #"); shell_put_uint32(idx);
+        shell_puts(" (used "); shell_put_uint32(left); shell_puts("/32, Remaining: ");
+        shell_put_uint32(32u - (uint32_t)left); shell_puts(" slots)\r\n"); return 0; }
+    shell_puts("ERROR: Flash write failed (code="); shell_put_err((int)r); shell_puts(").\r\n"); return 1;
+}
+
+static int cmd_bootscript_list(int argc, char **argv) {
+    (void)argc; (void)argv;
+    uint8_t n = bootscript_count();
+    uint32_t rem = 32u - (uint32_t)n;
+    shell_puts("Persistent commands (used "); shell_put_uint32(n);
+    shell_puts(", free "); shell_put_uint32(rem); shell_puts("/32 slots, Flash 2x backup):\r\n");
+    for (uint8_t i = 0; i < n; i++) {
+        char line[SHELL_LINE_SIZE];
+        if (!bootscript_get(i, line, sizeof(line))) {
+            shell_puts("  #"); shell_put_uint32(i); shell_puts(": <CRC CORRUPT>\r\n"); continue;
+        }
+        shell_puts("  #"); shell_put_uint32(i); shell_puts(": "); shell_puts(line); shell_crlf();
+    }
+    if (n == 0) shell_puts("  (empty. Try: save i2c init 0 4 5 100000)\r\n");
+    return 0;
+}
+
+static int cmd_bootscript_boot_exec(int argc, char **argv) {
+    (void)argc; (void)argv;
+    (void)bootscript_run_all();
+    return 0;
+}
+
+/* ================================================================
+ * 出厂重置：factory_reset [confirm]
+ *   · 无参数：打印警告和影响范围，要求二次确认；
+ *   · confirm：真正执行
+ *       1) 清空 bootscript 双备份 (末尾 2×4KB，SEC_A/B)  → 调用 bootscript_clear_all()
+ *       2) 再往回擦 14 个扇区（末尾共 16 个扇区 = 64KB，
+ *          0x1F0000..0x1FFFFF 共 64KB），彻底消除 "用户层/保留区 其他应用残留数据"，
+ *          但绝对不碰 Flash 起始区域（固件 .text/.rodata 都在最开头，当前固件仅 83KB）。
+ *   · 成功后提示重新上电，系统回到"刚刷完固件、无任何固化指令/用户数据"的出厂状态。
+ * ================================================================ */
+#ifndef PICO_FLASH_SIZE_BYTES
+#define PICO_FLASH_SIZE_BYTES   (2u * 1024u * 1024u)
+#endif
+#define FACTORY_RESET_SECTORS   (16u)   /* 擦末尾 16 × 4KB = 64KB */
+
+static int cmd_factory_reset(int argc, char **argv) {
+    /* 第 1 步：无 confirm → 只打印警告 */
+    if (argc < 2 || strcmp(argv[1], "confirm") != 0) {
+        shell_puts("****************************************************************\r\n");
+        shell_puts("*                    FACTORY RESET WARNING                     *\r\n");
+        shell_puts("****************************************************************\r\n");
+        shell_puts("  此命令将把系统恢复到刚刷完固件的出厂状态：\r\n");
+        shell_puts("   ✓ 保留：内核 + demo_app 固件本身（操作系统完整保留）\r\n");
+        shell_puts("   ✗ 清除：所有固化指令 (save / ! 保存的 bootscript 全部条目)\r\n");
+        shell_puts("   ✗ 清除：板载 SPI Flash 最后 64KB 保留区 (16 sectors)\r\n");
+        shell_puts("   ✗ 清除：任何应用层写入的持久化用户数据\r\n");
+        shell_puts("  操作不可恢复！请确保已备份重要配置。\r\n");
+        shell_puts("  要继续，请输入:  factory_reset confirm\r\n");
+        shell_puts("****************************************************************\r\n");
+        return 0;
+    }
+
+    shell_puts("[FACTORY_RESET] Starting... Will erase tail 64KB of SPI Flash (keep kernel FW).\r\n");
+
+    /* 先快速清 bootscript 双备份（带 CRC 的 2 个扇区），之后即使断电也不会残留 */
+    hal_err_t r = bootscript_clear_all();
+    if (r != HAL_OK) {
+        shell_puts("[FACTORY_RESET] FAIL: bootscript_clear_all returned ");
+        shell_put_err((int)r); shell_crlf();
+        return 1;
+    }
+    shell_puts("[FACTORY_RESET] Bootscript (2×4KB) cleared OK.\r\n");
+
+    /* 再擦剩余 14 个扇区（共 16 个）：从 FACTORY_RESET_BASE 往上到末尾 */
+    uint32_t base = (uint32_t)PICO_FLASH_SIZE_BYTES - (uint32_t)FACTORY_RESET_SECTORS * HAL_FLASH_SECTOR_SIZE;
+    for (uint32_t s = 0; s < FACTORY_RESET_SECTORS; s++) {
+        uint32_t off = base + s * HAL_FLASH_SECTOR_SIZE;
+        /* 跳过 SEC_A/B 位置 —— 其实 bootscript_clear_all 里 bs_commit_both 已经擦过了，
+         *   再擦一遍也没问题；但为了"进度汇报"统一，这里统一都擦并计数。 */
+        hal_err_t er = hal_flash_erase_sector(off);
+        if (er != HAL_OK) {
+            shell_puts("[FACTORY_RESET] FAIL at sector "); shell_put_uint32(s);
+            shell_puts(" (offset="); shell_put_hex32(off);
+            shell_puts(") code="); shell_put_err((int)er); shell_crlf();
+            return 1;
+        }
+        if (((s + 1) % 4) == 0 || s == FACTORY_RESET_SECTORS - 1) {
+            shell_puts("[FACTORY_RESET] Erased "); shell_put_uint32(s + 1);
+            shell_puts("/"); shell_put_uint32(FACTORY_RESET_SECTORS);
+            shell_puts(" sectors (");
+            shell_put_uint32((s + 1) * HAL_FLASH_SECTOR_SIZE / 1024u);
+            shell_puts(" KB)\r\n");
+        }
+    }
+
+    shell_puts("[FACTORY_RESET] DONE. System restored to factory state (v");
+    shell_puts(k_version());
+    shell_puts(").\r\n");
+    shell_puts("[FACTORY_RESET] Please POWER-CYCLE (拔插 USB) or press RUN 键重新上电以进入全新状态。\r\n");
+    return 0;
+}
+
+/* ================================================================
+ * 执行单条命令（新增："!" 前缀糖衣）
+ *   "! gpio init 25 out 1" → 先执行 "gpio init 25 out 1"，
+ *                             成功 (rc=0) 再 save 到 Flash；
+ *                             失败 (rc≠0) 就不 save，避免保存错误命令。
  * ================================================================ */
 static int shell_exec_line(char *line) {
     /* 容错：自动跳过行开头的提示符残留（用户粘贴整个会话时最常出现）
@@ -893,6 +1173,29 @@ static int shell_exec_line(char *line) {
             line = p;
         }
     }
+
+    /* "!" 前缀糖衣：先执行命令，成功再固化 */
+    bool bang_append_on_success = false;
+    {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '!') {
+            bang_append_on_success = true;
+            p++;
+            if (*p == ' ') p++;
+            line = p;
+        }
+    }
+
+    /* 为了 !<cmd> 语法糖能把剩余命令重新拼成命令行字符串保存，
+     *   先 copy 一份"剥了 '!' 后的原始 line"，执行成功后直接用。 */
+    static char bang_original[SHELL_LINE_SIZE];
+    if (bang_append_on_success) {
+        size_t ll = strlen(line);
+        if (ll >= sizeof(bang_original)) ll = sizeof(bang_original) - 1;
+        memcpy(bang_original, line, ll); bang_original[ll] = '\0';
+    }
+
     static char *argv[SHELL_MAX_ARGS];
     bool overflowed = false;
     int argc = shell_split_argv(line, argv, SHELL_MAX_ARGS, &overflowed);
@@ -903,15 +1206,37 @@ static int shell_exec_line(char *line) {
     }
     if (argc == 0) return 0;   /* 空行 */
     const char *name = argv[0];
+    int rc = 1;
+    bool found = false;
     for (size_t i = 0; i < SHELL_CMD_NUM; i++) {
         if (strcmp(g_cmd_table[i].name, name) == 0) {
-            return g_cmd_table[i].handler(argc, argv);
+            found = true;
+            rc = g_cmd_table[i].handler(argc, argv);
+            break;
         }
     }
-    shell_puts("Unknown command: ");
-    shell_puts(name);
-    shell_puts(" (try 'help')\r\n");
-    return 1;
+    /* 只有命令表里完全没命中才打印 "Unknown command"；handler 返回 1 只是表示失败（此时
+     *   handler 自己应该已经打印了具体错误信息），不能误报"未知命令"。*/
+    if (!found) {
+        shell_puts("Unknown command: ");
+        shell_puts(name);
+        shell_puts(" (try 'help')\r\n");
+    }
+
+    /* ! 糖衣：执行成功 → 追加 Flash；成功/失败都汇报剩余 slots */
+    if (bang_append_on_success && rc == 0) {
+        hal_err_t br = bootscript_append(bang_original);
+        if (br == HAL_OK) {
+            uint8_t n = bootscript_count();
+            uint8_t rem = (uint8_t)(32u - (uint32_t)n);
+            shell_puts("  → Auto-saved as #"); shell_put_uint32((uint32_t)(n - 1));
+            shell_puts(" (persistent on Flash. Remaining: "); shell_put_uint32(rem); shell_puts("/32 slots)\r\n");
+        } else {
+            shell_puts("  → FAILED to save to Flash (code=");
+            shell_put_err((int)br); shell_puts(")\r\n");
+        }
+    }
+    return rc;
 }
 
 /* ================================================================
@@ -1015,8 +1340,17 @@ static void task_shell(void *arg) {
 
 /* ================================================================
  * 对外入口：创建 Shell 任务（由 demo_app_init 调用）
+ *
+ * 开机固化命令执行时机：
+ *   在进入 shell 主循环 (task_shell) 之前，立即执行 bootscript_run_all()。
+ *   这样每次开机 / reset 后，用户 save / ! 前缀固化的 I2C init / led on /
+ *   gpio init 等指令都会自动跑一遍，然后才进入交互式等待。
+ *   bootscript_run_all 内部会 "No persistent commands" 友好提示 0 条的情况。
  * ================================================================ */
 void shell_start(void) {
+    /* 先跑固化指令（如果有） */
+    (void)bootscript_run_all();
+    /* 再启动交互式 shell */
     tcb_t *t = task_create(SHELL_TASK_NAME, task_shell, NULL,
                            SHELL_TASK_STACK, SHELL_TASK_WEIGHT);
     (void)t;   /* 失败也不 panic：demo 阶段仅尽力启动 */

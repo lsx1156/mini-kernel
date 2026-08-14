@@ -38,7 +38,7 @@ set(CMAKE_C_EXTENSIONS ON)
 
 # project()：现在 SDK 已经把交叉工具链塞进 cache 了
 project(mini_kernel
-    VERSION 0.1.0
+    VERSION 0.2.0
     LANGUAGES C CXX ASM
     DESCRIPTION "Lightweight time-sliced kernel for resource-constrained 32-bit MCUs"
 )
@@ -234,7 +234,9 @@ function(add_module_if_enabled name src_dir define_flag)
     message(STATUS "add_module_if_enabled: ${define_flag}=${${define_flag}}")
     
     if(${define_flag})
-        file(GLOB _srcs ${src_dir}/*.c)
+        # 不用 file(GLOB) 避免 CMake cache 不自动发现新增的 bootscript.c 这类文件；
+        # 显式 CONFIGURE_DEPENDS 让重新 cmake --build 时 glob 会更新。
+        file(GLOB _srcs CONFIGURE_DEPENDS ${src_dir}/*.c)
         message(STATUS "add_module_if_enabled: ${name} - found ${_srcs} source files")
         if(_srcs)
             add_library(${name} STATIC ${_srcs})

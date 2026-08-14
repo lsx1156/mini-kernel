@@ -22,6 +22,8 @@ typedef enum {
     HAL_ERR_TIMEOUT   = -5,   /* 超时 */
     HAL_ERR_NOTSUP    = -6,   /* 功能未实现/未使能 */
     HAL_ERR_IO        = -7,   /* 物理层错误（ACK失败、CRC错等） */
+    HAL_ERR_PARAM     = -8,   /* 参数超范围/非法组合（替代 INVAL 的精确版） */
+    HAL_ERR_FULL      = -9,   /* 存储/队列满（如 bootscript 32 条上限） */
 } hal_err_t;
 
 /* ================================================================
@@ -94,6 +96,20 @@ typedef struct {
     hal_err_t (*set_rx_cb)(uint32_t uart_id, void (*cb)(uint8_t byte, void *arg), void *arg);
 } hal_uart_ops_t;
 
+/* ---- 2.5 板载 Flash（RP2040 的 QSPI 外挂 W25Q16JV，2MB） ----
+ *   · erase/program 必须扇区对齐：4096B，写前必须先擦（1→0 只能擦恢复 0→1）
+ *   · offset = 从 Flash 起始地址 (PICO_FLASH = 0x10000000) 的字节偏移
+ *   · Pico SDK 限制：写/擦阶段必须暂停 XIP，故 erase/program 内部会关中断
+ *     并从 RAM 执行函数，执行期间不会响应任何调度 */
+#define HAL_FLASH_SECTOR_SIZE   4096u
+#define HAL_FLASH_PAGE_SIZE     256u
+typedef struct {
+    hal_err_t (*erase_sector)(uint32_t offset);                   /* offset 必须 4096 对齐 */
+    hal_err_t (*program_page)(uint32_t offset, const uint8_t *data, size_t len);
+    const uint8_t *(*map_read)(uint32_t offset);                  /* 返回 XIP 映射的只读指针，直接读 */
+    hal_err_t (*crc8_range)(uint32_t offset, size_t len, uint8_t *out_crc);
+} hal_flash_ops_t;
+
 #endif /* OS_CFG_PERIPH_SERVICE */
 
 #if OS_CFG_VFS && OS_CFG_FATFS
@@ -117,10 +133,11 @@ typedef struct {
 
     /* 可选（未实现置 NULL，内核运行时检查） */
 #if OS_CFG_PERIPH_SERVICE
-    const hal_gpio_ops_t  *gpio;
-    const hal_spi_ops_t   *spi;
-    const hal_i2c_ops_t   *i2c;
-    const hal_uart_ops_t  *uart;
+    const hal_gpio_ops_t   *gpio;
+    const hal_spi_ops_t    *spi;
+    const hal_i2c_ops_t    *i2c;
+    const hal_uart_ops_t   *uart;
+    const hal_flash_ops_t  *flash;   /* 板载 Flash（W25Q16JV），供 bootscript / ENV 固化 */
 #endif
 #if OS_CFG_VFS && OS_CFG_FATFS
     const hal_sdcard_ops_t *sdcard;
@@ -160,6 +177,16 @@ extern const hal_export_t hal_export;
 #define hal_uart_init(i,b,p,s)     hal_export.uart->init(i,b,p,s)
 #define hal_uart_write(i,b,l,t)    hal_export.uart->write(i,b,l,t)
 #define hal_uart_read(i,b,l,t)     hal_export.uart->read(i,b,l,t)
+
+/* 板载 Flash：offset = 相对 Flash 基址 (0x10000000) 的字节偏移
+ *   · hal_flash_erase_sector : 擦 4KB 扇区（必须 sector 对齐）
+ *   · hal_flash_program      : 写任意 len 字节（内部按 256B page 分块，offset 无需对齐）
+ *   · hal_flash_map_read     : 返回 XIP 映射只读指针，直接 memcpy 读
+ *   · hal_flash_crc8         : 只读区域 CRC8（x^8+x^5+x^4+1 多项式，和 crc8_smbus 相同） */
+#define hal_flash_erase_sector(o)      hal_export.flash->erase_sector(o)
+#define hal_flash_program(o,d,l)       hal_export.flash->program_page(o,d,l)
+#define hal_flash_map_read(o)          hal_export.flash->map_read(o)
+#define hal_flash_crc8(o,l,c)          hal_export.flash->crc8_range(o,l,c)
 #endif
 
 #if OS_CFG_VFS && OS_CFG_FATFS
