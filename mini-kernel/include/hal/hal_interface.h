@@ -154,6 +154,8 @@ extern const hal_export_t hal_export;
 #define hal_i2c_init(id,hz)        hal_export.i2c->init(id,hz)
 #define hal_i2c_tx(id,a,b,l)       hal_export.i2c->master_tx(id,a,b,l)
 #define hal_i2c_rx(id,a,b,l)       hal_export.i2c->master_rx(id,a,b,l)
+#define hal_i2c_mem_read(id,a,m,b,l)  hal_export.i2c->mem_read(id,a,m,b,l)
+#define hal_i2c_mem_write(id,a,m,b,l) hal_export.i2c->mem_write(id,a,m,b,l)
 
 #define hal_uart_init(i,b,p,s)     hal_export.uart->init(i,b,p,s)
 #define hal_uart_write(i,b,l,t)    hal_export.uart->write(i,b,l,t)

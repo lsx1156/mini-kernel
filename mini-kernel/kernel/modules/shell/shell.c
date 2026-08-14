@@ -112,6 +112,7 @@ static int cmd_clear(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_syscalls(int argc, char **argv);
 static int cmd_gpio(int argc, char **argv);
+static int cmd_i2c(int argc, char **argv);
 
 /* ================================================================
  * 命令表（驱动扩展：新增命令只需加一行）
@@ -129,6 +130,8 @@ static const shell_cmd_t g_cmd_table[] = {
     { "led",     cmd_led,     "led on | off | toggle", "控制 RP2040 板载 LED (GPIO25)" },
     { "gpio",    cmd_gpio,    "gpio help | init ... | read <pin> | write <pin> 0|1 | toggle <pin>",
                                                     "GPIO 子命令：初始化/读/写/翻转任意 RP2040 引脚" },
+    { "i2c",     cmd_i2c,     "i2c help | init ... | scan | wr | rd | memwr | memrd",
+                                                    "I2C 主机子命令：扫描总线/读写/寄存器访问" },
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
@@ -518,6 +521,236 @@ static int cmd_gpio(int argc, char **argv) {
 #else /* !PERIPH_SERVICE */
     (void)argc; (void)argv;
     shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, GPIO HAL not linked. Set =1 in os_config.h.\r\n");
+    return 1;
+#endif
+}
+
+/* ================================================================
+ * i2c 子命令解析（Linux i2cdetect / i2c-tools 风格）
+ *
+ *   i2c help
+ *   i2c init  <bus> <sda_pin> <scl_pin> <hz>
+ *                   bus = 0 (I2C0) | 1 (I2C1)
+ *                   RP2040: I2C0 默认 GP4=SDA/GP5=SCL; I2C1  GP6=SDA/GP7=SCL
+ *                   hz = 100000 (Standard) | 400000 (Fast) | 1000000 (Fast+)
+ *   i2c scan  <bus>                   # 探测 0x08~0x77 的 7-bit 地址
+ *   i2c wr    <bus> <addr> <B1> [B2 ... Bn]       # 裸写 1+ 字节
+ *   i2c rd    <bus> <addr> <len>                  # 裸读 len 字节
+ *   i2c memwr <bus> <addr> <reg> <B1> [B2 ...]    # 设备内部寄存器写（reg 8/16-bit mem_addr）
+ *   i2c memrd <bus> <addr> <reg> <len>            # 设备内部寄存器读
+ *
+ * 注意：所有地址字段 <addr>/<reg>/<Bx> 都接受十进制或 0x 十六进制，
+ *       但 7-bit I2C 地址禁止自动左移（用户输入的是 Datasheet 里的 7-bit 值）。
+ *       hal_port.c 的 i2c_write_blocking 需要 7-bit 地址（Pico SDK 约定）。
+ * ================================================================ */
+
+/* 解析 10 进制或带 0x 前缀的十六进制 uint32。失败返回 -1 */
+static int shell_parse_uint_auto(const char *s, uint32_t *out) {
+    if (!s || !*s) return -1;
+    uint32_t base = 10;
+    const char *p = s;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16;
+        p += 2;
+        if (!*p) return -1;
+    }
+    uint32_t v = 0;
+    for (; *p; p++) {
+        char c = *p;
+        uint32_t digit;
+        if (c >= '0' && c <= '9')      digit = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (uint32_t)(c - 'a') + 10;
+        else if (c >= 'A' && c <= 'F') digit = (uint32_t)(c - 'A') + 10;
+        else return -1;
+        if (digit >= base) return -1;
+        v = v * base + digit;
+    }
+    *out = v;
+    return 0;
+}
+
+static void i2c_help(void) {
+    shell_puts("I2C subcommands (7-bit device addresses, no auto-left-shift):\r\n");
+    shell_puts("  i2c init <bus> <sda> <scl> <hz>      Init + pinmux I2C bus (bus=0|1)\r\n");
+    shell_puts("         RP2040 AF: bus0 pins=GP4(SDA)/GP5(SCL), bus1=GP6/GP7\r\n");
+    shell_puts("         Typical hz: 100000 / 400000 / 1000000\r\n");
+    shell_puts("  i2c scan <bus>                      Scan 7-bit addresses 0x08..0x77\r\n");
+    shell_puts("  i2c wr   <bus> <addr> <b1> [..bn]   Raw write 1..N bytes\r\n");
+    shell_puts("  i2c rd   <bus> <addr> <len>         Raw read len bytes\r\n");
+    shell_puts("  i2c memwr <bus> <addr> <reg> <b1> [..]   Write device register (mem 16-bit)\r\n");
+    shell_puts("  i2c memrd <bus> <addr> <reg> <len>       Read device register (mem 16-bit)\r\n");
+    shell_puts("Examples:\r\n");
+    shell_puts("  i2c init 0 4 5 100000                # Standard-mode on default pins\r\n");
+    shell_puts("  i2c scan 0                           # Show connected devices\r\n");
+    shell_puts("  i2c wr 0 0x3C 0x00 0xAF              # Write 2 bytes to OLED at 0x3C\r\n");
+    shell_puts("  i2c memrd 0 0x50 0x00 16             # Read 16 bytes from AT24Cxx EEPROM @ 0\r\n");
+}
+
+/* 打印一个字节为 2 位十六进制，前缀空格 */
+static void shell_print_hex8(uint8_t b) {
+    const char hex[] = "0123456789ABCDEF";
+    hal_console_putc(hex[(b >> 4) & 0xF]);
+    hal_console_putc(hex[b & 0xF]);
+}
+
+static int cmd_i2c(int argc, char **argv) {
+#if OS_CFG_PERIPH_SERVICE
+    if (argc < 2) { i2c_help(); return 1; }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "help") == 0) {
+        i2c_help();
+        return 0;
+    }
+
+    if (strcmp(sub, "init") == 0) {
+        if (argc < 6) { shell_puts("Usage: i2c init <bus> <sda_pin> <scl_pin> <hz>\r\n"); return 1; }
+        uint32_t bus, sda, scl, hz;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &sda) != 0 || sda > 29) { shell_puts("Invalid SDA pin (0..29)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &scl) != 0 || scl > 29) { shell_puts("Invalid SCL pin (0..29)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &hz)  != 0 || hz == 0)  { shell_puts("Invalid hz (non-zero)\r\n"); return 1; }
+
+        /* RP2040 GPIO_FUNC_I2C = 3，SDK 自动按 pin 路由到 I2C0/I2C1；开漏 + 上拉由 SDK i2c_init 处理 */
+        hal_err_t r1 = hal_gpio_init(sda, HAL_GPIO_AF, 3);
+        hal_err_t r2 = hal_gpio_init(scl, HAL_GPIO_AF, 3);
+        hal_err_t r3 = hal_i2c_init(bus, hz);
+        if (r1 != HAL_OK || r2 != HAL_OK) { shell_puts("I2C pinmux FAILED\r\n"); return 1; }
+        if (r3 != HAL_OK) { shell_puts("I2C init FAILED\r\n"); return 1; }
+
+        shell_puts("OK: I2C"); shell_put_uint32(bus);
+        shell_puts(" SDA=GP"); shell_put_uint32(sda);
+        shell_puts(" SCL=GP"); shell_put_uint32(scl);
+        shell_puts(" @"); shell_put_uint32(hz); shell_puts("Hz\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "scan") == 0) {
+        if (argc < 3) { shell_puts("Usage: i2c scan <bus>\r\n"); return 1; }
+        uint32_t bus;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        shell_puts("Scanning I2C"); shell_put_uint32(bus);
+        shell_puts(" (7-bit addresses 0x08..0x77):\r\n   ");
+        for (uint8_t col = 0; col < 16; col++) {
+            shell_print_hex8(col); shell_putc(' ');
+        }
+        shell_crlf();
+        for (uint8_t row = 0; row < 8; row++) {
+            shell_print_hex8(row << 4);
+            shell_putc(':'); shell_putc(' ');
+            for (uint8_t col = 0; col < 16; col++) {
+                uint8_t addr = (uint8_t)((row << 4) | col);
+                if (addr < 0x08 || addr > 0x77) {
+                    shell_puts("-- ");
+                    continue;
+                }
+                /* 标准探测：发送 START + addr_W + STOP（0 字节写）
+                 *   调用 HAL 层 hal_i2c_tx，传 len=0。
+                 *   RP2040 SDK 实现里 buf=NULL / len=0 时只发控制字节，
+                 *   ACK → HAL_OK，NACK → HAL_ERR_IO。 */
+                hal_err_t pr = hal_i2c_tx(bus, addr, NULL, 0);
+                if (pr == HAL_OK) {
+                    shell_print_hex8(addr); shell_putc(' ');
+                } else {
+                    shell_puts("-- ");
+                }
+            }
+            shell_crlf();
+        }
+        shell_puts("Done.\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "wr") == 0) {
+        if (argc < 5) { shell_puts("Usage: i2c wr <bus> <addr> <B1> [B2 ...]\r\n"); return 1; }
+        uint32_t bus, addr;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr (0x00..0x7F)\r\n"); return 1; }
+        int nbytes = argc - 4;
+        if (nbytes > 256) { shell_puts("Too many bytes (>256)\r\n"); return 1; }
+        uint8_t buf[256];
+        for (int i = 0; i < nbytes; i++) {
+            uint32_t v;
+            if (shell_parse_uint_auto(argv[4 + i], &v) != 0 || v > 0xFF) {
+                shell_puts("Invalid byte at pos "); shell_put_uint32(i); shell_puts(": "); shell_puts(argv[4 + i]); shell_crlf();
+                return 1;
+            }
+            buf[i] = (uint8_t)v;
+        }
+        hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, buf, (size_t)nbytes);
+        if (r != HAL_OK) { shell_puts("I2C WR NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" WR 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
+        shell_puts("] ("); shell_put_uint32(nbytes); shell_puts(" bytes)\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "rd") == 0) {
+        if (argc < 5) { shell_puts("Usage: i2c rd <bus> <addr> <len>\r\n"); return 1; }
+        uint32_t bus, addr, len;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus (0 or 1)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &len) != 0 || len == 0 || len > 256) { shell_puts("Invalid len (1..256)\r\n"); return 1; }
+        uint8_t buf[256];
+        hal_err_t r = hal_i2c_rx(bus, (uint8_t)addr, buf, (size_t)len);
+        if (r != HAL_OK) { shell_puts("I2C RD NACK or ERROR at addr=0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" RD 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
+        shell_puts("] ("); shell_put_uint32(len); shell_puts(" bytes)\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "memwr") == 0) {
+        if (argc < 6) { shell_puts("Usage: i2c memwr <bus> <addr> <reg> <B1> [..Bn]\r\n"); return 1; }
+        uint32_t bus, addr, reg;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { shell_puts("Invalid reg (0..0xFFFF, 16-bit mem addr)\r\n"); return 1; }
+        int nbytes = argc - 5;
+        if (nbytes <= 0 || nbytes > 254) { shell_puts("Need 1..254 data bytes\r\n"); return 1; }
+        uint8_t buf[254];
+        for (int i = 0; i < nbytes; i++) {
+            uint32_t v;
+            if (shell_parse_uint_auto(argv[5 + i], &v) != 0 || v > 0xFF) {
+                shell_puts("Invalid byte at pos "); shell_put_uint32(i); shell_crlf();
+                return 1;
+            }
+            buf[i] = (uint8_t)v;
+        }
+        hal_err_t r = hal_i2c_mem_write(bus, (uint8_t)addr, (uint16_t)reg, buf, (size_t)nbytes);
+        if (r != HAL_OK) { shell_puts("I2C MEMWR ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
+                           shell_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); shell_crlf(); return 1; }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" MEMWR 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
+        shell_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
+        shell_puts("]\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "memrd") == 0) {
+        if (argc < 6) { shell_puts("Usage: i2c memrd <bus> <addr> <reg> <len>\r\n"); return 1; }
+        uint32_t bus, addr, reg, len;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &reg) != 0 || reg > 0xFFFF) { shell_puts("Invalid reg (0..0xFFFF)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &len) != 0 || len == 0 || len > 256) { shell_puts("Invalid len (1..256)\r\n"); return 1; }
+        uint8_t buf[256];
+        hal_err_t r = hal_i2c_mem_read(bus, (uint8_t)addr, (uint16_t)reg, buf, (size_t)len);
+        if (r != HAL_OK) { shell_puts("I2C MEMRD ERROR at addr=0x"); shell_print_hex8((uint8_t)addr);
+                           shell_puts(" reg=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg); shell_crlf(); return 1; }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" MEMRD 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts("@REG=0x"); shell_print_hex8((uint8_t)(reg >> 8)); shell_print_hex8((uint8_t)reg);
+        shell_puts(" -> ["); for (size_t i = 0; i < len; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
+        shell_puts("]\r\n");
+        return 0;
+    }
+
+    shell_puts("Unknown i2c subcommand: '"); shell_puts(sub); shell_puts("' (try 'i2c help')\r\n");
+    return 1;
+
+#else /* !PERIPH_SERVICE */
+    (void)argc; (void)argv;
+    shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, I2C HAL not linked.\r\n");
     return 1;
 #endif
 }
