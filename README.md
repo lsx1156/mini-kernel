@@ -20,17 +20,24 @@ project/                          ← 本仓库（单仓）
 
 ## v0.1 里程碑
 
-- Cortex-M0+ 时间片轮转调度（支持权重比例）
-- 固定内存池 + 零碎片堆（含临界区保护）
-- USB CDC 控制台（硬件 EP1 OUT 轮询旁路）
-- 交互式 Shell（含 syscalls 契约表查询命令）
-- 完整上下文切换（保存 r4-r11 callee-saved 寄存器）
-- Pico SDK 可集成：既可顶层固件，也能被独立工程 add_subdirectory 引用
-- **体积约束**：精简版 Flash ≤ 10KB / RAM ≤ 4KB（不含 Pico SDK）；完整基础版 ≤ 20KB/8KB
+* Cortex-M0+ 时间片轮转调度（支持权重比例）
+
+* 固定内存池 + 零碎片堆（含临界区保护）
+
+* USB CDC 控制台（硬件 EP1 OUT 轮询旁路）
+
+* 交互式 Shell（含 syscalls 契约表查询命令）
+
+* 完整上下文切换（保存 r4-r11 callee-saved 寄存器）
+
+* Pico SDK 可集成：既可顶层固件，也能被独立工程 add\_subdirectory 引用
+
+* **体积约束**：精简版 Flash ≤ 10KB / RAM ≤ 4KB（不含 Pico SDK）；完整基础版 ≤ 20KB/8KB
 
 ## 架构设计
 
 ### 分层架构
+
 ```
 ┌─────────────────────────────────────────┐
 │         应用层 (Application)             │
@@ -51,14 +58,19 @@ project/                          ← 本仓库（单仓）
 ```
 
 ### 关键特性
-- **时间片轮转调度**：固定时间片 + 权重比例，非抢占式
-- **零碎片内存**：固定池 + 隐式空闲链表堆
-- **临界区保护**：kmalloc/kfree 和任务队列操作均使用 cpsid/cpsie
-- **上下文切换**：PendSV 保存/恢复 r4-r11 寄存器
+
+* **时间片轮转调度**：固定时间片 + 权重比例，非抢占式
+
+* **零碎片内存**：固定池 + 隐式空闲链表堆
+
+* **临界区保护**：kmalloc/kfree 和任务队列操作均使用 cpsid/cpsie
+
+* **上下文切换**：PendSV 保存/恢复 r4-r11 寄存器
 
 ## 构建
 
 ### mini-kernel 内置 demo 固件
+
 ```bash
 cd mini-kernel
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
@@ -66,6 +78,7 @@ cmake --build build -j4
 ```
 
 ### rp2040demo 独立应用固件
+
 ```bash
 cd rp2040demo
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
@@ -77,6 +90,7 @@ cmake --build build -j4
 将生成的 `.uf2` 文件拖入 RP2040 的 `RPI-RP2` 盘符即可。
 
 烧录后用 PuTTY / TeraTerm 打开 USB 虚拟串口（115200-8-N-1），看到：
+
 ```
 ============================================================
 
@@ -90,11 +104,20 @@ cmake --build build -j4
 ## 版本历史
 
 ### v0.1.0 (当前)
-- ✅ 基础内核调度器（时间片轮转 + 权重）
-- ✅ 任务管理（创建/销毁/睡眠/唤醒）
-- ✅ 内存管理（固定池 + 堆，零碎片）
-- ✅ Shell 命令行（help/tasks/mem/syscalls）
-- ✅ USB CDC 控制台
-- ✅ 临界区保护（内存/任务队列操作）
-- ✅ 上下文切换（PendSV/SVC，完整寄存器保存）
-- ✅ 单仓结构（mini-kernel + rp2040demo）
+
+* ✅ 基础内核调度器（时间片轮转 + 权重）
+
+* ✅ 任务管理（创建/销毁/睡眠/唤醒）
+
+* ✅ 内存管理（固定池 + 堆，零碎片）
+
+* ✅ Shell 命令行（help/tasks/mem/syscalls）
+
+* ✅ USB CDC 控制台
+
+* ✅ 临界区保护（内存/任务队列操作）
+
+* ✅ 上下文切换（PendSV/SVC，完整寄存器保存）
+
+* ✅ 单仓结构（mini-kernel + rp2040demo）
+
