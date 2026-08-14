@@ -1,7 +1,6 @@
 @echo off
 REM ================================================================
 REM  RP2040 Demo Build / Flash Script
-REM  （Safe version: always pauses, writes full log）
 REM
 REM  Usage:
 REM    build.bat              Build incrementally
@@ -33,7 +32,10 @@ set "CMAKE_BIN=C:\Program Files\CMake\bin"
 set "NINJA_BIN=C:\Users\master\AppData\Local\Programs\Python\Python312\Scripts"
 set "PROJECT_ROOT=%~dp0"
 if "%PROJECT_ROOT:~-1%"=="\" set "PROJECT_ROOT=%PROJECT_ROOT:~0,-1%"
-set "BUILD_DIR=%PROJECT_ROOT%build"
+REM NOTE: "%PROJECT_ROOT%\build" has an explicit backslash so that the
+REM output lands inside the source tree as "rp2040demo\build", not a
+REM confusing sibling directory called "rp2040demobuild".
+set "BUILD_DIR=%PROJECT_ROOT%\build"
 set "UF2=%BUILD_DIR%\rp2040demo.uf2"
 set "TOOLCHAIN_FILE=%PROJECT_ROOT%\..\mini-kernel\toolchain-arm-none-eabi.cmake"
 set "LOG=%BUILD_DIR%\build.log"

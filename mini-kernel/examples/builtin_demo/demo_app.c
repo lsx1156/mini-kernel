@@ -398,10 +398,18 @@ void demo_app_init(void) {
  *             demo_app_init 返回之后 **永不** 无条件写 GPIO25。
  *     · 新增 boot status 命令：RAM 常驻回放结果，用户打开终端后随时查询
  *             每条固化命令的执行结果，不再依赖启动时刚好打开终端接串口。
- *               [UNTESTED] 标注：尚未在硬件端完整跑通
+ *     · ✅ 2026-08-15 用户硬件实测通过：BOOTSCRIPT banner 打印 → GPIO25=HIGH →
+ *             boot status 显示所有字段正确 → LED 重启后稳定常亮。
+ *
+ *   0.2.0-beta-hotfix2: boot status 命令行完整显示修复
+ *     · 根因：shell_exec_line(line) 内部 strtok 把空格改 '\0' 拆 argv，
+ *             调用后再把 line 传给 bootscript_rec_entry，导致 strlen()
+ *             只取到第一个 token（显示 "led" 而不是 "led on"）。
+ *     · 修复：在 shell_exec_line 之前 memcpy 一份 line_snap 快照，
+ *             bootscript_rec_entry 传入 line_snap（完整原始命令行）。
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "0.2.0-beta-hotfix1 [UNTESTED]"
+#define KERNEL_VERSION_STR  "0.2.0-beta-hotfix2"
 #endif
 
 const char *k_version(void) {

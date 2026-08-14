@@ -1139,8 +1139,15 @@ int bootscript_run_all(void) {
             continue;
         }
         shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": $ "); shell_puts(line); shell_crlf();
+        /* 【hotfix2: shell_exec_line 内部会用 strtok/strsep 把空格换成 '\0'，
+         *  所以在此之前先快照一份原始命令行，供 bootscript_rec_entry 记录使用。
+         *  否则 boot status 里会看到 "led"（第一个 token）而不是完整的 "led on"。*/
+        char line_snap[SHELL_LINE_SIZE];
+        size_t slen = strlen(line);
+        if (slen >= sizeof(line_snap)) slen = sizeof(line_snap) - 1u;
+        memcpy(line_snap, line, slen); line_snap[slen] = '\0';
         int rc = shell_exec_line(line);
-        bootscript_rec_entry(i, line, rc);          /* ← RAM 记录：每条命令结果 */
+        bootscript_rec_entry(i, line_snap, rc);          /* ← RAM 记录：每条命令结果（完整原始行） */
         if (rc != 0) {
             shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": exit code=");
             shell_put_err((int)rc); shell_crlf();
