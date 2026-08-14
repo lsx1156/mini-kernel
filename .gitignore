@@ -3,6 +3,7 @@ build/
 .pio/
 **/build/
 minik-build/
+rp2040demobuild/
 
 # IDE / Editor
 .vscode/

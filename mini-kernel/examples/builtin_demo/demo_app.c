@@ -356,11 +356,27 @@ void demo_app_init(void) {
     demo_puts("\r\n");
     demo_puts("========================================\r\n\r\n");
 
-    /* 创建各演示任务 —— 栈大小、权重不同，体现权重调度效果 */
+    /* 创建各演示任务 —— 栈大小、权重不同，体现权重调度效果
+     * 检查返回值，防止内存不足时继续执行导致崩溃 */
     g_demo_led_task       = task_create("led",       task_led,       NULL, 384, 1);
+    if (!g_demo_led_task) {
+        demo_puts("[BOOT  ] WARN: LED task creation FAILED (heap may be low)\r\n");
+    }
+    
     g_demo_heartbeat_task = task_create("heartbeat", task_heartbeat, NULL, 768, 2);  /* 权重高一点 */
-    task_create("mem",    task_mem_stress, NULL, 768, 1);
-    task_create("ctrl",   task_ctrl,       NULL, 384, 1);
+    if (!g_demo_heartbeat_task) {
+        demo_puts("[BOOT  ] WARN: Heartbeat task creation FAILED\r\n");
+    }
+    
+    tcb_t *mem_task = task_create("mem",    task_mem_stress, NULL, 768, 1);
+    if (!mem_task) {
+        demo_puts("[BOOT  ] WARN: Mem task creation FAILED\r\n");
+    }
+    
+    tcb_t *ctrl_task = task_create("ctrl",   task_ctrl,       NULL, 384, 1);
+    if (!ctrl_task) {
+        demo_puts("[BOOT  ] WARN: Ctrl task creation FAILED\r\n");
+    }
 
     demo_puts("[BOOT  ] 4 demo tasks created. Starting scheduler...\r\n");
     demo_dump_task_list();

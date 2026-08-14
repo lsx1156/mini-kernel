@@ -12,31 +12,89 @@ project/                          ← 本仓库（单仓）
 │   ├── port/rp2040/              Cortex-M0+ 移植（PendSV / SVC / HAL）
 │   ├── tests/                    单元测试 + 诊断固件
 │   ├── cmake/check_size.cmake    体积红线检查脚本
-│   ├── build.bat                 一键构建/烧录脚本
 │   └── CMakeLists.txt
 └── rp2040demo/                   ← 独立应用工程（引用 mini-kernel 作静态库）
     ├── src/main.c                应用入口（强 main() 覆盖内核的弱 main）
-    ├── build.bat                 一键构建/烧录脚本
     └── CMakeLists.txt
 ```
 
 ## v0.1 里程碑
 
 - Cortex-M0+ 时间片轮转调度（支持权重比例）
-- 固定内存池 + 零碎片堆
+- 固定内存池 + 零碎片堆（含临界区保护）
 - USB CDC 控制台（硬件 EP1 OUT 轮询旁路）
 - 交互式 Shell（含 syscalls 契约表查询命令）
+- 完整上下文切换（保存 r4-r11 callee-saved 寄存器）
 - Pico SDK 可集成：既可顶层固件，也能被独立工程 add_subdirectory 引用
 - **体积约束**：精简版 Flash ≤ 10KB / RAM ≤ 4KB（不含 Pico SDK）；完整基础版 ≤ 20KB/8KB
 
-## 构建
+## 架构设计
 
-```bat
-REM mini-kernel 内置 demo 固件
-cd mini-kernel && build.bat
-
-REM rp2040demo 独立应用固件
-cd rp2040demo && build.bat
+### 分层架构
+```
+┌─────────────────────────────────────────┐
+│         应用层 (Application)             │
+│   独立应用 / 内置演示任务                │
+├─────────────────────────────────────────┤
+│         系统调用层 (Syscall)             │
+│   SVC 异常 / X-Macro 契约表             │
+├─────────────────────────────────────────┤
+│         内核核心 (Kernel Core)           │
+│   调度器 / 任务 / 内存 / 中断管理        │
+├─────────────────────────────────────────┤
+│         硬件抽象层 (HAL)                │
+│   统一接口 / 平台相关实现               │
+├─────────────────────────────────────────┤
+│         硬件 (Hardware)                 │
+│   Cortex-M0+ / RP2040                   │
+└─────────────────────────────────────────┘
 ```
 
-烧录后用 PuTTY / TeraTerm 打开 USB 虚拟串口（115200-8-N-1，无需实际波特率参数，USB CDC），输入 `help` / `syscalls` 查看。
+### 关键特性
+- **时间片轮转调度**：固定时间片 + 权重比例，非抢占式
+- **零碎片内存**：固定池 + 隐式空闲链表堆
+- **临界区保护**：kmalloc/kfree 和任务队列操作均使用 cpsid/cpsie
+- **上下文切换**：PendSV 保存/恢复 r4-r11 寄存器
+
+## 构建
+
+### mini-kernel 内置 demo 固件
+```bash
+cd mini-kernel
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
+cmake --build build -j4
+```
+
+### rp2040demo 独立应用固件
+```bash
+cd rp2040demo
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=/path/to/pico-sdk -G Ninja
+cmake --build build -j4
+```
+
+## 烧录
+
+将生成的 `.uf2` 文件拖入 RP2040 的 `RPI-RP2` 盘符即可。
+
+烧录后用 PuTTY / TeraTerm 打开 USB 虚拟串口（115200-8-N-1），看到：
+```
+============================================================
+
+ === Mini Kernel Boot ===
+
+============================================================
+```
+
+输入 `help` / `tasks` / `syscalls` 查看可用命令。
+
+## 版本历史
+
+### v0.1.0 (当前)
+- ✅ 基础内核调度器（时间片轮转 + 权重）
+- ✅ 任务管理（创建/销毁/睡眠/唤醒）
+- ✅ 内存管理（固定池 + 堆，零碎片）
+- ✅ Shell 命令行（help/tasks/mem/syscalls）
+- ✅ USB CDC 控制台
+- ✅ 临界区保护（内存/任务队列操作）
+- ✅ 上下文切换（PendSV/SVC，完整寄存器保存）
+- ✅ 单仓结构（mini-kernel + rp2040demo）

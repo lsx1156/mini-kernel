@@ -116,7 +116,7 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
     hal_context_init(&ctx, task->stack_base, entry, arg);
     task->sp = (uint32_t *)ctx.sp;
 
-    /* 加入任务池与就绪队列 */
+    /* 加入任务池与就绪队列（队列操作内部有临界区保护） */
     g_task_pool[slot] = task;
     sched_ready_enqueue(task);
 
@@ -133,6 +133,9 @@ void task_destroy(tcb_t *task) {
      * 调用者应先 task_suspend(task) 再等下一次调度后销毁，或仅销毁非自身任务。 */
     if (task == g_current_task) return;
 
+    /* 关中断保护队列操作和状态修改 */
+    __asm volatile ("cpsid i" ::: "memory");
+    
     /* 从所在队列移除（就绪队列或睡眠队列）。
      *
      *   【关键修复 · use-after-free 根因】
@@ -141,10 +144,10 @@ void task_destroy(tcb_t *task) {
      *   归零时把悬空 TCB 重新入就绪队列 → 链表损坏 / 随机崩溃。 */
     switch (task->state) {
         case TASK_STATE_READY:
-            sched_ready_remove(task);
+            _sched_ready_remove(task);
             break;
         case TASK_STATE_SLEEP:
-            sched_sleep_remove(task);
+            _sched_sleep_remove(task);
             break;
         case TASK_STATE_RUNNING:
             /* RUNNING 任务不在任何队列（sched_ready_pick_next 已移除），
@@ -154,8 +157,10 @@ void task_destroy(tcb_t *task) {
             break;
     }
     task->state = TASK_STATE_DEAD;
+    
+    __asm volatile ("cpsie i" ::: "memory");
 
-    /* 释放栈与 TCB */
+    /* 释放栈与 TCB（kfree 内部有关中断保护） */
     if (task->stack_base) {
         uint8_t *stack_base = (uint8_t *)task->stack_base - task->stack_size;
         kfree(stack_base);
@@ -182,12 +187,13 @@ void task_sleep(uint32_t ticks) {
 
     /* 关中断保护队列操作：防止 TIMER_IRQ_0 在 ready_remove 与 sleep_enqueue
      * 之间触发 PendSV → sched_do_switch 此时任务不在任何队列 → 任务永久丢失。
-     * 顺序：关中断 → 改状态+移队列 → 设 PendSV → 开中断（PendSV 立即生效）。 */
+     * 顺序：关中断 → 改状态+移队列 → 设 PendSV → 开中断（PendSV 立即生效）。
+     * 使用内部版本避免重复关中断。 */
     __asm volatile ("cpsid i" ::: "memory");
     task->state = TASK_STATE_SLEEP;
     task->ticks_to_sleep = ticks;
-    sched_ready_remove(task);
-    sched_sleep_enqueue(task);
+    _sched_ready_remove(task);
+    _sched_sleep_enqueue(task);
     hal_yield_trigger();        /* 设 PendSV pending（此时中断关着，不会立即触发） */
     __asm volatile ("cpsie i" ::: "memory");  /* 开中断 → PendSV 立即进入 */
 }
@@ -195,10 +201,13 @@ void task_sleep(uint32_t ticks) {
 void task_wakeup(tcb_t *task) {
     if (!task || task->state != TASK_STATE_SLEEP) return;
 
-    sched_sleep_remove(task);
+    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _sched_sleep_remove(task);
     task->state = TASK_STATE_READY;
     task->ticks_to_sleep = 0;
-    sched_ready_enqueue(task);
+    _sched_ready_enqueue(task);
+    __asm volatile ("cpsie i" ::: "memory");
 }
 
 /* ================================================================
@@ -211,21 +220,29 @@ void task_yield(void) {
 void task_suspend(tcb_t *task) {
     if (!task || task == &g_idle_task) return;
     int self_suspend = 0;
+    
+    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    __asm volatile ("cpsid i" ::: "memory");
+    
     switch (task->state) {
         case TASK_STATE_READY:
-            sched_ready_remove(task);
+            _sched_ready_remove(task);
             break;
         case TASK_STATE_SLEEP:
-            sched_sleep_remove(task);
+            _sched_sleep_remove(task);
             break;
         case TASK_STATE_RUNNING:
             /* 当前任务自我挂起：标记后需触发切换，否则会继续跑 */
             self_suspend = 1;
             break;
         default:
+            __asm volatile ("cpsie i" ::: "memory");
             return;  /* DEAD / SUSPEND 等不处理 */
     }
     task->state = TASK_STATE_SUSPEND;
+    
+    __asm volatile ("cpsie i" ::: "memory");
+    
     /* 自我挂起时主动触发 PendSV，让调度器切到下一个任务。
      * sched_do_switch 看到 from->state != RUNNING 不会把当前任务入就绪队列。 */
     if (self_suspend) {
@@ -235,9 +252,13 @@ void task_suspend(tcb_t *task) {
 
 void task_resume(tcb_t *task) {
     if (!task || task->state != TASK_STATE_SUSPEND) return;
+    
+    /* 关中断保护队列操作，使用内部版本避免重复关中断 */
+    __asm volatile ("cpsid i" ::: "memory");
     /* 恢复到 READY 状态（原 SLEEP 任务直接就绪，忽略剩余睡眠） */
     task->state = TASK_STATE_READY;
-    sched_ready_enqueue(task);
+    _sched_ready_enqueue(task);
+    __asm volatile ("cpsie i" ::: "memory");
 }
 
 /* ================================================================

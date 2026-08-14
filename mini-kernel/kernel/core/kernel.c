@@ -160,8 +160,8 @@ void kernel_main(void) {
     /* —— 冷初始化 Step 3: 调度器（空队列安全） —— */
     sched_init();
 
-    /* —— 冷初始化 Step 4: 创建 boot_setup 启动任务 —— */
-    task_create("boot_setup", _boot_setup_task, NULL, 768, 3);
+    /* —— 冷初始化 Step 4: 创建 boot_setup 启动任务（栈增大到 1024 以容纳 demo_app_init） —— */
+    task_create("boot_setup", _boot_setup_task, NULL, 1024, 3);
 
     /* —— 【关键修复】把控制台初始化移到这里（MSP 上下文，全局中断开启后）
      *

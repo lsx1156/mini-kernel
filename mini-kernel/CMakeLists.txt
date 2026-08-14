@@ -132,8 +132,13 @@ foreach(_m ${_matches})
     string(REGEX REPLACE "#define[ \t]+(OS_CFG_[A-Z0-9_]+)[ \t]+([0-9]+).*" "\\2" _val  ${_m})
     list(APPEND OS_CFG_DEFINES "${_name}=${_val}")
     # 同步设置为 CMake 变量，让后面的 if(OS_CFG_SHELL) / add_module_if_enabled 能真·判断开关
-    set(${_name} ${_val})
+    # 同时设置当前作用域（供 mini-kernel 内部使用）和父作用域（供 rp2040demo 使用）
+    set(${_name} ${_val})           # 当前作用域（mini-kernel 内部使用）
+    set(${_name} ${_val} PARENT_SCOPE)  # 父作用域（rp2040demo 使用）
 endforeach()
+
+# 把 OS_CFG_DEFINES 列表也传递到父工程，使 rp2040demo 等独立应用能把它们加到自己的 target_compile_definitions
+set(OS_CFG_DEFINES "${OS_CFG_DEFINES}" PARENT_SCOPE)
 
 add_compile_definitions(${OS_CFG_DEFINES})
 
@@ -225,18 +230,25 @@ target_compile_options(hal_port PRIVATE ${COMMON_FLAGS})
 # 6. 扩展模块库（按配置裁剪）
 # ================================================================
 function(add_module_if_enabled name src_dir define_flag)
+    message(STATUS "add_module_if_enabled: name=${name}, src_dir=${src_dir}, define_flag=${define_flag}")
+    message(STATUS "add_module_if_enabled: ${define_flag}=${${define_flag}}")
+    
     if(${define_flag})
         file(GLOB _srcs ${src_dir}/*.c)
+        message(STATUS "add_module_if_enabled: ${name} - found ${_srcs} source files")
         if(_srcs)
             add_library(${name} STATIC ${_srcs})
             target_include_directories(${name} PUBLIC ${INCLUDE_DIRS})
             target_compile_options(${name} PRIVATE ${COMMON_FLAGS})
-            set(${name}_ENABLED TRUE PARENT_SCOPE)
+            set(${name}_ENABLED TRUE CACHE INTERNAL "${name} module enabled")
+            message(STATUS "add_module_if_enabled: ${name} - created library, ${name}_ENABLED=TRUE")
         else()
-            set(${name}_ENABLED FALSE PARENT_SCOPE)
+            set(${name}_ENABLED FALSE CACHE INTERNAL "${name} module disabled")
+            message(STATUS "add_module_if_enabled: ${name} - no source files found, ${name}_ENABLED=FALSE")
         endif()
     else()
-        set(${name}_ENABLED FALSE PARENT_SCOPE)
+        set(${name}_ENABLED FALSE CACHE INTERNAL "${name} module disabled")
+        message(STATUS "add_module_if_enabled: ${name} - ${define_flag} is OFF, ${name}_ENABLED=FALSE")
     endif()
 endfunction()
 

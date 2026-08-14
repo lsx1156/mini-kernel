@@ -76,7 +76,8 @@ void kmem_init(void *heap_start, size_t heap_size) {
     g_free_list = g_heap_start;
 }
 
-void *kmalloc(size_t size) {
+/* 内部版本：在调用方已持有临界区时使用（如中断上下文） */
+static void *_kmalloc_internal(size_t size) {
     if (size == 0) return NULL;
     size = (size + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
     size += BLOCK_HEAD_SIZE;
@@ -108,7 +109,19 @@ void *kmalloc(size_t size) {
     return NULL;  /* 内存不足 */
 }
 
-void kfree(void *ptr) {
+void *kmalloc(size_t size) {
+    if (size == 0) return NULL;
+    
+    /* 关中断保护：防止抢占式调度破坏链表操作
+     * （PendSV 可能在遍历/修改链表时触发，导致链表损坏） */
+    __asm volatile ("cpsid i" ::: "memory");
+    void *ptr = _kmalloc_internal(size);
+    __asm volatile ("cpsie i" ::: "memory");
+    return ptr;
+}
+
+/* 内部版本：在调用方已持有临界区时使用（如中断上下文） */
+static void _kfree_internal(void *ptr) {
     if (!ptr) return;
     heap_block_t *block = (heap_block_t *)((uint8_t *)ptr - BLOCK_HEAD_SIZE);
     if (!IS_ALLOC(block)) return;  /* 重复释放 */
@@ -141,6 +154,15 @@ void kfree(void *ptr) {
     /* 插入空闲链表头 */
     block->next = g_free_list;
     g_free_list = block;
+}
+
+void kfree(void *ptr) {
+    if (!ptr) return;
+    
+    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _kfree_internal(ptr);
+    __asm volatile ("cpsie i" ::: "memory");
 }
 
 size_t kmem_free_size(void) {

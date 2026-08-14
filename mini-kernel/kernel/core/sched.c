@@ -15,8 +15,8 @@ static tcb_t g_sleep_head = { .next = &g_sleep_head, .prev = &g_sleep_head };
 /* ================================================================
  * 就绪队列操作
  * ================================================================ */
-void sched_ready_enqueue(tcb_t *task) {
-    if (!task) return;
+/* 内部版本：在调用方已持有临界区时使用（如 task.c、中断上下文） */
+void _sched_ready_enqueue(tcb_t *task) {
     /* 尾插 */
     task->next = &g_ready_head;
     task->prev = g_ready_head.prev;
@@ -24,11 +24,26 @@ void sched_ready_enqueue(tcb_t *task) {
     g_ready_head.prev = task;
 }
 
-void sched_ready_remove(tcb_t *task) {
-    if (!task || task->next == NULL) return;
+void _sched_ready_remove(tcb_t *task) {
     task->prev->next = task->next;
     task->next->prev = task->prev;
     task->next = task->prev = NULL;
+}
+
+void sched_ready_enqueue(tcb_t *task) {
+    if (!task) return;
+    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _sched_ready_enqueue(task);
+    __asm volatile ("cpsie i" ::: "memory");
+}
+
+void sched_ready_remove(tcb_t *task) {
+    if (!task || task->next == NULL) return;
+    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _sched_ready_remove(task);
+    __asm volatile ("cpsie i" ::: "memory");
 }
 
 tcb_t *sched_ready_pick_next(void) {
@@ -47,17 +62,19 @@ tcb_t *sched_ready_pick_next(void) {
      *    → ps 输出 ID=12533 / name="=." 等乱码。
      *
      *    正确契约：RUNNING 任务不在就绪队列；切出时由 sched_do_switch
-     *    重新入队（仅当仍为 READY）。idle 永不入队，是空队列兜底。 */
+     *    重新入队（仅当仍为 READY）。idle 永不入队，是空队列兜底。
+     *
+     *    注意：此函数可能在中断上下文中被调用，使用内部版本 */
     tcb_t *next = g_ready_head.next;
-    sched_ready_remove(next);
+    _sched_ready_remove(next);  /* 可能在中断上下文，使用内部版本 */
     return next;
 }
 
 /* ================================================================
  * 睡眠队列操作
  * ================================================================ */
-void sched_sleep_enqueue(tcb_t *task) {
-    if (!task) return;
+/* 内部版本：在调用方已持有临界区或处于中断上下文时使用 */
+void _sched_sleep_enqueue(tcb_t *task) {
     /* 按剩余 tick 排序（小在前），O(n) 够用，任务数 ≤ 16 */
     tcb_t *pos = g_sleep_head.next;
     while (pos != &g_sleep_head && pos->ticks_to_sleep <= task->ticks_to_sleep) {
@@ -69,14 +86,32 @@ void sched_sleep_enqueue(tcb_t *task) {
     pos->prev = task;
 }
 
-void sched_sleep_remove(tcb_t *task) {
-    if (!task || task->next == NULL) return;
+void _sched_sleep_remove(tcb_t *task) {
     task->prev->next = task->next;
     task->next->prev = task->prev;
     task->next = task->prev = NULL;
 }
 
+void sched_sleep_enqueue(tcb_t *task) {
+    if (!task) return;
+    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _sched_sleep_enqueue(task);
+    __asm volatile ("cpsie i" ::: "memory");
+}
+
+void sched_sleep_remove(tcb_t *task) {
+    if (!task || task->next == NULL) return;
+    /* 关中断保护：防止抢占式调度破坏链表操作 */
+    __asm volatile ("cpsid i" ::: "memory");
+    _sched_sleep_remove(task);
+    __asm volatile ("cpsie i" ::: "memory");
+}
+
 void sched_sleep_tick(void) {
+    /* 注意：此函数在 SysTick 中断上下文中被调用
+     * 不需要额外关中断（硬件已自动禁止中断嵌套）
+     * 使用内部版本直接操作链表 */
     tcb_t *curr = g_sleep_head.next;
     while (curr != &g_sleep_head) {
         if (curr->ticks_to_sleep > 0) {
@@ -84,9 +119,9 @@ void sched_sleep_tick(void) {
         }
         if (curr->ticks_to_sleep == 0) {
             tcb_t *next = curr->next;
-            sched_sleep_remove(curr);
+            _sched_sleep_remove(curr);
             curr->state = TASK_STATE_READY;
-            sched_ready_enqueue(curr);
+            _sched_ready_enqueue(curr);
             curr = next;
         } else {
             curr = curr->next;
@@ -142,6 +177,9 @@ void sched_start(void) {
  *   · 汇编层再 pop r4-r11 + bx lr（硬件自动弹 r0-r3/r12/lr/pc/xpsr）
  * ================================================================ */
 uint32_t *sched_do_switch(uint32_t *old_sp) {
+    /* 注意：此函数在 PendSV 中断上下文中被调用
+     * 不需要额外关中断（硬件已自动禁止中断嵌套）
+     * 使用内部版本直接操作链表 */
     tcb_t *from = g_current_task;
 
     /* 1. 保存 from 的 SP（push r4-r11 后已经更新过的 PSP）
@@ -161,7 +199,7 @@ uint32_t *sched_do_switch(uint32_t *old_sp) {
         if (from->state == TASK_STATE_RUNNING) {
             from->state = TASK_STATE_READY;
             if (from != &g_idle_task) {
-                sched_ready_enqueue(from);
+                _sched_ready_enqueue(from);  /* 中断上下文使用内部版本 */
             }
         }
     }
