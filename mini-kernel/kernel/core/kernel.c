@@ -35,7 +35,11 @@ extern uint8_t __end__;
  * 若用户裁剪更多模块/任务，可在 os_config.h 中调小此值节省 RAM。 */
 #define KERNEL_HEAP_SIZE  OS_CFG_HEAP_SIZE_BYTES
 
-extern void demo_app_init(void);
+/* demo_app_init() 由 examples/builtin_demo/demo_app.c 提供，
+ * 独立应用（如 rp2040demo）不链接 demo_app.c。
+ * 使用 weak 声明：若链接器找不到符号，调用时跳到 0/直接跳过。
+ * 运行时判断 &demo_app_init != NULL 即可安全地决定是否调用。 */
+extern __attribute__((weak)) void demo_app_init(void);
 void kernel_main(void);
 void SysTick_Handler(void);
 void kernel_tick_hook(void);
@@ -104,7 +108,9 @@ static void _boot_setup_task(void *arg) {
     }
 
     /* — Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） — */
-    demo_app_init();
+    if (&demo_app_init != NULL) {
+        demo_app_init();
+    }
 
     /* — Step 4: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
     task_suspend(g_current_task);
@@ -113,8 +119,15 @@ static void _boot_setup_task(void *arg) {
 
 /* ================================================================
  * main：冷启动（关中断、最小硬件初始化）→ kernel_main → 永远不返回
+ *
+ *  【关键：弱 main() 符号】
+ *    mini-kernel 作为库被独立应用（rp2040demo）add_subdirectory 时，
+ *    应用自己的 src/main.c 会提供 main()。用 weak 标记：
+ *      · 若无人定义 main → 用内核自带 main（mini-kernel 顶层固件）
+ *      · 若 rp2040demo 提供 main → 用应用的强定义（rp2040demo 的应用层）
+ *    两种方式最终都应调用 kernel_main()。
  * ================================================================ */
-int main(void) {
+__attribute__((weak)) int main(void) {
     /* 【核心修复】冷启动阶段**始终关中断**。诊断固件已证实：
      *   开中断做 USB 枚举 → SDK alarm pool / TinyUSB state machine
      *   的 IRQ 回调会在 kmem_init / task_module_init 数据结构未

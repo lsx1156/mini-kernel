@@ -5,6 +5,10 @@
 # ================================================================
 cmake_minimum_required(VERSION 3.13)
 
+# mini-kernel 根目录锚点（使用 CURRENT_SOURCE_DIR 而非 CMAKE_SOURCE_DIR，
+# 便于其他工程 add_subdirectory(mini-kernel) 引用时路径仍正确）
+set(MINIK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "mini-kernel root")
+
 # ================================================================
 # 0. Pico SDK 交叉工具链引入（必须在 project() 之前执行！）
 #    pico_sdk_import.cmake 会提前把 CMAKE_TOOLCHAIN_FILE、
@@ -13,10 +17,19 @@ cmake_minimum_required(VERSION 3.13)
 #    若放在 project() 之后，则清过 CMakeCache 后交叉编译器找不到。
 # ================================================================
 set(PICO_SDK_PATH "$ENV{PICO_SDK_PATH}" CACHE PATH "Path to Pico SDK")
-if(NOT PICO_SDK_PATH)
-    message(FATAL_ERROR "PICO_SDK_PATH not set. Please export PICO_SDK_PATH or pass -DPICO_SDK_PATH=...")
+
+# 父工程（如 rp2040demo）已经做过 pico_sdk_import / pico_sdk_init 时，
+# 不再重复初始化 Pico SDK，避免 OBJECT 库源码被编译两遍 → 链接时符号重复。
+if(NOT TARGET pico_stdlib)
+    if(NOT PICO_SDK_PATH)
+        message(FATAL_ERROR "PICO_SDK_PATH not set. Please export PICO_SDK_PATH or pass -DPICO_SDK_PATH=...")
+    endif()
+    if(NOT EXISTS "${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
+        message(FATAL_ERROR "PICO_SDK_PATH invalid (missing pico_sdk_import.cmake): ${PICO_SDK_PATH}")
+    endif()
+    include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 endif()
-include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+set(_MINIK_PARENT_INITS_PICO_SDK_ TARGET pico_stdlib)
 
 # 语言标准（放在 project 前也可；新 CMake 两者都接受）
 set(CMAKE_C_STANDARD 11)
@@ -30,8 +43,11 @@ project(mini_kernel
     DESCRIPTION "Lightweight time-sliced kernel for resource-constrained 32-bit MCUs"
 )
 
-# Pico SDK 初始化（必须在 project() 之后执行）
-pico_sdk_init()
+# Pico SDK 初始化（只在 mini-kernel 作为顶层工程时自己执行；
+#  rp2040demo 作为父工程已在其自己的 project() 之后执行过，跳过）
+if(NOT TARGET pico_stdlib)
+    pico_sdk_init()
+endif()
 
 # ================================================================
 # 1. 编译选项与工具链路径推导（裸机 Cortex-M0+）
@@ -101,7 +117,9 @@ string(REPLACE ";" " " CMAKE_EXE_LINKER_FLAGS "${LINK_FLAGS_LIST}")
 # 2. 裁剪配置：从 os_config.h 读取宏并传递给编译器
 # ================================================================
 # 由用户提供的配置头文件路径
-set(OS_CONFIG_HEADER "${CMAKE_SOURCE_DIR}/include/os_config.h" CACHE FILEPATH "Path to os_config.h")
+# NOTE: 使用 MINIK_ROOT 而非 CMAKE_SOURCE_DIR，
+#       以便 mini-kernel 被其他工程 add_subdirectory 引用时仍能定位自身的 include/os_config.h。
+set(OS_CONFIG_HEADER "${MINIK_ROOT}/include/os_config.h" CACHE FILEPATH "Path to os_config.h")
 if(NOT EXISTS ${OS_CONFIG_HEADER})
     message(FATAL_ERROR "os_config.h not found at ${OS_CONFIG_HEADER}")
 endif()
@@ -141,29 +159,41 @@ message(STATUS "OS Config Defines: ${OS_CFG_DEFINES}")
 # 3. 目录结构
 # ================================================================
 set(INCLUDE_DIRS
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/include/hal
-    ${CMAKE_SOURCE_DIR}/kernel/core
-    ${CMAKE_SOURCE_DIR}/kernel/syscall
-    ${CMAKE_SOURCE_DIR}/kernel/modules/periph
-    ${CMAKE_SOURCE_DIR}/kernel/modules/shell
-    ${CMAKE_SOURCE_DIR}/kernel/modules/vfs
-    ${CMAKE_SOURCE_DIR}/kernel/modules/loader
-    ${CMAKE_SOURCE_DIR}/port/rp2040
+    ${MINIK_ROOT}/include
+    ${MINIK_ROOT}/include/hal
+    ${MINIK_ROOT}/kernel/core
+    ${MINIK_ROOT}/kernel/syscall
+    ${MINIK_ROOT}/kernel/modules/periph
+    ${MINIK_ROOT}/kernel/modules/shell
+    ${MINIK_ROOT}/kernel/modules/vfs
+    ${MINIK_ROOT}/kernel/modules/loader
+    ${MINIK_ROOT}/port/rp2040
 )
 
 # ================================================================
 # 4. 内核核心库
 # ================================================================
 file(GLOB KERNEL_CORE_SRCS
-    ${CMAKE_SOURCE_DIR}/kernel/core/*.c
-    ${CMAKE_SOURCE_DIR}/kernel/core/*.S
-    ${CMAKE_SOURCE_DIR}/kernel/syscall/*.c
+    ${MINIK_ROOT}/kernel/core/*.c
+    ${MINIK_ROOT}/kernel/core/*.S
+    ${MINIK_ROOT}/kernel/syscall/*.c
 )
 
 add_library(kernel_core STATIC ${KERNEL_CORE_SRCS})
 target_include_directories(kernel_core PUBLIC ${INCLUDE_DIRS})
-target_link_libraries(kernel_core PUBLIC pico_stdlib)
+# 只取 Pico SDK + hardware_* 的头文件路径（generator 表达式），
+# 不把 OBJECT 库的对象归档进 .a，避免最终链接时 multiple definition。
+# SDK target 统一在可执行（mini_kernel/rp2040demo）上 PRIVATE link 一次。
+target_include_directories(kernel_core PRIVATE
+    $<TARGET_PROPERTY:pico_stdlib,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_uart,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_timer,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_gpio,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_spi,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_i2c,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_irq,INTERFACE_INCLUDE_DIRECTORIES>
+)
+# INTERFACE 下游（如可执行）仍能拿到 Pico SDK：由最终 CMakeLists 直接 link
 target_compile_options(kernel_core PRIVATE ${COMMON_FLAGS})
 
 # ================================================================
@@ -172,22 +202,22 @@ target_compile_options(kernel_core PRIVATE ${COMMON_FLAGS})
 # 注意：startup_rp2040.S 提供的 .weak 向量表/Reset_Handler 与 SDK crt0.S
 #       的启动流程冲突，必须 **EXCLUDE**。仅保留 context_switch.S。
 file(GLOB HAL_SRCS
-    ${CMAKE_SOURCE_DIR}/port/rp2040/*.c
-    ${CMAKE_SOURCE_DIR}/port/rp2040/context_switch.S
+    ${MINIK_ROOT}/port/rp2040/*.c
+    ${MINIK_ROOT}/port/rp2040/context_switch.S
 )
 # 也可显式列出而非 GLOB，避免新增文件时误链接：
 # list(FILTER HAL_SRCS EXCLUDE REGEX "startup_rp2040\\.S$")
 
 add_library(hal_port STATIC ${HAL_SRCS})
 target_include_directories(hal_port PUBLIC ${INCLUDE_DIRS})
-target_link_libraries(hal_port PUBLIC
-    pico_stdlib
-    hardware_uart
-    hardware_timer
-    hardware_gpio
-    hardware_spi
-    hardware_i2c
-    hardware_irq
+target_include_directories(hal_port PRIVATE
+    $<TARGET_PROPERTY:pico_stdlib,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_uart,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_timer,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_gpio,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_spi,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_i2c,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:hardware_irq,INTERFACE_INCLUDE_DIRECTORIES>
 )
 target_compile_options(hal_port PRIVATE ${COMMON_FLAGS})
 
@@ -210,11 +240,11 @@ function(add_module_if_enabled name src_dir define_flag)
     endif()
 endfunction()
 
-add_module_if_enabled(periph_module ${CMAKE_SOURCE_DIR}/kernel/modules/periph OS_CFG_PERIPH_SERVICE)
-add_module_if_enabled(shell_module ${CMAKE_SOURCE_DIR}/kernel/modules/shell OS_CFG_SHELL)
-add_module_if_enabled(vfs_module ${CMAKE_SOURCE_DIR}/kernel/modules/vfs OS_CFG_VFS)
-add_module_if_enabled(fatfs_module ${CMAKE_SOURCE_DIR}/kernel/modules/vfs/fatfs OS_CFG_FATFS)
-add_module_if_enabled(loader_module ${CMAKE_SOURCE_DIR}/kernel/modules/loader OS_CFG_LOADER)
+add_module_if_enabled(periph_module ${MINIK_ROOT}/kernel/modules/periph OS_CFG_PERIPH_SERVICE)
+add_module_if_enabled(shell_module ${MINIK_ROOT}/kernel/modules/shell OS_CFG_SHELL)
+add_module_if_enabled(vfs_module ${MINIK_ROOT}/kernel/modules/vfs OS_CFG_VFS)
+add_module_if_enabled(fatfs_module ${MINIK_ROOT}/kernel/modules/vfs/fatfs OS_CFG_FATFS)
+add_module_if_enabled(loader_module ${MINIK_ROOT}/kernel/modules/loader OS_CFG_LOADER)
 
 # ================================================================
 # 7. 最终固件目标
@@ -223,9 +253,26 @@ add_module_if_enabled(loader_module ${CMAKE_SOURCE_DIR}/kernel/modules/loader OS
 # 若保留并参与链接，它提供的 .weak PendSV_Handler 等与 context_switch.S
 # 导出的 isr_pendsv 别名可能产生未定义行为。完全不编译。
 add_executable(${PROJECT_NAME})
+if(OS_CFG_DEMO_APP)
+    target_sources(${PROJECT_NAME} PRIVATE ${MINIK_ROOT}/examples/builtin_demo/demo_app.c)
+else()
+    # OS_CFG_DEMO_APP=0：不构建 demo_app.c，提供空桩让 kernel.c 链接通过。
+    # 由目标工程（如 rp2040demo）在自己的 main.c 里自行注册应用任务。
+    target_compile_definitions(kernel_core PUBLIC OS_CFG_DEMO_APP_STUB=1)
+endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
     kernel_core
     hal_port
+    # 所有 Pico SDK target 在最终可执行处 link 一次，
+    # 避免 kernel_core / hal_port 静态库各自嵌入 SDK OBJECT 副本
+    # 导致 multiple definition。
+    pico_stdlib
+    hardware_uart
+    hardware_timer
+    hardware_gpio
+    hardware_spi
+    hardware_i2c
+    hardware_irq
 )
 # 按模块裁剪开关按需链接（模块未启用时 target 不存在，不能直接写进上面的列表）
 # 依赖顺序：模块 → kernel_core → hal_port（模块引用内核核心的符号）
@@ -262,10 +309,10 @@ pico_add_extra_outputs(${PROJECT_NAME})
 # 8. 体积红线检查（构建后自动解析 .map 文件）
 # ================================================================
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -DCMAKE_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_SOURCE_DIR=${MINIK_ROOT}
         -DPROJECT_NAME=${PROJECT_NAME}
         -DMAX_FLASH_KB=10 -DMAX_RAM_KB=4
-        -P ${CMAKE_SOURCE_DIR}/cmake/check_size.cmake
+        -P ${MINIK_ROOT}/cmake/check_size.cmake
     COMMENT "Checking firmware size against volume limits..."
     VERBATIM
 )
@@ -276,9 +323,9 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 #    → 若本程序烧录后也不亮：硬件/板型/刷写操作问题
 #    → 若本程序正常闪：硬件通路 OK，问题在内核代码
 # ================================================================
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/minimal_led_test.c)
+if(EXISTS ${MINIK_ROOT}/tests/minimal_led_test.c)
     add_executable(minimal_led_test)
-    target_sources(minimal_led_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/minimal_led_test.c)
+    target_sources(minimal_led_test PRIVATE ${MINIK_ROOT}/tests/minimal_led_test.c)
     target_link_libraries(minimal_led_test PRIVATE pico_stdlib)
     set_target_properties(minimal_led_test PROPERTIES
         C_STANDARD 11
@@ -293,9 +340,9 @@ endif()
 
 # 诊断固件：最小 USB CDC 打印测试（零内核依赖）
 #    用途：验证 USB 枚举 + 发送通路本身是否可行
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/usb_print_test.c)
+if(EXISTS ${MINIK_ROOT}/tests/usb_print_test.c)
     add_executable(usb_print_test)
-    target_sources(usb_print_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/usb_print_test.c)
+    target_sources(usb_print_test PRIVATE ${MINIK_ROOT}/tests/usb_print_test.c)
     target_link_libraries(usb_print_test PRIVATE pico_stdlib)
     set_target_properties(usb_print_test PROPERTIES
         C_STANDARD 11
@@ -314,7 +361,7 @@ endif()
 enable_testing()
 
 # Unity 测试框架
-add_subdirectory(${CMAKE_SOURCE_DIR}/tests/unit)
+add_subdirectory(${MINIK_ROOT}/tests/unit)
 
 # ================================================================
 # 11. 安装与打包

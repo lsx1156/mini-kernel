@@ -1,8 +1,6 @@
 # Build artifacts
 build/
 .pio/
-**/build/
-minik-build/
 
 # IDE / Editor
 .vscode/
@@ -25,7 +23,6 @@ bat_run*.log
 *.hex
 *.dis
 *.elf.map
-*.elf
 
 # Backup files
 *.bak
