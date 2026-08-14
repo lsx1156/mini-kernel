@@ -48,7 +48,10 @@ extern const char *k_version(void);
  * Shell 基本常量
  * ================================================================ */
 #define SHELL_LINE_SIZE       128   /* 单条命令最大长度 */
-#define SHELL_MAX_ARGS        10    /* 最大参数个数（含命令本身，gpio init af 等需要 5+） */
+#define SHELL_MAX_ARGS        16    /* 最大参数个数（含命令本身）。
+                                     *   之前 10 会静默截断复合子命令（如 i2c cmds
+                                     *   0 0x3C + 8 字节 = 12 token）导致末尾参数丢失
+                                     *   且无任何报错。16 足够 I2C/SPI/UART 长命令。 */
 #define SHELL_PROMPT_STR      "mk> "
 #define SHELL_TASK_NAME       "shell"
 #define SHELL_TASK_STACK      768   /* 行解析 + 打印任务列表足够 */
@@ -577,6 +580,8 @@ static void i2c_help(void) {
     shell_puts("  i2c scan <bus>                      Scan 7-bit addresses 0x08..0x77\r\n");
     shell_puts("  i2c wr   <bus> <addr> <b1> [..bn]   Raw write 1..N bytes\r\n");
     shell_puts("  i2c rd   <bus> <addr> <len>         Raw read len bytes\r\n");
+    shell_puts("  i2c cmds <bus> <addr> <c1> [..cn]   SSD1306-style: 0x00 (Co=0,D/C=0) + N command bytes\r\n");
+    shell_puts("  i2c fill <bus> <addr> <byte> <cnt>  SSD1306-style: 0x40 (Co=0,D/C=1) + cnt×byte (GDRAM fill)\r\n");
     shell_puts("  i2c memwr <bus> <addr> <reg> <b1> [..]   Write device register (mem 16-bit)\r\n");
     shell_puts("  i2c memrd <bus> <addr> <reg> <len>       Read device register (mem 16-bit)\r\n");
     shell_puts("Examples:\r\n");
@@ -611,7 +616,22 @@ static int cmd_i2c(int argc, char **argv) {
         if (shell_parse_uint_auto(argv[4], &scl) != 0 || scl > 29) { shell_puts("Invalid SCL pin (0..29)\r\n"); return 1; }
         if (shell_parse_uint_auto(argv[5], &hz)  != 0 || hz == 0)  { shell_puts("Invalid hz (non-zero)\r\n"); return 1; }
 
-        /* RP2040 GPIO_FUNC_I2C = 3，SDK 自动按 pin 路由到 I2C0/I2C1；开漏 + 上拉由 SDK i2c_init 处理 */
+        /* RP2040 GPIO_FUNC_I2C = 3，SDK 自动按 pin 路由到 I2C0/I2C1
+         * 注：Pico SDK i2c_init 会自动 gpio_set_function，但不会自动开上拉！
+         * I2C 标准要求 SDA/SCL 必须有上拉（模块内部或外部 4.7kΩ）。
+         * 这里直接操作 PADS_BANK0 寄存器开启 ~50kΩ 内部上拉做兜底，
+         *   不依赖 Pico SDK 符号，避免 shell 编译单元侵入平台头文件：
+         *   PADS_BANK0 基址 = 0x4001C000
+         *   PADS_BANK0_GPIO<N> = 0x4001C004 + 4*N
+         *     bit3 PUE (Pull-Up Enable)  置 1 开上拉
+         *     bit2 PDE (Pull-Dn Enable)  清 0 关下拉
+         *     其他位保持 SDK 设置的默认值即可 */
+        #define PADS_BANK0_BASE   0x4001C000u
+        #define PADS_GPIO(n)      (*(volatile uint32_t *)(PADS_BANK0_BASE + 0x04u + 4u*(n)))
+        #define PADS_PUE          (1u << 3)
+        #define PADS_PDE          (1u << 2)
+        PADS_GPIO(sda) = (PADS_GPIO(sda) | PADS_PUE) & ~PADS_PDE;
+        PADS_GPIO(scl) = (PADS_GPIO(scl) | PADS_PUE) & ~PADS_PDE;
         hal_err_t r1 = hal_gpio_init(sda, HAL_GPIO_AF, 3);
         hal_err_t r2 = hal_gpio_init(scl, HAL_GPIO_AF, 3);
         hal_err_t r3 = hal_i2c_init(bus, hz);
@@ -644,11 +664,14 @@ static int cmd_i2c(int argc, char **argv) {
                     shell_puts("-- ");
                     continue;
                 }
-                /* 标准探测：发送 START + addr_W + STOP（0 字节写）
-                 *   调用 HAL 层 hal_i2c_tx，传 len=0。
-                 *   RP2040 SDK 实现里 buf=NULL / len=0 时只发控制字节，
-                 *   ACK → HAL_OK，NACK → HAL_ERR_IO。 */
-                hal_err_t pr = hal_i2c_tx(bus, addr, NULL, 0);
+                /* 标准探测（RP2040 Pico SDK 推荐方式）：
+                 *   Pico SDK 的 i2c_write_blocking 在 len=0 时不会发 START+ADDR，
+                 *   直接 ret=0 导致 HAL_OK，表现为 scan 全 ACK（见用户报告）。
+                 *   正确做法：执行 "read 1 byte" —— i2c_read_blocking(len=1) 一定会
+                 *   发 START + ADDR_R + ACK 采样 + STOP，ACK 即表示该地址有设备。
+                 *   读到的 dummy 字节直接丢弃。 */
+                uint8_t dummy;
+                hal_err_t pr = hal_i2c_rx(bus, addr, &dummy, 1);
                 if (pr == HAL_OK) {
                     shell_print_hex8(addr); shell_putc(' ');
                 } else {
@@ -682,6 +705,75 @@ static int cmd_i2c(int argc, char **argv) {
         shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" WR 0x"); shell_print_hex8((uint8_t)addr);
         shell_puts(" ["); for (int i = 0; i < nbytes; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[i]); }
         shell_puts("] ("); shell_put_uint32(nbytes); shell_puts(" bytes)\r\n");
+        return 0;
+    }
+
+    /* i2c cmds — SSD1306 风格：首字节固定 0x00 (Co=0 D/C#=0 后续全是命令字节) + N 个命令参数
+     *   SHELL_MAX_ARGS=10 时：cmd=cmds + bus + addr + 最多 7 个命令字节 / 次。
+     *   长初始化序列多分几次 i2c cmds 调用即可。 */
+    if (strcmp(sub, "cmds") == 0) {
+        if (argc < 5) { shell_puts("Usage: i2c cmds <bus> <addr> <C1> [C2 ... C7]\r\n"); return 1; }
+        uint32_t bus, addr;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        int ncmd = argc - 4;
+        if (ncmd > 255) { shell_puts("Too many commands (>255)\r\n"); return 1; }
+        /* buf[0] = 0x00 控制前缀，buf[1..ncmd] = 命令字节 */
+        uint8_t buf[257];
+        buf[0] = 0x00;
+        for (int i = 0; i < ncmd; i++) {
+            uint32_t v;
+            if (shell_parse_uint_auto(argv[4 + i], &v) != 0 || v > 0xFF) {
+                shell_puts("Invalid cmd byte at pos "); shell_put_uint32(i); shell_crlf();
+                return 1;
+            }
+            buf[1 + i] = (uint8_t)v;
+        }
+        hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, buf, (size_t)(ncmd + 1));
+        if (r != HAL_OK) { shell_puts("I2C CMDS NACK/ERROR @0x"); shell_print_hex8((uint8_t)addr); shell_crlf(); return 1; }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" CMDS 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts(" prefix=0x00 + [");
+        for (int i = 0; i < ncmd; i++) { if (i) shell_putc(' '); shell_print_hex8(buf[1 + i]); }
+        shell_puts("] ("); shell_put_uint32(ncmd); shell_puts(" commands)\r\n");
+        return 0;
+    }
+
+    /* i2c fill — SSD1306 风格：首字节 0x40 (Co=0 D/C#=1 后续全是 GDRAM 数据) + cnt × 同一个 byte
+     *   典型用途：OLED 全屏点亮 = fill 0x3C 0xFF 1024（128×64 bits / 8）
+     *            OLED 清屏      = fill 0x3C 0x00 1024
+     *            OLED 条纹     = fill 0x3C 0xAA 1024 */
+    if (strcmp(sub, "fill") == 0) {
+        if (argc < 6) { shell_puts("Usage: i2c fill <bus> <addr> <byte> <cnt>\r\n"); return 1; }
+        uint32_t bus, addr, bytev, count;
+        if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) { shell_puts("Invalid bus\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) { shell_puts("Invalid 7-bit addr\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[4], &bytev) != 0 || bytev > 0xFF) { shell_puts("Invalid fill byte (0x00..0xFF)\r\n"); return 1; }
+        if (shell_parse_uint_auto(argv[5], &count) != 0 || count == 0 || count > 8192) { shell_puts("Invalid cnt (1..8192)\r\n"); return 1; }
+
+        /* 分块发送：每块最多 256 字节（控制前缀 0x40 + 最多 255 数据字节）
+         *   SSD1306 的列指针自动递增，D/C=1 流可以被多次 I2C START 断续发送，
+         *   只要保持 D/C=1 前缀，内部指针不会复位。 */
+        uint8_t block[256];
+        block[0] = 0x40;       /* D/C=1, 数据流 */
+        memset(block + 1, (uint8_t)bytev, 255);   /* 全部填充为 bytev */
+        size_t remaining = (size_t)count;
+        uint32_t chunks = 0;
+        while (remaining > 0) {
+            size_t chunk = (remaining > 255) ? 255u : (size_t)remaining;
+            hal_err_t r = hal_i2c_tx(bus, (uint8_t)addr, block, chunk + 1);
+            if (r != HAL_OK) {
+                shell_puts("I2C FILL NACK/ERROR @chunk #");
+                shell_put_uint32(chunks);
+                shell_puts(" bytes left="); shell_put_uint32(remaining); shell_crlf();
+                return 1;
+            }
+            remaining -= chunk;
+            chunks++;
+        }
+        shell_puts("OK: I2C"); shell_put_uint32(bus); shell_puts(" FILL 0x"); shell_print_hex8((uint8_t)addr);
+        shell_puts(" byte=0x"); shell_print_hex8((uint8_t)bytev);
+        shell_puts(" ×"); shell_put_uint32(count);
+        shell_puts(" bytes ("); shell_put_uint32(chunks); shell_puts(" chunks)\r\n");
         return 0;
     }
 
@@ -758,19 +850,21 @@ static int cmd_i2c(int argc, char **argv) {
 /* ================================================================
  * 行解析器：按"空格"拆分 argv[0..argc-1]
  * ================================================================ */
-static int shell_split_argv(char *line, char **argv, int max_args) {
+static int shell_split_argv(char *line, char **argv, int max_args, bool *overflowed /* out */) {
     int argc = 0;
+    bool over = false;
     char *p = line;
     while (*p) {
         /* 跳过前导空白（空格/Tab） */
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
-        if (argc >= max_args) break;
+        if (argc >= max_args) { over = true; break; }
         argv[argc++] = p;
         /* 走到本段 token 末尾 */
         while (*p && *p != ' ' && *p != '\t') p++;
         if (*p) { *p = '\0'; p++; }
     }
+    if (overflowed) *overflowed = over;
     return argc;
 }
 
@@ -800,7 +894,13 @@ static int shell_exec_line(char *line) {
         }
     }
     static char *argv[SHELL_MAX_ARGS];
-    int argc = shell_split_argv(line, argv, SHELL_MAX_ARGS);
+    bool overflowed = false;
+    int argc = shell_split_argv(line, argv, SHELL_MAX_ARGS, &overflowed);
+    if (overflowed) {
+        shell_puts("WARNING: Too many tokens! Only first ");
+        shell_put_uint32(SHELL_MAX_ARGS);
+        shell_puts(" parsed. Increase SHELL_MAX_ARGS.\r\n");
+    }
     if (argc == 0) return 0;   /* 空行 */
     const char *name = argv[0];
     for (size_t i = 0; i < SHELL_CMD_NUM; i++) {
