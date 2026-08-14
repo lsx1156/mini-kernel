@@ -114,11 +114,54 @@ static bool sector_is_valid(uint32_t sector_off, uint8_t *out_count) {
 }
 
 /* 选取一个健康扇区：优先 A，A 坏 → B；都坏 → 都没初始化（首次）返回 false。
- * 首次启动（两个全 0xFF）：sector_is_valid 都会 false，我们返回 false 表示"空"。 */
-static bool bootscript_pick_active(uint32_t *out_sector, uint8_t *out_count) {
+ * 首次启动（两个全 0xFF）：sector_is_valid 都会 false，我们返回 false 表示"空"。
+ *
+ * 诊断支持：若 diag=true（当 bootscript_count==0 但用户怀疑有内容时调用），
+ *   会把 A/B 扇区的 magic/crc/count 原样打印到 shell console，方便定位"为什么
+ *   启动时 count=0 但 list 命令好像有数据"这种不一致。
+ *
+ *   【注意：这里**禁止**使用 shell_puts / shell_put_hex32 等 shell.c 内部 static 函数
+ *    —— bootscript.c 是独立的 shell_module 编译单元，看不到 shell.c 的 static 符号；
+ *    之前写 extern 再调用会导致链接器 "undefined reference to `shell_puts'" 错误。
+ *    正确做法：直接用 HAL 层的 hal_console_putc 逐字符输出（串口/USB 双通道都走 HAL）。*/
+static bool bootscript_pick_active_internal(uint32_t *out_sector, uint8_t *out_count, bool diag) {
     uint8_t ca = 0, cb = 0;
     bool a_ok = sector_is_valid(BOOTSCRIPT_SECTOR_A, &ca);
     bool b_ok = sector_is_valid(BOOTSCRIPT_SECTOR_B, &cb);
+    if (diag) {
+        /* —— 用 HAL console 自绘诊断（不依赖 shell.c static 函数）。
+         *    hal_console_putc 是宏 (hal_export.console->putc)，通过
+         *    顶部 #include "hal_interface.h" 已经可见，无需再 extern。 —— */
+#define PSTR(s) do { const char *pp = (s); while (*pp) hal_console_putc(*pp++); } while (0)
+#define PHEX(v) do { \
+    const char hx[] = "0123456789ABCDEF"; \
+    uint32_t vv = (uint32_t)(v); \
+    hal_console_putc('0'); hal_console_putc('x'); \
+    for (int ii = 7; ii >= 0; ii--) hal_console_putc(hx[(vv >> (ii*4)) & 0xF]); \
+} while (0)
+#define PU32(v) do { \
+    char buf[16]; int bi = 0; uint32_t vv = (uint32_t)(v); \
+    if (vv == 0) { hal_console_putc('0'); } \
+    else { while (vv > 0) { buf[bi++] = '0' + (vv % 10); vv /= 10; } \
+           while (bi > 0) { hal_console_putc(buf[--bi]); } } \
+} while (0)
+#define CRLF() do { hal_console_putc('\r'); hal_console_putc('\n'); } while (0)
+
+        const uint8_t *pa = hal_flash_map_read(BOOTSCRIPT_SECTOR_A);
+        const uint8_t *pb = hal_flash_map_read(BOOTSCRIPT_SECTOR_B);
+        PSTR("[BOOT-DIAG] Sector A @ "); PHEX(BOOTSCRIPT_SECTOR_A);
+        PSTR("  valid="); PSTR(a_ok?"Y":"N"); PSTR("  count="); PU32(ca);
+        if (pa) { PSTR("  magic="); PHEX((pa[0]<<8)|pa[1]); PSTR("  crc="); PHEX(pa[3]); }
+        CRLF();
+        PSTR("[BOOT-DIAG] Sector B @ "); PHEX(BOOTSCRIPT_SECTOR_B);
+        PSTR("  valid="); PSTR(b_ok?"Y":"N"); PSTR("  count="); PU32(cb);
+        if (pb) { PSTR("  magic="); PHEX((pb[0]<<8)|pb[1]); PSTR("  crc="); PHEX(pb[3]); }
+        CRLF();
+#undef PSTR
+#undef PHEX
+#undef PU32
+#undef CRLF
+    }
     if (a_ok && b_ok) {
         /* 两个都好：选 A 作主，B 是镜像，num_entries 应该一致；不一致选较小的（更保守） */
         if (out_count) *out_count = (ca < cb) ? ca : cb;
@@ -128,6 +171,15 @@ static bool bootscript_pick_active(uint32_t *out_sector, uint8_t *out_count) {
     if (a_ok) { if (out_count) *out_count = ca; if (out_sector) *out_sector = BOOTSCRIPT_SECTOR_A; return true; }
     if (b_ok) { if (out_count) *out_count = cb; if (out_sector) *out_sector = BOOTSCRIPT_SECTOR_B; return true; }
     return false;
+}
+static bool bootscript_pick_active(uint32_t *out_sector, uint8_t *out_count) {
+    return bootscript_pick_active_internal(out_sector, out_count, false);
+}
+
+/* 公共诊断入口：当启动 count==0 时打印 A/B 扇区 header，用于排查"save 成功 list 看到，
+ *   重启后却显示 count=0"的扇区损坏 / 未双写成功问题。 */
+void bootscript_diag_dump(void) {
+    (void)bootscript_pick_active_internal(NULL, NULL, true);
 }
 
 /* 把 staging 4KB 写到 A 和 B（先擦再写）。staging 必须是完整、CRC 已计算好的一整个扇区。 */
@@ -272,4 +324,41 @@ bool bootscript_verify(void) {
     bool b_ok = sector_is_valid(BOOTSCRIPT_SECTOR_B, &cb);
     if (!a_ok || !b_ok) return false;
     return (ca == cb);
+}
+
+/* ========== 回放结果 RAM 常驻记录（解决 USB FIFO 丢输出问题） ========== */
+static bootscript_status_t s_status = {
+    .ran = false,
+    .total = 0,
+    .ok_count = 0,
+    .fail_count = 0,
+    .final_gpio25_level = 0xFFu,
+};
+
+const bootscript_status_t *bootscript_get_status(void) {
+    return &s_status;
+}
+
+void bootscript_rec_begin(uint8_t total_slots) {
+    memset(&s_status, 0, sizeof(s_status));
+    s_status.ran = true;
+    s_status.total = total_slots;
+    s_status.final_gpio25_level = 0xFFu;
+}
+
+void bootscript_rec_entry(uint8_t slot, const char *cmd_line, int exec_rc) {
+    if (slot >= BOOTSCRIPT_LOG_MAX_ENTRIES) return;
+    bootscript_log_entry_t *e = &s_status.entries[slot];
+    e->slot = slot;
+    e->exec_rc = exec_rc;
+    size_t len = cmd_line ? strlen(cmd_line) : 0;
+    if (len >= sizeof(e->cmd_line)) len = sizeof(e->cmd_line) - 1u;
+    if (len > 0) memcpy(e->cmd_line, cmd_line, len);
+    e->cmd_line[len] = '\0';
+}
+
+void bootscript_rec_end(uint8_t ok_cnt, uint8_t fail_cnt, uint8_t final_gpio25_level_01_or_FF) {
+    s_status.ok_count = ok_cnt;
+    s_status.fail_count = fail_cnt;
+    s_status.final_gpio25_level = final_gpio25_level_01_or_FF;
 }

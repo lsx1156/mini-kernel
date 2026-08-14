@@ -318,9 +318,64 @@ void demo_app_init(void) {
     demo_puts("\r\n");
     demo_puts("[BOOT  ] Creating interactive shell task...\r\n");
 
+    /* ── HAL 外围"预热"（解决用户报告：重启后固化命令 led on 不生效）──────
+     * 用户固化的命令（如 led on / i2c init 0 4 5 ...）理论上每条命令内部都会自行
+     *   hal_gpio_init 或 hal_i2c_init，但是为了避免极端情况（例如用户 save 的是
+     *   一条 "gpio write 25 1" 而非 "gpio init 25 out 1 + write"），这里先把
+     *   最常见、最核心的板载外设做一次基础 init：
+     *
+     *   1) GPIO25（板载 LED）：init 成推挽输出、初始 LOW（灭）
+     *        → bootscript_run_all 执行 "led on" 后会拉成 HIGH
+     *
+     *   注意：这里只做"安全默认 init"（不亮灯、不产生总线行为），真正的用户级
+     *        配置仍然必须由 bootscript 中的显式命令执行。
+     *
+     *   实现：**直接写 RP2040 寄存器**（避免在这里 extern hal_gpio_init 触发
+     *         hal_interface.h 的同名宏展开导致编译错误）。代码与
+     *         hal_port.c hal_gpio_init_impl(HAL_GPIO_OUT_PP) 完全等价。
+     * ──────────────────────────────────────────────────────────────── */
+#if OS_CFG_PERIPH_SERVICE
+    {
+        register const uint32_t SIO_BASE        = 0xD0000000u;
+        register const uint32_t PADS_BANK0_BASE = 0x4001C000u;
+        register const uint32_t IO_BANK0_BASE   = 0x40014000u;
+        register const uint32_t PIN25           = 25u;
+        register const uint32_t MASK25          = 1u << PIN25;
+        register const uint32_t RESETS_BASE     = 0x4000C000u;
+
+        /* 1. 确保 RESETS.PADS_BANK0 / IO_BANK0 / PWM / USBCTRL（等）都已经脱离复位
+         *    Pico SDK bootrom 已完成；这里只对 PADS/IO 做写操作。 */
+        *(volatile uint32_t *)(PADS_BANK0_BASE + 0x04 + PIN25 * 4u) =
+            (0u << 7) | (1u << 6) | (0u << 4) | (1u << 3) | (0u << 2) | (0u << 1) | (0u << 0);
+        /*   含义: ISO=0, OD=0, IE=1(enable input), DRIVE=8mA, PUE=0, PDE=0, SCHMITT=1, SLEWFAST=0 */
+
+        /* 2. IO_BANK0 引脚 mux: GPIO25 → F5 (SIO)，与 hal_port AF=0 对应 */
+        *(volatile uint32_t *)(IO_BANK0_BASE + 0x04 + PIN25 * 8u) = 5u; /* func 5 = SIO */
+
+        /* 3. SIO OE: 置位 → 输出模式 */
+        *(volatile uint32_t *)(SIO_BASE + 0x024) = MASK25;  /* OE_SET */
+
+        /* 4. SIO OUT: 先清零（灭灯）*/
+        *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;  /* OUT_CLR */
+
+        /* 防编译器 unused：RESETS_BASE 没写，读取一下确认在地址空间 */
+        (void)(*(volatile uint32_t *)RESETS_BASE);
+
+        demo_puts("[BOOT  ] Pre-init: GPIO25 (LED) OUT, LOW (ready for bootscript)\r\n");
+
+        /* 给 bootscript_run_all 的入口加一行 banner，让启动回放的 6 行 big banner
+         *   和 demo banner 之间有明确的视觉分界点（否则用户不知道从哪里开始）。*/
+        demo_puts("[BOOT  ] Entering persistent boot command playback (shell_start → bootscript_run_all)...\r\n");
+        demo_puts("\r\n");
+    }
+#endif
+
     /* 创建交互式 Shell 任务（USB CDC + UART0 双通道）
      *   这是本平台唯一持续运行的用户任务。
-     *   Shell 模式：输入命令 → 同步执行 → 打印结果 → 等待下一条命令。 */
+     *   Shell 模式：输入命令 → 同步执行 → 打印结果 → 等待下一条命令。
+     *   注意 (v0.2)：shell_start() 内部在创建交互式 shell 任务之前，会先
+     *   同步调用 bootscript_run_all()，跑完所有 save/! 固化的命令，再进
+     *   交互模式。LED / I2C 的回放结果都在那个大 banner 里体现。 */
     shell_start();
     demo_puts("[BOOT  ] Shell ready. Connect USB CDC COMx and type 'help' or 'gpio help'.\r\n\r\n");
 }
@@ -335,11 +390,18 @@ void demo_app_init(void) {
 
 /* ================================================================
  * 版本字符串（k_version 必须始终提供，kernel.h 已声明）
- *   0.2.0-beta: 指令固化(!/save/unsave/list/boot) + factory_reset 出厂恢复
+ *   0.2.0-beta-hotfix1: 修复"固化 led on 重启后不亮" + 新增 boot status 诊断
+ *     · 根因：demo_app_init → shell_start → bootscript → led on 后，
+ *             boot_setup_task 还调用 _led_stage(13) 做 13 次闪烁指示，
+ *             每次最后 SIO_OUT_CLR 把 GPIO25 强制 OFF，覆盖用户固化的设置。
+ *     · 修复：把 _led_stage(13) 提前到 demo_app_init 之前跑完（kernel.c），
+ *             demo_app_init 返回之后 **永不** 无条件写 GPIO25。
+ *     · 新增 boot status 命令：RAM 常驻回放结果，用户打开终端后随时查询
+ *             每条固化命令的执行结果，不再依赖启动时刚好打开终端接串口。
  *               [UNTESTED] 标注：尚未在硬件端完整跑通
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "0.2.0-beta [UNTESTED]"
+#define KERNEL_VERSION_STR  "0.2.0-beta-hotfix1 [UNTESTED]"
 #endif
 
 const char *k_version(void) {

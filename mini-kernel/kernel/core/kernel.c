@@ -142,13 +142,25 @@ static void _boot_setup_task(void *arg) {
     /* 阶段 12：横幅打印完成，准备创建 demo 任务 */
     _led_stage(12);
 
-    /* — Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） — */
+    /* ── Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） ──
+     * 【v0.2.0-beta 修复：**绝对不要在 demo_app_init 返回后再写 GPIO25！**】
+     *   之前的 bug：demo_app_init 内部调用 shell_start() → bootscript_run_all()
+     *   → 用户固化的 "led on" 把 GPIO25 HIGH，然后返回 boot_setup_task，
+     *   接着 _led_stage(13) 做了 13 次 "ON → long wait → OFF → long wait"，
+     *   最后一步 SIO_OUT_CLR 直接把用户设置的 HIGH 拉回 LOW，LED 表现为
+     *   "启动亮了一下然后又灭了"。用户输入 list 能看到 #0: led on，
+     *   但灯实际是灭的，这就是 2026-08-15 用户报告的 "操作系统这样是不对的"。
+     *
+     *   修复原则：
+     *     · 所有 _led_stage 诊断指示必须放在 demo_app_init 之前跑完；
+     *     · demo_app_init（及其内部 bootscript 回放）之后，**永不**
+     *       无条件操纵 GPIO25（除了 HardFault / NMI 处理的故障指示）。
+     *
+     *   阶段 13 合并入阶段 12，取消独立的"demo 任务创建完成"指示，避免冲突。
+     * ──────────────────────────────────────────────────────────────── */
     if (&demo_app_init != NULL) {
         demo_app_init();
     }
-
-    /* 阶段 13：demo 任务创建完成 */
-    _led_stage(13);
 
     /* — Step 4: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
     task_suspend(g_current_task);

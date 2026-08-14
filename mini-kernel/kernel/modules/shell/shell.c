@@ -194,8 +194,8 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "把任意命令追加到 Flash 固化区（不立即执行；下次开机自动执行）" },
     { "unsave",  cmd_unsave,  "unsave <idx> | all",   "删除固化命令：按序号或一键清空" },
     { "list",    cmd_list,    "list",                  "列出所有已固化命令（Flash 双备份 + CRC）" },
-    { "boot",    cmd_boot,    "boot exec | boot flash_test",
-                                                    "boot: 固化指令子系统；exec=立即跑；flash_test=B线路SPI自检" },
+    { "boot",    cmd_boot,    "boot exec | boot flash_test | boot status",
+                                                    "boot: 固化指令子系统；exec=立即跑；status=查看上次回放结果(解决启动时USB输出被丢)；flash_test=B线路SPI自检" },
     { "factory_reset", cmd_factory_reset, "factory_reset | factory_reset confirm",
                                                     "出厂重置：擦除所有持久化数据(bootscript+末尾保留区)；保留内核固件本身" },
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
@@ -380,28 +380,53 @@ static int cmd_clear(int argc, char **argv) {
     return 0;
 }
 
-/* led on|off|toggle */
+/* led on|off|toggle
+ * · 新增：每次命令都检查 hal_gpio_init 返回值（确保 OS_CFG_PERIPH_SERVICE 开启且 HAL 就位）
+ * · 新增：写完输出电平后 **立即回读一次 SIO 电平**，失败时打印 "GPIO25 readback mismatch"
+ *       这样可以区分"命令没执行"和"命令执行了但硬件没响应"两种情况。 */
 static int cmd_led(int argc, char **argv) {
 #if OS_CFG_PERIPH_SERVICE
     if (argc < 2) { shell_puts("Usage: led on | off | toggle\r\n"); return 1; }
     /* RP2040 板载 LED 固定是 GPIO25（Pico非W版），这里直接用 hal_gpio 接口 */
     const uint32_t pin = 25;
+    hal_err_t ir = hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
+    if (ir != HAL_OK) {
+        shell_puts("ERROR: led: hal_gpio_init(GPIO25, OUT_PP) returned ");
+        shell_put_err((int)ir); shell_puts(" (OS_CFG_PERIPH_SERVICE ON?)\r\n");
+        return 1;
+    }
+    hal_gpio_level_t want = HAL_GPIO_LOW;
     if (strcmp(argv[1], "on") == 0) {
-        hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
+        want = HAL_GPIO_HIGH;
         hal_gpio_write(pin, HAL_GPIO_HIGH);
         shell_puts("LED GPIO25 ON\r\n");
     } else if (strcmp(argv[1], "off") == 0) {
-        hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
+        want = HAL_GPIO_LOW;
         hal_gpio_write(pin, HAL_GPIO_LOW);
         shell_puts("LED GPIO25 OFF\r\n");
     } else if (strcmp(argv[1], "toggle") == 0) {
-        hal_gpio_init(pin, HAL_GPIO_OUT_PP, 0);
+        hal_gpio_level_t cur = hal_gpio_read(pin);
+        want = (cur == HAL_GPIO_HIGH) ? HAL_GPIO_LOW : HAL_GPIO_HIGH;
         hal_gpio_toggle(pin);
         shell_puts("LED GPIO25 toggled\r\n");
     } else {
         shell_puts("Unknown led op (use: on | off | toggle)\r\n");
         return 1;
     }
+    /* 回读校验：SIO 寄存器的读回必须等于预期，否则输出 FAIL 标志（这就是用户常说的
+     *   "命令执行了但灯没亮" 时最直接的自检证据）。 */
+    hal_gpio_level_t got = hal_gpio_read(pin);
+    if (got != want) {
+        shell_puts("  ↳ FAIL: GPIO25 readback ");
+        shell_puts((got == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+        shell_puts(" but expected ");
+        shell_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+        shell_puts(" (HW problem?)\r\n");
+        return 1;
+    }
+    shell_puts("  ↳ OK: GPIO25=");
+    shell_puts((want == HAL_GPIO_HIGH) ? "HIGH" : "LOW");
+    shell_puts(" (verified via SIO readback)\r\n");
     return 0;
 #else
     (void)argc; (void)argv;
@@ -914,10 +939,16 @@ static int cmd_i2c(int argc, char **argv) {
 }
 
 /* ========== cmd_boot 包装子命令 ========== */
+static int cmd_bootscript_status(int argc, char **argv);   /* 前向声明，定义在下方 */
+
 static int cmd_boot(int argc, char **argv) {
-    if (argc < 2) { shell_puts("Usage: boot exec | boot flash_test\r\n  exec - 立即执行全部固化命令\r\n  flash_test - (B线路SPI) 擦+写双备份扇区后校验一致性\r\n"); return 1; }
+    if (argc < 2) { shell_puts("Usage: boot exec | boot flash_test | boot status\r\n"
+                               "  exec       - 立即执行全部固化命令（与开机同路径）\r\n"
+                               "  flash_test - (B线路SPI) 擦+写双备份扇区后校验一致性\r\n"
+                               "  status     - 查看 RAM 中上次开机 bootscript 回放结果（解决启动时 USB 输出被丢看不到）\r\n"); return 1; }
     const char *sub = argv[1];
     if (strcmp(sub, "exec") == 0)        return cmd_bootscript_boot_exec(argc, argv);
+    if (strcmp(sub, "status") == 0)      return cmd_bootscript_status(argc, argv);
     if (strcmp(sub, "flash_test") == 0) {
         hal_err_t e = bootscript_erase_test();
         if (e != HAL_OK) { shell_puts("B-LINE SPI: ERASE FAILED\r\n"); return 1; }
@@ -934,6 +965,85 @@ static int cmd_boot(int argc, char **argv) {
         return 0;
     }
     shell_puts("Unknown boot subcommand: '"); shell_puts(sub); shell_puts("'\r\n"); return 1;
+}
+
+/* —— boot status: 打印 RAM 中保存的上次 bootscript_run_all 回放结果 ——
+ *   这是 v0.2.0-beta 新增的"事后诊断"核心：
+ *     PICO_STDIO_USB_STDOUT_TIMEOUT_US=0 时，用户启动时若还没打开 PuTTY/终端，
+ *     bootscript_run_all 打印的 BOOTSCRIPT START/END banner + 所有错误/成功
+ *     信息会因 CDC IN FIFO 满被全部丢弃，用户只能看到 mk> 提示符和 list 中的
+ *     命令条目 —— 但"命令到底有没有真跑"完全看不到。
+ *   
+ *   有了 boot status 后：用户任何时候打开终端输入 boot status 都能看到：
+ *     · 本次上电 bootscript_run_all 是否曾经运行过
+ *     · 共多少条、成功多少、失败多少
+ *     · 每条命令的原内容 + shell_exec_line 返回码
+ *     · 回放结束后 GPIO25 电平（LED on 是否真的生效）
+ *   不再依赖"刚好在启动前打开终端"这种时序。 */
+static int cmd_bootscript_status(int argc, char **argv) {
+    (void)argc; (void)argv;
+    const bootscript_status_t *st = bootscript_get_status();
+    shell_puts("==============================================================\r\n");
+    shell_puts("  Bootscript Playback Status (RAM resident, since power-on)\r\n");
+    shell_puts("==============================================================\r\n");
+    if (!st->ran) {
+        shell_puts("  · bootscript_run_all() has NOT been called this boot.\r\n");
+        shell_puts("  · Possible reasons: OS_CFG_SHELL=0, or shell_start() never invoked.\r\n");
+        shell_puts("  · Tip: try 'boot exec' to run it now (same path as power-on).\r\n");
+        shell_puts("==============================================================\r\n");
+        return 1;
+    }
+    shell_puts("  · Called        : YES (current boot)\r\n");
+    shell_puts("  · Total slots   : "); shell_put_uint32(st->total); shell_crlf();
+    shell_puts("  · Executed OK   : "); shell_put_uint32(st->ok_count); shell_crlf();
+    shell_puts("  · Executed FAIL : "); shell_put_uint32(st->fail_count); shell_crlf();
+    shell_puts("  · GPIO25 level  : ");
+    if (st->final_gpio25_level == 0xFFu) {
+        shell_puts("UNKNOWN (no PERIPH service or 0 entries)\r\n");
+    } else if (st->final_gpio25_level == 1u) {
+        shell_puts("HIGH — LED SHOULD BE ON (bootscript `led on` took effect)\r\n");
+    } else {
+        shell_puts("LOW — LED IS OFF (if you expected ON, check `led on` rc below)\r\n");
+    }
+    shell_puts("--------------------------------------------------------------\r\n");
+    if (st->total == 0) {
+        shell_puts("  (No persistent commands stored at boot time. 'list' may show new saves since.)\r\n");
+    } else {
+        shell_puts("  # | RC  | Result | Command line\r\n");
+        shell_puts("----+-----+--------+---------------------------------------------\r\n");
+        for (uint8_t i = 0; i < st->total; i++) {
+            const bootscript_log_entry_t *e = &st->entries[i];
+            /* 序号 */
+            shell_pad_spaces(3); shell_put_uint32(i); shell_puts(" | ");
+            /* rc: 最多 4 位 + 符号 */
+            int rc = e->exec_rc;
+            if (rc == -999) shell_puts("CRC  ");  /* 特殊：读失败 */
+            else {
+                if (rc < 0) { hal_console_putc('-'); rc = -rc; }
+                else hal_console_putc(' ');
+                if (rc >= 100) { shell_put_uint32((uint32_t)rc / 100); } else shell_putc(' ');
+                if (rc >= 10)  { shell_put_uint32(((uint32_t)rc / 10) % 10); } else shell_putc(' ');
+                shell_put_uint32((uint32_t)rc % 10);
+            }
+            shell_puts(" | ");
+            /* result */
+            if (e->exec_rc == 0)       shell_puts("PASS   | ");
+            else if (e->exec_rc == -999) shell_puts("BAD SLOT| ");
+            else                        shell_puts("FAIL   | ");
+            /* command line（最多 60 字，超长截断 … ） */
+            {
+                const char *p = e->cmd_line[0] ? e->cmd_line : "(empty)";
+                int shown = 0;
+                while (*p && shown < 60) { hal_console_putc(*p++); shown++; }
+                if (*p) shell_puts("...");
+            }
+            shell_crlf();
+        }
+    }
+    shell_puts("==============================================================\r\n");
+    shell_puts("  Tip: To force re-run and refresh this status, use:  boot exec\r\n");
+    shell_puts("==============================================================\r\n");
+    return 0;
 }
 
 /* ================================================================
@@ -986,31 +1096,80 @@ static void argv_rejoin(int argc, char **argv, int arg_start, char *buf, size_t 
     buf[out] = '\0';
 }
 
-/* 公开 API：执行 bootscript 中全部已固化命令（boot_setup 开机和 shell "boot exec" 都会调用） */
+/* 公开 API：执行 bootscript 中全部已固化命令（boot_setup 开机和 shell "boot exec" 都会调用）
+ *
+ * 2026-08-15 用户报告：重启后 list 能看到 #0 led on，但 LED 没亮。
+ *   → 增强启动痕迹，绝不静默：
+ *       1. 开头打印分隔线 ===== BOOTSCRIPT START ===== + 带 total count
+ *       2. 每条命令前后 BEGIN/END，END 显示 shell_exec_line 返回 rc
+ *       3. rc != 0 时把 hal_err_t 名字打印出来（如果是 -1~-9）
+ *       4. 执行完后 200ms 小延时 + GPIO25 读回电平汇报 LED 当前状态（视觉锚点）
+ *       5. 最后再打 ===== BOOTSCRIPT DONE ===== + N ok / M failed
+ *       6. 如果 total == 0（且 HAL 已就绪），**主动 dump A/B 扇区诊断**，
+ *          防止"save 成功 list 看到、重启却 count=0"的扇区双写不一致被静默掩盖。 */
 int bootscript_run_all(void) {
+    shell_puts("==============================================================\r\n");
+    shell_puts("=====         BOOTSCRIPT START (persistent cmd playback)        =====\r\n");
+    shell_puts("==============================================================\r\n");
     uint8_t total = bootscript_count();
+    bootscript_rec_begin(total);                 /* ← RAM 记录：begin */
     if (total == 0) {
-        shell_puts("[BOOT ] No persistent commands saved yet. Use 'save <cmd>' or '!<cmd>'.\r\n");
+        shell_puts("[BOOT ] bootscript_count()==0 — No persistent commands saved yet.\r\n");
+        shell_puts("[BOOT ] (Use 'save <cmd>' to queue, or '!<cmd>' to exec-then-save)\r\n");
+        /* 诊断：A/B 扇区 dump 出来，防止用户 save 后重启显示空、
+         *       但是实际上只是双备份 A 或 B 某一侧 CRC/写入没成功。 */
+        bootscript_diag_dump();
+        shell_puts("==============================================================\r\n");
+        shell_puts("=====         BOOTSCRIPT DONE (0 entries, idle)                =====\r\n");
+        shell_puts("==============================================================\r\n");
+        bootscript_rec_end(0, 0, 0xFFu);           /* ← RAM 记录：end (0 entries, GPIO unknown) */
         return 0;
     }
-    shell_puts("[BOOT ] Running "); shell_put_uint32(total); shell_puts(" persistent command(s)...\r\n");
+    shell_puts("[BOOT ] Will run "); shell_put_uint32(total); shell_puts(" persistent command(s):\r\n");
     int failed = 0;
+    uint8_t ok_cnt = 0;
     for (uint8_t i = 0; i < total; i++) {
         char line[SHELL_LINE_SIZE];
+        shell_puts("[BOOT ] --- BEGIN #"); shell_put_uint32(i); shell_puts(" ---\r\n");
         if (!bootscript_get(i, line, sizeof(line))) {
             shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": FAILED to read slot (CRC corrupt?)\r\n");
-            failed++; continue;
+            failed++;
+            bootscript_rec_entry(i, "<slot CRC corrupt>", -999);
+            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" FAIL (read)\r\n");
+            continue;
         }
         shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": $ "); shell_puts(line); shell_crlf();
         int rc = shell_exec_line(line);
+        bootscript_rec_entry(i, line, rc);          /* ← RAM 记录：每条命令结果 */
         if (rc != 0) {
-            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": exited with code ");
-            shell_put_uint32((uint32_t)((rc < 0) ? -rc : rc)); shell_crlf();
+            shell_puts("[BOOT ] #"); shell_put_uint32(i); shell_puts(": exit code=");
+            shell_put_err((int)rc); shell_crlf();
             failed++;
+            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" FAIL (exec)\r\n");
+        } else {
+            ok_cnt++;
+            shell_puts("[BOOT ] --- END #"); shell_put_uint32(i); shell_puts(" OK\r\n");
         }
     }
-    shell_puts("[BOOT ] Done. ("); shell_put_uint32(total - (uint8_t)failed);
-    shell_puts(" ok / "); shell_put_uint32((uint32_t)((failed < 0) ? 0 : failed)); shell_puts(" failed)\r\n");
+    /* 回放结束，给用户视觉锚点：GPIO25 电平直接汇报（用户最关心的就是 LED 是否亮） */
+    uint8_t gpio25_after = 0xFFu;
+#if OS_CFG_PERIPH_SERVICE
+    {
+        hal_gpio_level_t lvl = hal_gpio_read(25);
+        gpio25_after = (lvl == HAL_GPIO_HIGH) ? 1u : 0u;
+        shell_puts("[BOOT ] GPIO25 (LED) level after bootscript = ");
+        shell_puts((lvl == HAL_GPIO_HIGH) ? "HIGH (LED should be ON)\r\n" : "LOW (LED OFF)\r\n");
+    }
+#endif
+    shell_puts("[BOOT ] Summary: ");
+    shell_put_uint32((uint32_t)(total - (uint8_t)failed));
+    shell_puts(" ok / ");
+    shell_put_uint32((uint32_t)((failed < 0) ? 0 : failed));
+    shell_puts(" failed (total="); shell_put_uint32(total); shell_puts(")\r\n");
+    shell_puts("==============================================================\r\n");
+    shell_puts("=====         BOOTSCRIPT DONE                                   =====\r\n");
+    shell_puts("==============================================================\r\n");
+    bootscript_rec_end(ok_cnt, (uint8_t)((failed < 0) ? 0 : failed), gpio25_after);
     return failed;
 }
 
