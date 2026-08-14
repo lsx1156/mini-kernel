@@ -158,6 +158,7 @@ set(INCLUDE_DIRS
 file(GLOB KERNEL_CORE_SRCS
     ${CMAKE_SOURCE_DIR}/kernel/core/*.c
     ${CMAKE_SOURCE_DIR}/kernel/core/*.S
+    ${CMAKE_SOURCE_DIR}/kernel/syscall/*.c
 )
 
 add_library(kernel_core STATIC ${KERNEL_CORE_SRCS})
@@ -227,11 +228,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hal_port
 )
 # 按模块裁剪开关按需链接（模块未启用时 target 不存在，不能直接写进上面的列表）
+# 依赖顺序：模块 → kernel_core → hal_port（模块引用内核核心的符号）
 if(periph_module_ENABLED)
     target_link_libraries(${PROJECT_NAME} PRIVATE periph_module)
 endif()
 if(shell_module_ENABLED)
     target_link_libraries(${PROJECT_NAME} PRIVATE shell_module)
+    # shell 引用 kernel_core 的 syscall_contract 等符号，声明依赖以确保链接顺序
+    target_link_libraries(shell_module PUBLIC kernel_core)
 endif()
 if(vfs_module_ENABLED)
     target_link_libraries(${PROJECT_NAME} PRIVATE vfs_module)

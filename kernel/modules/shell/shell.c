@@ -6,7 +6,7 @@
  *    · 非阻塞 getc 拼行，配合 USB CDC / UART0 双通道 SDK stdio
  *    · 支持 \b 退格、\r\n 行结束、清屏命令
  *    · 命令表驱动，易于扩展
- *    · 命令：help / ps / heap / tick / version / suspend / resume / kill / clear / led
+ *    · 命令：help / ps / heap / tick / version / suspend / resume / kill / clear / led / syscalls
  *
  *  注意：本文件由 kernel/modules/shell/ 下的 CMake add_module_if_enabled
  *        扫描并编入，裁剪宏 OS_CFG_SHELL=0 时整体不编译（链接零开销）。
@@ -15,6 +15,7 @@
 #include "mem.h"
 #include "hal_interface.h"
 #include "os_config.h"
+#include "syscall_contract.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -109,6 +110,7 @@ static int cmd_resume(int argc, char **argv);
 static int cmd_kill(int argc, char **argv);
 static int cmd_clear(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
+static int cmd_syscalls(int argc, char **argv);
 
 /* ================================================================
  * 命令表（驱动扩展：新增命令只需加一行）
@@ -124,6 +126,7 @@ static const shell_cmd_t g_cmd_table[] = {
     { "kill",    cmd_kill,    "kill <id>",             "销毁指定 ID 的任务（不可恢复）" },
     { "clear",   cmd_clear,   "clear | cls",           "清屏并将光标移至左上角" },
     { "led",     cmd_led,     "led on | off | toggle", "控制 RP2040 板载 LED (GPIO25)" },
+    { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
 };
@@ -330,6 +333,38 @@ static int cmd_led(int argc, char **argv) {
     shell_puts("ERROR: OS_CFG_PERIPH_SERVICE=0, hal_gpio not linked\r\n");
     return 1;
 #endif
+}
+
+/* syscalls — 列出系统调用契约表 */
+static int cmd_syscalls(int argc, char **argv) {
+    (void)argc; (void)argv;
+    size_t total = syscall_table_size();
+    shell_puts("\r\n=== Syscall Contract Table (");
+    shell_put_uint32((uint32_t)total);
+    shell_puts(" entries) ===\r\n");
+    shell_puts("ID    Name            Params  Return     Signature\r\n");
+    shell_puts("----------------------------------------------------------\r\n");
+    for (size_t i = 0; i < total; i++) {
+        const syscall_entry_t *e = syscall_get_entry(i);
+        if (!e) break;
+        /* ID */
+        shell_put_uint32((uint32_t)e->id);
+        shell_pad_spaces(6 - (int)(e->id / 10 + 1));
+        /* Name */
+        shell_puts(e->name);
+        shell_pad_spaces(16 - (int)strlen(e->name));
+        /* Params */
+        shell_put_uint32(e->param_count);
+        shell_pad_spaces(8);
+        /* Return type */
+        shell_puts(e->return_type);
+        shell_pad_spaces(11 - (int)strlen(e->return_type));
+        /* Signature */
+        shell_puts(e->signature);
+        shell_crlf();
+    }
+    shell_puts("----------------------------------------------------------\r\n");
+    return 0;
 }
 
 /* ================================================================
