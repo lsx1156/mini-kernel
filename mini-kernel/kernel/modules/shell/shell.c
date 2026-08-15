@@ -1569,7 +1569,9 @@ static void vt_task_oled(void *arg) {
 static void vt_task_ctrl(void *arg) {
     (void)arg;
     #define VT3_NMEM 8
-    size_t sizes[VT3_NMEM] = { 32, 64, 128, 96, 256, 48, 160, 80 };
+    /* 3 tasks 建立后剩余 heap≈800~950B，必须保证 8 块总和 + header 留 200B 余量。
+     * 旧版 864B 太紧 → Round #1 kmalloc 失败 + p[] 未清零 = kfree 野指针 = HardFault 爆闪。*/
+    size_t sizes[VT3_NMEM] = { 16, 32, 64, 32, 96, 24, 48, 32 };  /* 总和 = 344B，永远够 */
     int    order[VT3_NMEM] = { 3,0,7,2,5,1,6,4 };
 
     while (g_vtest_running) {
@@ -1578,17 +1580,19 @@ static void vt_task_ctrl(void *arg) {
 
         /* ── ① 堆压力 (alloc + 写 + 乱序 free) ─────────────────── */
         {
-            void *p[VT3_NMEM];
+            void *p[VT3_NMEM] = {0};   /* 【关键 Bugfix】必须清零！kmalloc break 时 p[后面]=NULL，
+                                        * 防止 kfree(野指针) → heap 元数据破坏 → HardFault */
             size_t free_before = kmem_free_size();
             size_t max_before  = kmem_max_free_block();
             int ok = 1;
+            int fail_at = -1;
             for (int i = 0; i < VT3_NMEM; i++) {
                 p[i] = kmalloc(sizes[i]);
-                if (!p[i]) { ok = 0; break; }
+                if (!p[i]) { ok = 0; fail_at = i; break; }
                 memset(p[i], (int)(g_vt3_rounds + i + 0x33u), sizes[i]);
             }
             for (int i = 0; i < VT3_NMEM; i++) {
-                if (p[order[i]]) kfree(p[order[i]]);
+                if (p[order[i]]) kfree(p[order[i]]);   /* NULL check + NULL 初始化 = 永远安全 */
             }
             size_t free_after = kmem_free_size();
             size_t max_after  = kmem_max_free_block();
@@ -1601,7 +1605,14 @@ static void vt_task_ctrl(void *arg) {
                 shell_put_uint32((free_after > free_before) ?
                                  (free_after - free_before) :
                                  (free_before - free_after));
-                sh_puts("B]");
+                sh_puts("B");
+                if (!ok) {
+                    sh_puts(" (NOMEM at block #");
+                    shell_put_uint32((uint32_t)fail_at);
+                    sh_puts(", size="); shell_put_uint32(sizes[fail_at]);
+                    sh_puts("B)");
+                }
+                sh_puts("]");
             }
             sh_crlf();
         }
@@ -1730,13 +1741,13 @@ static int cmd_vtest(int argc, char **argv) {
 
         sh_puts("vtest: Creating 3 validation tasks...\r\n");
         sh_puts("  VT1 (led_beat)      : stack=384, weight=1 — LED flip every 500ms\r\n");
-        sh_puts("  VT2 (oled_refresh) : stack=768, weight=1 — 1024B GDRAM every 2s via I2C");
+        sh_puts("  VT2 (oled_refresh) : stack=1536, weight=1 — 1024B GDRAM every 2s via I2C");
         sh_puts(" bus="); shell_put_uint32(bus); sh_puts(" addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf();
-        sh_puts("  VT3 (ctrl_pressure): stack=768, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
+        sh_puts("  VT3 (ctrl_pressure): stack=1024, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
 
         g_vt1 = task_create("vt_led",   vt_task_led,   NULL, 384, 1);
-        g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 768, 1);
-        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 768, 2);
+        g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 1536, 1);  /* 768 溢出：block[256]+i2c_write_blocking SDK 调用栈+PendSV 64B+TIMER_IRQ 嵌套 → 25 轮后踩坏 heap header */
+        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 1024, 2);  /* 768 紧张：sizes[8]+order[8]+p[8]=72B + sh_puts 调用栈 */
 
         if (!g_vt1 || !g_vt2 || !g_vt3) {
             sh_puts("vtest: task_create FAILED (heap exhausted?)\r\n");
