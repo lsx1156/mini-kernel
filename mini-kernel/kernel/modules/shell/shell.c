@@ -195,6 +195,7 @@ static int cmd_list(int argc, char **argv);
 static int cmd_boot(int argc, char **argv);
 static int cmd_factory_reset(int argc, char **argv);
 static int cmd_vtest(int argc, char **argv);
+static int cmd_jobs(int argc, char **argv);
 
 /* —— vtest: 三任务嵌套调度稳定性验证（v2.2.5 调度系统完全正常的验证工具）
  *   VT1 (vt_led): 板载 LED 500ms 心跳翻转 → 验证 SLEEP→READY 轮转
@@ -256,6 +257,7 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "I2C 主机子命令：扫描总线/读写/寄存器访问" },
     { "vtest",   cmd_vtest,   "vtest start [bus] [addr] | stop | status",
                                                     "三任务嵌套调度验证: start=启动VT1(LED心跳)/VT2(OLED刷新)/VT3(压力+嵌套suspend-resume); status=查看三任务计数器; stop=销毁三任务" },
+    { "jobs",    cmd_jobs,    "jobs",                  "列出用户创建的后台任务（类似 Linux jobs）" },
     { "save",    cmd_save,    "save <any command...>",
                                                     "把任意命令追加到 Flash 固化区（不立即执行；下次开机自动执行）" },
     { "unsave",  cmd_unsave,  "unsave <idx> | all",   "删除固化命令：按序号或一键清空" },
@@ -1690,7 +1692,56 @@ static void vt_task_ctrl(void *arg) {
     #undef VT3_NMEM
 }
 
-/* — cmd_vtest: vtest start/stop/status 主入口 */
+/* vtest_stop_all: 提取的停止+清理逻辑，供 cmd_vtest stop 和 Ctrl+C 共用 */
+static void vtest_stop_all(void) {
+    g_vtest_running = 0;
+    if (g_vt2 && g_vt2->state == TASK_STATE_SUSPEND) task_resume(g_vt2);
+    if (g_vt1) task_wakeup(g_vt1);
+    if (g_vt2) task_wakeup(g_vt2);
+    if (g_vt3) task_wakeup(g_vt3);
+    hal_systick_delay_us(5000);
+    if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
+    if (g_vt2) { task_destroy(g_vt2); g_vt2 = NULL; }
+    if (g_vt3) { task_destroy(g_vt3); g_vt3 = NULL; }
+    {
+        register const uint32_t SIO_BASE = 0xD0000000u;
+        register const uint32_t MASK25   = 0x02000000u;
+        *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;
+    }
+    g_vt1_beats = g_vt2_frames = g_vt2_errs = 0;
+    g_vt3_rounds = g_vt3_susps = g_vt3_rsms = 0;
+}
+
+/* — cmd_jobs: 列出用户创建的后台任务（类似 Linux jobs）
+ *   跳过内核任务（idle/boot_setup/shell），只显示 ID >= 3 的用户任务 */
+static int cmd_jobs(int argc, char **argv) {
+    (void)argc; (void)argv;
+    sh_crlf();
+    sh_puts("=== Background Jobs ===\r\n");
+    int found = 0;
+    for (int i = 0; i < OS_CFG_MAX_TASKS; i++) {
+        tcb_t *t = g_task_pool[i];
+        if (!t) continue;
+        /* 跳过内核任务：idle(0) / boot_setup(1) / shell(2) */
+        if (t->id <= 2) continue;
+        found++;
+        sh_puts("  [");
+        shell_put_uint32((uint32_t)found);
+        sh_puts("] ID="); shell_put_uint32(t->id);
+        sh_puts("  "); sh_puts(t->name);
+        int pad = 12 - (int)strlen(t->name);
+        if (pad < 0) pad = 0;
+        shell_pad_spaces(pad);
+        sh_puts(task_state_str(t->state));
+        sh_puts("\r\n");
+    }
+    if (!found) {
+        sh_puts("  (no background jobs)\r\n");
+    }
+    sh_puts("Tip: Ctrl+C stops vtest; 'kill <id>' destroys a single task.\r\n");
+    return 0;
+}
+
 static int cmd_vtest(int argc, char **argv) {
     if (argc < 2) {
         sh_puts("Usage: vtest start [bus] [addr] | status | stop\r\n");
@@ -1728,36 +1779,7 @@ static int cmd_vtest(int argc, char **argv) {
             sh_puts("vtest: not running. Try 'vtest start'.\r\n");
             return 1;
         }
-        g_vtest_running = 0;        /* 三个任务的 while 循环退出 */
-
-        /* 确保所有被 suspend 的任务先 resume，否则 task_destroy
-         *   处理不了不在任何队列的 SUSPEND 任务。*/
-        if (g_vt2 && g_vt2->state == TASK_STATE_SUSPEND) task_resume(g_vt2);
-
-        /* 唤醒所有仍在 SLEEP 的任务 → READY → 下一 tick 它们会跑完退出 */
-        if (g_vt1) { task_wakeup(g_vt1); }
-        if (g_vt2) { task_wakeup(g_vt2); }
-        if (g_vt3) { task_wakeup(g_vt3); }
-
-        /* 给它们 1 tick 跑完退出路径（noreturn 不会真 return 但任务
-         *   结构体已标记 DEAD 或从 pool 移除后再销毁更安全）*/
-        hal_systick_delay_us(5000);
-
-        /* kill 三个任务（安全销毁 TCB + 栈内存）*/
-        if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
-        if (g_vt2) { task_destroy(g_vt2); g_vt2 = NULL; }
-        if (g_vt3) { task_destroy(g_vt3); g_vt3 = NULL; }
-
-        /* 灭 LED（确保回到干净状态） */
-        {
-            register const uint32_t SIO_BASE = 0xD0000000u;
-            register const uint32_t MASK25   = 0x02000000u;
-            *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;
-        }
-        /* 计数器清零，下次 start 从零开始 */
-        g_vt1_beats = g_vt2_frames = g_vt2_errs = 0;
-        g_vt3_rounds = g_vt3_susps = g_vt3_rsms = 0;
-
+        vtest_stop_all();
         sh_puts("OK: vtest stopped. 3 tasks destroyed, LED OFF.\r\n");
         sh_puts("Tip: Run 'ps' + 'heap' to confirm tasks gone + heap recovered fully.\r\n");
         return 0;
@@ -1932,6 +1954,18 @@ static void task_shell(void *arg) {
         }
 
         switch (c) {
+            case 0x03:  /* Ctrl+C — Linux 风格中断：停止后台任务 + 清空输入行 */
+                sh_puts("^C");
+                sh_crlf();
+                if (g_vtest_running) {
+                    sh_puts("[Interrupt] Stopping vtest...\r\n");
+                    vtest_stop_all();
+                    sh_puts("[Interrupt] vtest stopped. LED OFF.\r\n");
+                }
+                g_shell_pos = 0;
+                sh_puts(SHELL_PROMPT_STR);
+                break;
+
             case '\r':   /* 回车 → Mac/Windows 终端行结束 */
             case '\n':   /* 换行 → Unix 终端行结束 */
                 sh_crlf();
