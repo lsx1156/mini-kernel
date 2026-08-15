@@ -8,6 +8,7 @@
 > · 修复 boot_setup 任务自挂起后被 task_sleep "复活" 导致 g_task_pool[] 指针重复覆盖 → ps 乱码/LED 爆闪
 > · 修复 SHELL_TASK_STACK 768B 不足 → cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动 + 中断栈帧 → 栈溢出踩坏 TCB
 > · 所有 demo 任务 / shell / idle / boot_setup 状态机与队列归属契约 100% 符合设计，长时间运行无异常
+> · 新增 `vtest` 三任务嵌套调度验证命令（LED 心跳 / OLED 刷新 / 压力+嵌套 suspend-resume），使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
 
 ---
 

@@ -401,6 +401,587 @@ mk> msc mount
 
 ***
 
+## 🎓 完整使用教程（Linux man 风格）
+
+本章节按 Linux man 手册风格组织，按使用场景分模块讲解。每个命令包含**语法 / 参数 / 返回 / 示例 / 错误 / 注意事项**六段式说明。
+
+### man 1: 系统启动 & 交互模式
+
+#### 启动流程
+
+```
+上电 → boot2 → crt0 → main() → kernel_main()
+                                   │
+                                   ├─ kmem_init / task_module_init / sched_init (关中断)
+                                   ├─ 创建 boot_setup 任务 (SUSPEND 后永久挂起)
+                                   ├─ hal_systick_init (ALARM3 + TIMER_IRQ_3, 1kHz)
+                                   └─ sched_start → SVC 切到第一个任务 (boot_setup)
+                                              │
+                                              ├─ hal_systick_init → cpsie i
+                                              ├─ 打印 banner
+                                              ├─ demo_app_init → 创建 shell 任务
+                                              │   └─ shell_start → bootscript_run_all (回放 save/! 固化命令)
+                                              │                   → 进入 shell 主循环
+                                              ├─ fatfs_init_and_mount (首启动自动 f_mkfs FAT16)
+                                              └─ task_suspend(self) → 永久 SUSPEND (不再调度)
+```
+
+#### 交互模式特点（v2.2 起）
+
+* **纯同步交互式**：用户输入命令 → 解析 → 执行 → 打印结果 → 等下一条命令
+* **无异步后台任务刷屏**：心跳/内存压力/ctrl 任务不再创建，避免打断用户输入
+* **唯一持续运行的任务**：`shell` (ID=2)。idle 任务作为调度器兜底，不主动打印
+* **特殊场景**：`vtest` 验证命令会临时创建后台任务并打印日志（用户主动触发）
+
+#### 提示符与命令格式
+
+```
+mk> <command> [arg1] [arg2] ...
+```
+
+* `mk>` = Mini Kernel 提示符
+* 命令大小写敏感（`PS` 不识别，必须 `ps`）
+* 参数用空格分隔；十六进制需 `0x` 前缀（`0x3C` ≠ `3C`）
+* 退格 / DEL 支持，方向键不支持
+* 命令最大长度 128 字节，最多 16 个参数
+* 行结束支持 `\r` / `\n` / `\r\n`，跨平台兼容
+
+### man 2: 任务管理命令
+
+#### ps — 列出所有任务
+
+**语法**：`ps`
+
+**输出列**：
+
+| 列名 | 含义 |
+|---|---|
+| ID | 任务 ID（创建顺序，0=idle, 1=boot_setup, 2+=用户任务）|
+| Name | 任务名（task_create 时传入，最长 12 字符）|
+| State | READY / RUNNING / SLEEP / SUSPEND / DEAD |
+| TicksLeft | 若 SLEEP 状态，剩余唤醒 tick 数；其他状态为 0 |
+| StackBase | 任务栈顶地址（堆分配），用于调试 |
+| StackSize | 栈大小（字节）|
+| StackOK | Y=栈未溢出；N=栈溢出（应立即排查）|
+
+**示例**：
+
+```
+mk> ps
+
+--- Task List ---
+ID  Name        State     TicksLeft  StackBase  StackSize  StackOK
+0   idle        READY    0 0x200027E8 256 Y
+1   boot_setup  SUSPEND  0 0x200058A8 2048 Y
+2   shell       RUNNING  0 0x200060F0 2048 Y
+Cur: shell
+-----------------
+```
+
+**注意事项**：
+* `Cur: <name>` 显示当前正在运行的任务
+* `StackOK=N` 说明栈溢出，需检查 task_create 的 size 参数
+* ID 出现 `536883988` 等乱码值 → TCB 损坏（已在 v2.2.5 修复）
+* `boot_setup` 永远是 SUSPEND，不会复活（v2.2.5 保证）
+
+#### suspend / resume / kill — 任务控制
+
+**语法**：
+
+```
+suspend <id>     # 挂起指定任务（移出所有队列，不参与调度）
+resume  <id>     # 恢复挂起的任务（重新进入就绪队列）
+kill   <id>      # 销毁任务（TCB + 栈内存回收，不可恢复）
+```
+
+**示例**：
+
+```
+mk> ps                          # 假设有 ID=3 的 vt_led 任务
+mk> suspend 3                   # 挂起 vt_led → LED 停止闪烁
+mk> ps                          # vt_led 的 State = SUSPEND
+mk> resume 3                    # 恢复 vt_led → LED 继续闪烁
+mk> kill 3                      # 销毁 vt_led（不可恢复）
+```
+
+**注意事项**：
+* `suspend` 和 `resume` 必须配对，挂起后任务不会被任何 tick 唤醒
+* `kill` 会立即回收 TCB 和栈内存，再次 `ps` 该任务消失
+* 不能 `kill 0`（idle）或 `kill 1`（boot_setup），会返回错误
+* 自挂起（`suspend <self_id>`）会触发 PendSV 立即切换到下一个任务
+
+### man 3: 系统诊断命令
+
+#### heap / tick / version / syscalls — 系统信息
+
+**语法**：
+
+```
+heap              # 内核堆空闲字节 + 最大连续空闲块
+tick              # 当前系统 tick（@1kHz = 自启动毫秒数）
+version           # 内核版本 + 编译宏配置
+syscalls          # SVC 系统调用契约表（开发者参考）
+```
+
+**示例**：
+
+```
+mk> heap
+Heap free     = 3952 B
+Heap max blk  = 3952 B          ← 零碎片：free == max_block 说明堆完全连续
+
+mk> tick
+Tick = 465249  (@1000 Hz)       ← 系统已运行 465 秒
+
+mk> version
+Kernel version: 2.2.5 ✅ STABLE
+Config: MAX_TASKS=16  HEAP=8192B  TICK_HZ=1000  TIME_SLICE=5
+PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
+```
+
+**解读技巧**：
+* `heap free` 与 `max blk` 相等 = 零碎片；差值越大碎片越严重
+* `tick` 长时间不增长 = 调度器卡死（HardFault 或死循环）
+* `version` 显示编译时的 `OS_CFG_*` 宏，用于确认裁剪配置
+
+### man 4: 持久化指令（Bootscript）
+
+Bootscript 是 Mini Kernel 的"开机自启"机制，类似 Linux 的 `/etc/rc.local` 或 systemd unit。
+
+#### save / ! / list / unsave — 固化命令
+
+**语法**：
+
+```
+! <command> [args...]     # 立即执行 + 固化到 Flash（双备份 + CRC8）
+save <command> [args...]  # 仅固化，不立即执行
+list                      # 列出所有固化条目
+unsave <id>               # 删除指定序号条目（0-based）
+unsave all                # 清空所有固化条目
+```
+
+**存储规格**：
+* 容量：32 条命令 × 123 字节
+* 位置：Flash 末尾 `0x1FF000` / `0x1FF000+4096` 双备份扇区
+* 校验：CRC8，开机自动对比 A/B 两份，损坏的扇区自动恢复
+
+**示例（OLED 初始化场景）**：
+
+```
+# 一键保存 17 条 OLED 初始化命令到 Flash
+mk> save i2c init 0 4 5 100000
+mk> save i2c cmds 0 0x3C 0xAE
+mk> save i2c cmds 0 0x3C 0xD5 0x80
+# ... 共 17 条
+mk> list
+Persistent commands (used 17, free 15/32 slots, Flash 2x backup):
+  #0: i2c init 0 4 5 100000
+  #1: i2c cmds 0 0x3C 0xAE
+  ...
+
+# 立即执行 + 固化（! 前缀）
+mk> ! led on                # LED 立刻亮 + 固化"led on"到下次开机
+
+# 删除第 5 条
+mk> unsave 5
+
+# 全部清空（回到出厂状态）
+mk> unsave all
+```
+
+**注意事项**：
+* `save` 不立即执行，需重启或 `boot exec` 才跑
+* `!` 立即执行 + 固化（原子操作）
+* 固化命令过长（>123B）会被静默截断，建议拆分
+* `factory_reset` 会擦除 Bootscript + 末尾保留区，但保留固件本身
+
+#### boot exec / boot status / boot flash_test — 启动控制
+
+```
+boot exec         # 立即同步回放所有固化命令（不等下次开机）
+boot status       # 查看本次开机 bootscript 回放结果（OK / FAIL / 每条展开）
+boot flash_test   # SPI Flash HAL 自检：A/B 扇区擦写读 CRC 一致性
+```
+
+**使用场景**：
+* 刚 `save` 完一批命令，不想重启 → `boot exec` 立即跑
+* 开机时 banner 没看清 → `boot status` 看 RAM 常驻回放结果
+* 怀疑 Flash 硬件故障 → `boot flash_test` 自检
+
+### man 5: 外设子命令（GPIO / I2C）
+
+#### gpio — 通用 IO 控制
+
+```
+gpio help                                 # 子命令总览
+gpio init <pin> [in|out] [0|1]            # 初始化引脚（默认 out, 0）
+gpio read <pin>                           # 读取引脚电平
+gpio write <pin> 0|1                      # 写引脚
+gpio toggle <pin>                         # 翻转引脚
+```
+
+**示例**：
+
+```
+mk> gpio init 25 out 1         # GPIO25 (LED) 输出高
+mk> gpio toggle 25             # 翻转 LED
+mk> gpio read 15               # 读 GP15 电平
+```
+
+#### i2c — I2C 主机控制
+
+```
+i2c help                                           # 子命令总览
+i2c init <bus> <sda> <scl> <hz>                    # 初始化 I2C 总线
+i2c scan <bus>                                     # 扫描 7-bit 地址 0x08..0x77
+i2c wr  <bus> <addr> <byte0> [byte1] ...           # 主机写（最多 16 字节）
+i2c rd  <bus> <addr> <len>                         # 主机读 len 字节
+i2c cmds <bus> <addr> <cmd0> [cmd1] ...            # 发命令序列（如 OLED 寄存器配置）
+i2c fill <bus> <addr> <byte> <count>               # 填充 count 字节相同数据（用于 GDRAM 刷新）
+i2c memwr <bus> <addr> <reg> <data>                # 写寄存器（先发 reg 再发 data）
+i2c memrd <bus> <addr> <reg> <len>                 # 读寄存器
+```
+
+**地址格式**：必须 `0x` 前缀，如 `0x3C`（7-bit 地址，不含 R/W 位）
+
+**示例（OLED SSD1306 完整初始化）**：
+
+```
+# 1. 初始化 I2C0：SDA=GP4, SCL=GP5, 100kHz
+mk> i2c init 0 4 5 100000
+
+# 2. 扫描设备
+mk> i2c scan 0                  # 期望看到 0x3C
+
+# 3. 发送 SSD1306 初始化序列（17 条命令）
+mk> i2c cmds 0 0x3C 0xAE        # display off
+mk> i2c cmds 0 0x3C 0xD5 0x80   # display clk div
+mk> i2c cmds 0 0x3C 0xA8 0x3F   # multiplex 1/64
+mk> i2c cmds 0 0x3C 0xD3 0x00   # display offset
+mk> i2c cmds 0 0x3C 0x40        # display start line
+mk> i2c cmds 0 0x3C 0x8D 0x14   # charge pump enable
+mk> i2c cmds 0 0x3C 0x20 0x00   # horizontal addressing mode
+mk> i2c cmds 0 0x3C 0xA1        # segment remap
+mk> i2c cmds 0 0x3C 0xC8        # COM scan direction
+mk> i2c cmds 0 0x3C 0xDA 0x12   # COM pins config
+mk> i2c cmds 0 0x3C 0x81 0xCF   # contrast
+mk> i2c cmds 0 0x3C 0xD9 0xF1   # pre-charge period
+mk> i2c cmds 0 0x3C 0xDB 0x40   # VCOMH deselect
+mk> i2c cmds 0 0x3C 0xA4        # resume display
+mk> i2c cmds 0 0x3C 0xA6        # normal display
+mk> i2c cmds 0 0x3C 0xAF        # display on
+
+# 4. 测试：全屏亮 → 全屏黑
+mk> i2c fill 0 0x3C 0xFF 1024   # 128×64 = 1024B 全亮
+mk> i2c fill 0 0x3C 0x00 1024   # 全黑
+```
+
+**一键持久化**（开机自动初始化 OLED）：
+
+```
+mk> save i2c init 0 4 5 100000
+mk> save i2c cmds 0 0x3C 0xAE
+# ... 17 条
+# 下次开机会自动按顺序回放
+```
+
+### man 6: vtest 三任务嵌套调度验证（v2.2.5 新增）
+
+`vtest` 是验证调度系统完全正常的核心工具。创建 3 个并发任务，通过嵌套依赖关系一次性验证时间片轮转、SLEEP 队列、SUSPEND 状态机、堆零碎片、TCB 队列契约。
+
+**语法**：
+
+```
+vtest start [bus] [addr]    # 启动 3 任务验证（默认 OLED bus=0, addr=0x3C）
+vtest status                # 查看三任务计数器 + 堆快照
+vtest stop                  # 停止验证 + 销毁 3 任务 + 灭 LED
+```
+
+**快速启动**：
+
+```
+mk> vtest start             # 用默认 OLED 配置启动
+mk> ps                       # 看到 6 个任务
+mk> vtest status             # 查看计数器
+mk> vtest stop               # 停止验证
+```
+
+详见下方【vtest 案例分析】章节。
+
+### man 7: 文件系统 & U 盘管理
+
+#### msc — U 盘介质控制
+
+```
+msc help                    # 子命令总览
+msc status                  # 分区总览：容量 / 已用 / 空闲 / ejected / mounted
+msc mount                   # 让电脑可写（Shell 只读）
+msc eject                   # 让 Shell 可写（电脑显示无介质）
+msc format                  # 两步确认 → f_mkfs FAT16 → 重新挂载
+```
+
+**互斥原则**（重要）：
+
+| 状态 | 电脑 U 盘 | Shell 文件操作 |
+|---|---|---|
+| ejected=true | "请插入磁盘" | 可 mkdir/rmdir/rm/cat（读写）|
+| ejected=false | 可读写 U 盘 | 只能 ls/cat（只读）|
+
+#### ls / cd / pwd / mkdir / rmdir / rm / cat — 目录命令
+
+```
+pwd                         # 当前工作目录（绝对路径）
+ls [path]                   # 列目录（文件 + <DIR> + 大小）
+cd <path>                   # 切换目录（支持 / .. 相对路径）
+mkdir <name>                # 创建子目录（需 ejected=true）
+rmdir <name>                # 删除空目录
+rm <file>                   # 删除文件
+cat <file>                  # 十六进制 + ASCII dump 查看文件
+```
+
+**示例**：
+
+```
+mk> pwd
+/
+
+mk> mkdir docs              # 需先 msc eject
+mk> ls
+drwxrwxrwx        0  docs/
+
+mk> cd docs
+mk> pwd
+/docs
+
+mk> cat hello.txt
+00000000  48 65 6C 6C 6F 2C 20 50  69 63 6F 20 4D 69 6E 69  |Hello, Pico Mini|
+00000010  20 4B 65 72 6E 65 6C 21  0A                       | Kernel!.|
+OK: 18 bytes read.
+```
+
+### man 8: 系统维护命令
+
+#### factory_reset — 出厂重置
+
+```
+factory_reset               # 仅打印警告（安全，不执行）
+factory_reset confirm        # 真正执行：擦 Bootscript A/B + 末尾 64KB
+```
+
+**影响范围**：Bootscript 固化区 + 保留区；**保留**固件本身（kernel + app）。
+
+**使用场景**：
+* 固化了错误命令导致启动异常
+* 想把设备完全恢复到出厂状态
+* Flash 数据分区损坏需重建
+
+#### clear / led — 辅助命令
+
+```
+clear | cls                 # 清屏 + 光标左上角（VT100）
+led on | off | toggle       # 控制 GPIO25 LED
+```
+
+***
+
+## 🧪 vtest 三任务嵌套调度验证案例分析
+
+vtest 是 v2.2.5 调度系统完全正常的核心证明工具。本章节深度剖析其设计原理、嵌套关系、代码实现、能验证什么。
+
+### 设计目标
+
+一次性验证调度系统的 **5 大契约**：
+
+| 契约 | 验证机制 |
+|---|---|
+| 1. 时间片轮转（非抢占）| VT2 阻塞 I2C 期间 VT1 继续跳 |
+| 2. SLEEP 队列正确轮转 | VT1/VT2/VT3 各自 task_sleep 后能按时唤醒 |
+| 3. SUSPEND 状态隔离 | VT3 挂起 VT2 时，VT1 不受影响 |
+| 4. 堆零碎片 | VT3 每 10s alloc 8 块乱序 free，free 不变 |
+| 5. TCB 队列不损坏 | 长跑 5min+ 后 ps 仍显示干净任务列表 |
+
+### 三个任务的角色与嵌套关系图
+
+```
+       ┌─────────────────────────────────────────────────┐
+       │            vtest start 一条命令                  │
+       └────────────────────┬────────────────────────────┘
+                            │ task_create × 3
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+    ┌─────────────┐ ┌─────────────┐ ┌──────────────┐
+    │ VT1 (vt_led)│ │VT2(vt_oled) │ │VT3 (vt_ctrl) │
+    │  stack=384  │ │  stack=768  │ │  stack=768   │
+    │  weight=1   │ │  weight=1   │ │  weight=2    │
+    └──────┬──────┘ └──────┬──────┘ └──────┬───────┘
+           │               │               │
+           │ 独立循环       │ 独立循环       │ 独立循环
+           │ LED 翻转      │ 刷 OLED       │ alloc/free
+           │ task_sleep    │ 1024B I2C     │ + 操作 VT2 状态
+           │ (500ms)       │ task_sleep    │ task_suspend(VT2)
+           │               │ (2s)          │ task_sleep(3s)
+           │               │               │ task_resume(VT2)
+           │               │               │ task_sleep(7s)
+           │               │               │
+           ▼               ▼               ▼
+    LED 心跳 ~2Hz      OLED 每 2s      每 10s 一轮 Round
+    (验证轮转)         换图案          (验证堆零碎片 +
+                                      嵌套 suspend/resume)
+           │               │  ▲           │
+           │               │  │resume     │suspend
+           │               │  │           │
+           │     ┌─────────┴──┴───────────┘
+           │     │  VT3 → VT2 嵌套控制
+           │     │  (VT3 修改 VT2 的状态)
+           ▼     ▼
+      现象：每 13s OLED 冻结 3s，但 LED 继续跳
+```
+
+**嵌套关系总结**：
+* VT3 操作 VT2 的状态（suspend/resume）→ 嵌套依赖 #1
+* VT2 被 VT3 挂起期间，VT1 不受影响 → 嵌套依赖 #2
+* VT3 自己 task_sleep 让出 CPU 给 VT1/VT2 → 嵌套依赖 #3
+
+### VT1 代码剖析：为什么 LED 心跳能证明轮转正常
+
+[shell.c: vt_task_led](file:///E:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c#L1481-L1498)
+
+```c
+static void vt_task_led(void *arg) {
+    register const uint32_t SIO_BASE = 0xD0000000u;
+    register const uint32_t MASK25   = 0x02000000u;
+    uint8_t on = 0;
+    while (g_vtest_running) {
+        on = !on;
+        if (on) *(volatile uint32_t *)(SIO_BASE + 0x014) = MASK25;  // OUT_SET
+        else    *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;  // OUT_CLR
+        g_vt1_beats++;
+        task_sleep(500);   // ← 关键：500ms SLEEP
+    }
+}
+```
+
+**为什么能证明轮转正常**：
+
+1. `task_sleep(500)` 把 VT1 状态改为 SLEEP，移入睡眠队列
+2. 500 tick 后 `sched_sleep_tick` 把 VT1 移回就绪队列
+3. `sched_do_switch` 选中 VT1 → 翻转 LED → 再次 sleep
+4. **如果 VT2 正在阻塞 I2C，VT1 仍能每 500ms 准时翻转** → 证明 tick 中断（1ms）照样进 → kernel_tick_hook 照样递减 → 时间片耗尽照样 PendSV 切换
+
+**失败现象**：LED 停跳或变慢 → 调度器卡死或 VT2 阻塞太久未切走
+
+### VT2 代码剖析：I2C 阻塞期间调度器如何切走
+
+[shell.c: vt_task_oled](file:///E:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c#L1506-L1557)
+
+```c
+static void vt_task_oled(void *arg) {
+    uint8_t block[256];
+    block[0] = 0x40;  // D/C=1: 后续为 GDRAM 数据
+
+    while (g_vtest_running) {
+        // 5 chunks × 255B = 1275B (截断到 1024B 有效)
+        for (uint8_t c = 0; c < 5; c++) {
+            // 动态生成棋盘格图案
+            for (uint16_t i = 1; i <= 255; i++) {
+                block[i] = (pat_row & 1) ?
+                          (0x55 + (frame & 0xFF)) :
+                          (0xAA ^ (frame & 0xFF));
+                // ...
+            }
+            hal_err_t r = hal_i2c_tx(bus, addr, block, chunk_sz + 1);
+            // hal_i2c_tx 是忙等 I2C 硬件，不主动 yield
+            // 但 tick 中断照样进 → 时间片耗尽 → PendSV 切走
+        }
+        g_vt2_frames++;
+        task_sleep(2000);  // 2s SLEEP
+    }
+}
+```
+
+**关键洞察**：`hal_i2c_tx` 是**忙等阻塞**（不主动 yield），但这不影响其他任务：
+
+1. RP2040 1kHz tick 中断（TIMER_IRQ_3）**总是能进**（中断优先级 > 任务）
+2. `kernel_tick_hook` 递减 VT2 的 time_slice
+3. time_slice 归零 → `hal_yield_trigger` 设 PENDSVSET
+4. PendSV 在 TIMER_IRQ 退出后立即触发 → 切到 VT1 或 shell
+5. VT1 跑 500ms 后 sleep → 又切回 VT2 继续 I2C 发送
+
+**这就是"时间片轮转非抢占"的正确性证明**：即使一个任务不主动让出 CPU，调度器也能通过 tick 中断强制切走它。
+
+### VT3 代码剖析：嵌套 suspend/resume + 堆压力测试
+
+[shell.c: vt_task_ctrl](file:///E:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c#L1569-L1627)
+
+```c
+static void vt_task_ctrl(void *arg) {
+    size_t sizes[8] = { 32, 64, 128, 96, 256, 48, 160, 80 };
+    int    order[8] = { 3,0,7,2,5,1,6,4 };  // 乱序释放
+
+    while (g_vtest_running) {
+        g_vt3_rounds++;
+
+        // ① 堆压力测试：alloc 8 块 → 写数据 → 乱序 free
+        size_t free_before = kmem_free_size();
+        for (int i = 0; i < 8; i++) {
+            p[i] = kmalloc(sizes[i]);
+            memset(p[i], 0x33 + i, sizes[i]);
+        }
+        for (int i = 0; i < 8; i++) kfree(p[order[i]]);
+        size_t free_after = kmem_free_size();
+        // 验证 free_before == free_after（零碎片）
+
+        // ② 嵌套 suspend/resume VT2
+        if (g_vt2) {
+            task_suspend(g_vt2);     // VT2 → SUSPEND, OLED 冻结
+            task_sleep(3000);         // 3s 内 VT1 继续跳, VT2 不动
+            task_resume(g_vt2);      // VT2 → READY, OLED 恢复
+        }
+
+        task_sleep(7000);            // 下一轮（总周期 ~10s）
+    }
+}
+```
+
+**为什么能验证 SUSPEND 状态隔离**：
+
+1. `task_suspend(g_vt2)` 把 VT2 移到 SUSPEND 状态（不在任何队列）
+2. VT3 自己 `task_sleep(3000)` 进入 SLEEP
+3. 这 3s 内，调度器只能从 VT1 + idle 中选 → VT1 继续每 500ms 翻转 LED
+4. **VT2 被 SUSPEND 完全不影响 VT1** → 证明状态机隔离正确
+
+**为什么能验证堆零碎片**：
+
+1. 每 10s 分配 8 块不同大小（32~256B）
+2. 按乱序释放（模拟真实使用场景）
+3. `free_before == free_after && max_before == max_after` → 零碎片
+4. 如果堆有碎片，差值会累积增长
+
+### 7 项验证清单详解
+
+| # | 验证项 | 现象 | 失败说明 |
+|---|---|---|---|
+| 1 | LED 永不停跳 | GPIO25 约 2Hz 稳定翻转 | 调度器卡死 / PendSV 未触发 |
+| 2 | OLED 每 2s 换图案 | 屏幕整体换棋盘格 | VT2 未被调度 / I2C NACK |
+| 3 | 每 13s OLED 冻结 3s | VT3 Round 时 OLED 停 | suspend 未生效 |
+| 4 | 冻结期间 LED 继续跳 | VT1 不受 VT2 SUSPEND 影响 | 状态机隔离破坏 |
+| 5 | `vtest status` 计数器单调递增 | beats/frames/rounds 都增长 | 某任务卡死 |
+| 6 | `ps` 显示 6 个干净任务 | ID=0~5, State 合法 | TCB 损坏 / 队列重复入队 |
+| 7 | `vtest stop` 后 heap 恢复 | 等于 start 前 | 内存泄漏 / TCB 未回收 |
+
+### 通过 vtest 学到的调度器知识
+
+1. **时间片轮转 = tick 中断驱动**：即使任务不主动 yield，tick 也会强制切换
+2. **SLEEP 队列 = 有序链表**：`ticks_to_sleep` 递增排序，O(n) 插入
+3. **SUSPEND = 完全隔离**：不在就绪/睡眠队列，不会被任何 tick 唤醒
+4. **状态机契约**：每个状态对应唯一队列归属，跨队列操作必崩
+5. **堆零碎片**：首次适配 + 合并相邻空闲块，乱序 free 不产生碎片
+6. **TCB 池保护**：`g_task_pool[]` 指针必须干净，重复创建会覆盖悬空
+
+***
+
+
+
 ## 🛠️ 配置裁剪总开关 ([os\_config.h](file:///E:/ppCD/project/mini-kernel/include/os_config.h))
 
 > 修改 mini-kernel/include/os\_config.h，cmake 自动解析并传递编译宏。

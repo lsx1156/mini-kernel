@@ -161,6 +161,34 @@ static int cmd_unsave(int argc, char **argv);
 static int cmd_list(int argc, char **argv);
 static int cmd_boot(int argc, char **argv);
 static int cmd_factory_reset(int argc, char **argv);
+static int cmd_vtest(int argc, char **argv);
+
+/* —— vtest: 三任务嵌套调度稳定性验证（v2.2.5 调度系统完全正常的验证工具）
+ *   VT1 (vt_led): 板载 LED 500ms 心跳翻转 → 验证 SLEEP→READY 轮转
+ *   VT2 (vt_oled): 每 2s 向 OLED SSD1306 写一帧棋盘格/计数器 → 验证 I2C 阻塞
+ *                 操作 (5 chunks × 1024B) 期间调度器能切走它，心跳继续跳
+ *   VT3 (vt_ctrl): 每 3s 一轮，malloc/free 压力 + suspend/resume VT2
+ *                 → 验证任务嵌套控制：VT3 操作 VT2 状态，期间 VT1 仍按时跳，
+ *                   heap alloc/free 后零碎片，状态机/队列不损坏
+ * —— */
+static tcb_t *g_vt1 = NULL;  /* LED 心跳任务句柄 */
+static tcb_t *g_vt2 = NULL;  /* OLED 刷新任务句柄 */
+static tcb_t *g_vt3 = NULL;  /* 压力/嵌套控制任务句柄 */
+static volatile uint8_t  g_vtest_running = 0;   /* 1=在跑，0=已停止/未启动 */
+static volatile uint8_t  g_vt_oled_bus  = 0;    /* VT2 用的 I2C 总线号 (0/1) */
+static volatile uint8_t  g_vt_oled_addr = 0x3C; /* VT2 用的 OLED 7-bit 地址 */
+/* 统计计数器（vtest status 展示）：用户可直观判断三个任务都在被调度 */
+static volatile uint32_t g_vt1_beats   = 0;  /* LED 心跳翻转次数 */
+static volatile uint32_t g_vt2_frames  = 0;  /* OLED 写 GDRAM 帧数 (含 NACK 失败) */
+static volatile uint32_t g_vt2_errs    = 0;  /* OLED I2C NACK 次数 */
+static volatile uint32_t g_vt3_rounds  = 0;  /* VT3 嵌套控制轮次 */
+static volatile uint32_t g_vt3_susps   = 0;  /* VT3 成功 suspend VT2 次数 */
+static volatile uint32_t g_vt3_rsms    = 0;  /* VT3 成功 resume VT2 次数 */
+
+/* 三个验证任务 entry（定义在 shell.c 末尾，cmd_vtest 旁边） */
+static void vt_task_led(void *arg);
+static void vt_task_oled(void *arg);
+static void vt_task_ctrl(void *arg);
 
 #undef cmd_save
 #undef cmd_unsave
@@ -193,6 +221,8 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "GPIO 子命令：初始化/读/写/翻转任意 RP2040 引脚" },
     { "i2c",     cmd_i2c,     "i2c help | init ... | scan | wr | rd | memwr | memrd",
                                                     "I2C 主机子命令：扫描总线/读写/寄存器访问" },
+    { "vtest",   cmd_vtest,   "vtest start [bus] [addr] | stop | status",
+                                                    "三任务嵌套调度验证: start=启动VT1(LED心跳)/VT2(OLED刷新)/VT3(压力+嵌套suspend-resume); status=查看三任务计数器; stop=销毁三任务" },
     { "save",    cmd_save,    "save <any command...>",
                                                     "把任意命令追加到 Flash 固化区（不立即执行；下次开机自动执行）" },
     { "unsave",  cmd_unsave,  "unsave <idx> | all",   "删除固化命令：按序号或一键清空" },
@@ -1436,6 +1466,305 @@ static int shell_exec_line(char *line) {
         }
     }
     return rc;
+}
+
+/* ================================================================
+ * vtest: 三任务嵌套调度稳定性验证 (v2.2.5)
+ *   · 三个并发任务嵌套依赖：VT3 操作 VT2 的状态，VT2 长时间 I2C 阻塞
+ *     期间 VT1 继续跑 → 完整验证时间片轮转 / SLEEP 队列 /
+ *     SUSPEND↔READY 状态切换 / 堆零碎片 / TCB 队列不损坏
+ * ================================================================ */
+
+/* — VT1: LED 心跳任务（500ms 翻转 GPIO25，与固化的 led 命令用同一 PIN 同一 SIO 寄存器）
+ *   不依赖 OS_CFG_PERIPH_SERVICE，任何裁剪开关下都能看到 LED 状态，
+ *   是调度器仍在正常轮转的"心跳指示器"。*/
+static void vt_task_led(void *arg) {
+    (void)arg;
+    register const uint32_t SIO_BASE = 0xD0000000u;
+    register const uint32_t MASK25   = 0x02000000u;
+    uint8_t on = 0;
+    while (g_vtest_running) {
+        on = !on;
+        if (on) {
+            *(volatile uint32_t *)(SIO_BASE + 0x014) = MASK25;  /* OUT_SET */
+        } else {
+            *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;  /* OUT_CLR */
+        }
+        g_vt1_beats++;
+        task_sleep(500);   /* 500ms at 1kHz tick — SLEEP 队列轮转验证 */
+    }
+    /* 被 kill 前：灭灯，避免一直亮着 */
+    *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;
+}
+
+/* — VT2: OLED 周期性刷新任务（每 2s 写一帧 1024B SSD1306 GDRAM）
+ *   帧内容：8 行 × 128 列棋盘格，叠加 g_vt2_frames 计数 byte，
+ *   这样肉眼能看到 OLED 在持续变化（即使没有逻辑分析仪）。
+ *   I2C 用 5 个 chunk × 255B 发送（与 i2c fill 命令完全相同）。
+ *   如果 OLED 初始化命令没跑（用户没 save 那 17 条 cmds），
+ *   这里也会 NACK 但不会崩，用户从 g_vt2_errs 可看到。*/
+static void vt_task_oled(void *arg) {
+    (void)arg;
+    /* 1024B frame buffer — 放栈上 (VT2 栈 768B，不够)。改为 256B chunk
+     * buffer，按 8 行 × 128 列 动态生成分块发送。SSD1306 的列指针在
+     * horizontal addressing mode 下自动 wrap，不会因为分 5 次
+     * START 断续发送 D/C=1 流而错位。*/
+    uint8_t block[256];
+    block[0] = 0x40;        /* D/C=1: 后续为 GDRAM 数据 */
+
+    while (g_vtest_running) {
+        uint32_t frame = g_vt2_frames;  /* 当前帧号（决定图案）*/
+        uint8_t  pat_row = 0;          /* 8 行一轮的棋盘行偏移 */
+
+        /* 5 chunks × (255 data+1 prefix) = 1280 bytes → 截断尾部多余的 256
+         *   实际写入前 1024 字节；SSD1306 128×64 bit = 1024 B，
+         *   指针 wrap 后多余字节会自然覆盖起点，不影响显示。*/
+        uint8_t chunk_byte = 0u;
+        for (uint8_t c = 0; c < 5; c++) {
+            /* 动态生成此 chunk 的 255 字节填充数据 */
+            for (uint16_t i = 1; i <= 255; i++) {
+                /* 128 列 / 8 = 16 字节 per page row；每 16 字节切换一次图案 */
+                uint8_t col_in_row = (uint8_t)((chunk_byte) & 0x0Fu);
+                (void)col_in_row;
+                uint8_t pattern;
+                if ((pat_row & 1u) != 0u) {
+                    pattern = (uint8_t)(0x55u + (uint8_t)(frame & 0xFFu));
+                } else {
+                    pattern = (uint8_t)(0xAAu ^ (uint8_t)(frame & 0xFFu));
+                }
+                block[i] = pattern;
+                chunk_byte++;
+                if ((chunk_byte & 0x0Fu) == 0u) {
+                    pat_row++;   /* 每 16 字节 = 走完一行 128 位的 8 像素 */
+                }
+            }
+            size_t chunk_sz = (c == 4) ? (size_t)(1024u - 4u * 255u) : 255u;
+            hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus,
+                                     (uint8_t)g_vt_oled_addr,
+                                     block, chunk_sz + 1u);
+            if (r != HAL_OK) g_vt2_errs++;
+            /* 【关键 · 阻塞式 I2C 切调度验证】
+             *   hal_i2c_tx 是忙等 I2C 硬件，不主动 yield。但系统 tick
+             *   (1ms) 每到就会进 TIMER_IRQ_3 → kernel_tick_hook →
+             *   time_slice 归零 → hal_yield_trigger → PendSV 切走。
+             *   所以即使 VT2 在"疯狂发 I2C"，VT1 依然应该每 500ms
+             *   准时翻转 LED —— 这就是"时间片轮转非抢占"的正确性证明。*/
+        }
+
+        g_vt2_frames++;
+        task_sleep(2000);   /* 2s at 1kHz tick — SLEEP 队列轮转验证 */
+    }
+}
+
+/* — VT3: 压力 + 嵌套控制任务（每 10s 一轮）
+ *   每一轮：
+ *     1) kmalloc 8 块不同大小 → 写数据 → 乱序 kfree（验证堆零碎片）
+ *     2) 如果 VT2 还在跑：task_suspend(VT2) → 等 3s → resume(VT2)
+ *        (VT2 被 suspend 的这 3s，OLED 应该停止刷新，帧号不涨，但
+ *         VT1 心跳还在继续 —— 这就是"嵌套控制 + SUSPEND 不影响其他任务")
+ *     3) 所有计数器 +1，进下一轮
+ *
+ *   ⚠️ 运行日志直接打印到串口（因为这是专门的验证任务，用户手动 start 触发的），
+ *   与"普通交互模式下仅命令触发输出"不冲突。 */
+static void vt_task_ctrl(void *arg) {
+    (void)arg;
+    #define VT3_NMEM 8
+    size_t sizes[VT3_NMEM] = { 32, 64, 128, 96, 256, 48, 160, 80 };
+    int    order[VT3_NMEM] = { 3,0,7,2,5,1,6,4 };
+
+    while (g_vtest_running) {
+        g_vt3_rounds++;
+        sh_puts("[VT3] Round #"); shell_put_uint32(g_vt3_rounds); sh_crlf();
+
+        /* ── ① 堆压力 (alloc + 写 + 乱序 free) ─────────────────── */
+        {
+            void *p[VT3_NMEM];
+            size_t free_before = kmem_free_size();
+            size_t max_before  = kmem_max_free_block();
+            int ok = 1;
+            for (int i = 0; i < VT3_NMEM; i++) {
+                p[i] = kmalloc(sizes[i]);
+                if (!p[i]) { ok = 0; break; }
+                memset(p[i], (int)(g_vt3_rounds + i + 0x33u), sizes[i]);
+            }
+            for (int i = 0; i < VT3_NMEM; i++) {
+                if (p[order[i]]) kfree(p[order[i]]);
+            }
+            size_t free_after = kmem_free_size();
+            size_t max_after  = kmem_max_free_block();
+            sh_puts("[VT3]   Heap: free_before="); shell_put_uint32(free_before);
+            sh_puts("B → after="); shell_put_uint32(free_after); sh_puts("B ");
+            if (ok && free_before == free_after && max_before == max_after) {
+                sh_puts("[ZERO-FRAGMENT OK]");
+            } else {
+                sh_puts("[WARN: diff=");
+                shell_put_uint32((free_after > free_before) ?
+                                 (free_after - free_before) :
+                                 (free_before - free_after));
+                sh_puts("B]");
+            }
+            sh_crlf();
+        }
+
+        /* ── ② 嵌套 suspend/resume VT2（如果 VT2 还存活） ──────── */
+        if (g_vt2) {
+            sh_puts("[VT3]   Suspend VT2 (oled_refresh) — OLED should stop for 3s.\r\n");
+            task_suspend(g_vt2);
+            g_vt3_susps++;
+            /* 3s 内：VT2 是 SUSPEND，OLED 不应再刷新新帧；VT1 必须继续跳 */
+            task_sleep(3000);
+            sh_puts("[VT3]   Resume VT2 (oled_refresh) — OLED should continue.\r\n");
+            task_resume(g_vt2);
+            g_vt3_rsms++;
+        } else {
+            sh_puts("[VT3]   VT2 not alive, skip suspend/resume (check OLED init commands).\r\n");
+        }
+
+        /* 下一轮：离上一轮起点约 10s（不含上面 suspend 已占的 3s，再等 7s）*/
+        task_sleep(7000);
+    }
+    #undef VT3_NMEM
+}
+
+/* — cmd_vtest: vtest start/stop/status 主入口 */
+static int cmd_vtest(int argc, char **argv) {
+    if (argc < 2) {
+        sh_puts("Usage: vtest start [bus] [addr] | status | stop\r\n");
+        sh_puts("  start  — Create 3 validation tasks & run concurrently.\r\n");
+        sh_puts("           bus  = I2C bus for OLED (default=0).\r\n");
+        sh_puts("           addr = OLED 7-bit I2C addr (default=0x3C).\r\n");
+        sh_puts("  status — Print 3-task counters + heap snapshot.\r\n");
+        sh_puts("  stop   — Destroy 3 validation tasks & restore LED OFF.\r\n");
+        return 1;
+    }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "status") == 0) {
+        sh_crlf();
+        sh_puts("=== vtest Status ===\r\n");
+        sh_puts("Running : ");
+        sh_puts(g_vtest_running ? "YES" : "NO");
+        sh_puts("  OLED bus="); shell_put_uint32((uint32_t)g_vt_oled_bus);
+        sh_puts(" addr=0x");    shell_print_hex8(g_vt_oled_addr); sh_crlf();
+        sh_puts("VT1(led_beat)      : beats   = "); shell_put_uint32(g_vt1_beats);   sh_crlf();
+        sh_puts("VT2(oled_refresh) : frames  = "); shell_put_uint32(g_vt2_frames);
+        sh_puts(" (i2c_err=");       shell_put_uint32(g_vt2_errs);  sh_puts(")"); sh_crlf();
+        sh_puts("VT3(ctrl_pressure): rounds  = "); shell_put_uint32(g_vt3_rounds);
+        sh_puts(" (suspend=");       shell_put_uint32(g_vt3_susps);
+        sh_puts(" resume=");         shell_put_uint32(g_vt3_rsms);  sh_puts(")"); sh_crlf();
+        sh_puts("Heap free=");       shell_put_uint32(kmem_free_size());
+        sh_puts("B max_block=");     shell_put_uint32(kmem_max_free_block()); sh_puts("B\r\n");
+        sh_puts("Tick=");            shell_put_uint32(hal_systick_get_tick()); sh_crlf();
+        sh_puts("Tip: Run 'ps' to confirm all 3 tasks appear + states OK.\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        if (!g_vtest_running) {
+            sh_puts("vtest: not running. Try 'vtest start'.\r\n");
+            return 1;
+        }
+        g_vtest_running = 0;        /* 三个任务的 while 循环退出 */
+
+        /* 确保所有被 suspend 的任务先 resume，否则 task_destroy
+         *   处理不了不在任何队列的 SUSPEND 任务。*/
+        if (g_vt2 && g_vt2->state == TASK_STATE_SUSPEND) task_resume(g_vt2);
+
+        /* 唤醒所有仍在 SLEEP 的任务 → READY → 下一 tick 它们会跑完退出 */
+        if (g_vt1) { task_wakeup(g_vt1); }
+        if (g_vt2) { task_wakeup(g_vt2); }
+        if (g_vt3) { task_wakeup(g_vt3); }
+
+        /* 给它们 1 tick 跑完退出路径（noreturn 不会真 return 但任务
+         *   结构体已标记 DEAD 或从 pool 移除后再销毁更安全）*/
+        hal_systick_delay_us(5000);
+
+        /* kill 三个任务（安全销毁 TCB + 栈内存）*/
+        if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
+        if (g_vt2) { task_destroy(g_vt2); g_vt2 = NULL; }
+        if (g_vt3) { task_destroy(g_vt3); g_vt3 = NULL; }
+
+        /* 灭 LED（确保回到干净状态） */
+        {
+            register const uint32_t SIO_BASE = 0xD0000000u;
+            register const uint32_t MASK25   = 0x02000000u;
+            *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;
+        }
+        /* 计数器清零，下次 start 从零开始 */
+        g_vt1_beats = g_vt2_frames = g_vt2_errs = 0;
+        g_vt3_rounds = g_vt3_susps = g_vt3_rsms = 0;
+
+        sh_puts("OK: vtest stopped. 3 tasks destroyed, LED OFF.\r\n");
+        sh_puts("Tip: Run 'ps' + 'heap' to confirm tasks gone + heap recovered fully.\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "start") == 0) {
+        if (g_vtest_running) {
+            sh_puts("vtest: already running. Run 'vtest stop' first.\r\n");
+            return 1;
+        }
+
+        /* 解析可选 bus / addr 参数（用户的 OLED 默认 I2C0@0x3C）*/
+        uint32_t bus = 0, addr = 0x3C;
+        if (argc >= 3) {
+            if (shell_parse_uint_auto(argv[2], &bus) != 0 || bus > 1) {
+                sh_puts("vtest: Invalid bus (0 or 1)\r\n"); return 1;
+            }
+        }
+        if (argc >= 4) {
+            if (shell_parse_uint_auto(argv[3], &addr) != 0 || addr > 0x7F) {
+                sh_puts("vtest: Invalid 7-bit OLED addr\r\n"); return 1;
+            }
+        }
+        g_vt_oled_bus  = (uint8_t)bus;
+        g_vt_oled_addr = (uint8_t)addr;
+
+        /* 计数器复位（每轮 start 从"干净 0 基准"开始，便于前后对比）*/
+        g_vt1_beats = g_vt2_frames = g_vt2_errs = 0;
+        g_vt3_rounds = g_vt3_susps = g_vt3_rsms = 0;
+
+        /* 先把 running 标记置 1（任务 while 循环里读它，必须先置）*/
+        g_vtest_running = 1;
+        __asm volatile ("" ::: "memory");   /* 编译器屏障，防止任务创建后乱序 */
+
+        sh_puts("vtest: Creating 3 validation tasks...\r\n");
+        sh_puts("  VT1 (led_beat)      : stack=384, weight=1 — LED flip every 500ms\r\n");
+        sh_puts("  VT2 (oled_refresh) : stack=768, weight=1 — 1024B GDRAM every 2s via I2C");
+        sh_puts(" bus="); shell_put_uint32(bus); sh_puts(" addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf();
+        sh_puts("  VT3 (ctrl_pressure): stack=768, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
+
+        g_vt1 = task_create("vt_led",   vt_task_led,   NULL, 384, 1);
+        g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 768, 1);
+        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 768, 2);
+
+        if (!g_vt1 || !g_vt2 || !g_vt3) {
+            sh_puts("vtest: task_create FAILED (heap exhausted?)\r\n");
+            sh_puts("  vt1="); shell_put_uint32(g_vt1 ? 1 : 0);
+            sh_puts(" vt2="); shell_put_uint32(g_vt2 ? 1 : 0);
+            sh_puts(" vt3="); shell_put_uint32(g_vt3 ? 1 : 0);
+            sh_puts(" heap_free="); shell_put_uint32(kmem_free_size()); sh_crlf();
+            /* 紧急清理：创建成功的先销毁，避免半残状态 */
+            g_vtest_running = 0;
+            if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
+            if (g_vt2) { task_destroy(g_vt2); g_vt2 = NULL; }
+            if (g_vt3) { task_destroy(g_vt3); g_vt3 = NULL; }
+            return 1;
+        }
+        sh_puts("OK: vtest STARTED. 3 tasks running concurrently.\r\n");
+        sh_puts("Validation checklist:\r\n");
+        sh_puts("  [ ] LED (GPIO25) blinks ~2Hz (heartbeat) at ALL times — proof of round-robin.\r\n");
+        sh_puts("  [ ] OLED shows changing pattern every 2s — proof VT2 scheduled.\r\n");
+        sh_puts("  [ ] Every ~13s: OLED FREEZES for 3s (VT2 suspended) but LED keeps blinking!\r\n");
+        sh_puts("  [ ] 'vtest status' — all 3 counters monotonically increasing.\r\n");
+        sh_puts("  [ ] 'ps'  — shows 6 tasks (idle/boot_setup/shell + vt_led/vt_oled/vt_ctrl), NO garbage IDs.\r\n");
+        sh_puts("  [ ] 'vtest stop'  → 'ps' shows back to 3 tasks; 'heap' matches pre-start bytes.\r\n");
+        sh_puts("  [ ] Long-run (5+ min): no LED flicker/stuck, no 'Unknown state ?' in ps, heap recovers 100%.\r\n");
+        return 0;
+    }
+
+    sh_puts("vtest: unknown subcmd '"); sh_puts(sub); sh_puts("'. Try 'vtest status'.\r\n");
+    return 1;
 }
 
 /* ================================================================
