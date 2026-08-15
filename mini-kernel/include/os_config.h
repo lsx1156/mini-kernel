@@ -40,6 +40,9 @@
  * 4. 资源上限（决定静态数组大小，超限编译期报错）
  * ================================================================ */
 #define OS_CFG_MAX_TASKS              16  /* 最大任务数（含空闲任务）     */
+#define OS_CFG_CORE_COUNT             2   /* CPU 核心数（RP2040 双核）。
+                                            *   默认 2：调度器按核心数组化，
+                                            *   但未启用多核时任务默认全在 core0。 */
 #define OS_CFG_MAX_SEM                8   /* 最大信号量数                 */
 #define OS_CFG_MAX_MUTEX              4   /* 最大互斥锁数                 */
 #define OS_CFG_MAX_QUEUE              8   /* 最大消息队列数               */

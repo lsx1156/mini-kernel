@@ -8,8 +8,11 @@
  * ================================================================ */
 #include "hal_port.h"
 #include "hal_interface.h"
+#include "hal/sysclk.h"
+#include "hal/config_store.h"  /* config_mcore_apply 强符号（覆盖 weak no-op） */
 #include "os_config.h"
 #include "mem.h"
+#include "task.h"   /* tcb_t / g_current_task，供 HardFault dump 读取任务名 */
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -21,7 +24,13 @@
 #include "hardware/i2c.h"
 #include "hardware/sync.h"
 #include "hardware/resets.h"
+/* 注意：不 include hardware/sio.h / hardware/multicore.h（hal_port 的 include
+ * 路径未暴露这些模块）。核心号用 SIO_CPUID 寄存器直读，core1 启动用
+ * multicore_launch_core1 的前向声明（链接期由 pico_multicore 提供）。 */
 #include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/pll.h"
+#include "hardware/structs/ssi.h"
 /* 注意：不直接 include "hardware/flash.h"，因为 Pico SDK hardware 子模块的
  *       头文件搜索路径并未在 shell_module 的 include 列表中暴露。
  *       flash_range_erase / flash_range_program 是 Pico SDK 提供的全局符号（
@@ -45,71 +54,82 @@ extern void tud_task_ext(uint32_t timeout_ms, int in_isr);
 extern void kernel_tick_hook(void);
 
 /* ================================================================
- * 1. 系统滴答定时器（TIMER_IRQ_3 ← 使用 ALARM3，不与 SDK alarm_pool 冲突）
+ * 1. 系统滴答定时器（TIMER_IRQ_0 ← 使用 ALARM0，不与 SDK alarm_pool 冲突）
  *
- * ⚠️ 【v2.2.4 修复：电脑烧录后看不到串口（USB 完全不枚举）的根因】
- *   Pico SDK 默认 alarm_pool（驱动 stdio_usb / TinyUSB 的超时、端点握手定时、
- *   alarm_pool 回调等）**独占使用 ALARM0 + TIMER_IRQ_0**。
- *   旧代码调用 `irq_set_exclusive_handler(TIMER_IRQ_0, systick_irq_handler)`
- *   直接覆盖 SDK 已注册好的 ALARM0 handler → SDK alarm_pool 回调从此永远
- *   不触发 → TinyUSB 的 CDC/MSC 状态机（SET_ADDRESS、端点 0 DATA 阶段、
- *   帧间隔 SOF 等）超时机制全失效 → USB 枚举走到一半卡死 → Windows 完全
- *   识别不出 COM 口 / U 盘盘符 → 用户症状："烧录后没看到串口"。
+ * ⚠️ 【v2.4.1 修复：爆闪根因 = ALARM3 冲突】
+ *   反汇编 + SDK 源码证实：Pico SDK 默认 alarm_pool 使用
+ *   PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM = **3**（ALARM3），
+ *   即在 stdio_init_all() 时 claim ALARM3 并注册 TIMER_IRQ_3。
+ *   旧注释"SDK 用 ALARM0、ALARM1/2/3 留给用户"是错误认知。
  *
- * ✅ 修复：改用 ALARM3 + TIMER_IRQ_3。Pico SDK 约定：ALARM0 给默认
- *   alarm_pool 用，ALARM1/2/3 留给用户代码自由使用。我们的内核 tick 只
- *   需要一个周期性 alarm，用 ALARM3 零冲突。
+ *   内核若也用 ALARM3 → hal_systick_init 里
+ *   irq_set_exclusive_handler(TIMER_IRQ_3, systick_irq_handler) 时
+ *   vtable 已被 SDK 占用 → hard_assert 失败 → panic →
+ *   "*** PANIC *** Hard assert" → LED 爆闪。
+ *
+ * ✅ 修复：内核 tick 改用 ALARM0 + TIMER_IRQ_0。SDK 默认 pool 用 ALARM3，
+ *   我们与它零冲突（不覆盖任何已注册 handler）。
  * ================================================================ */
 volatile uint32_t g_tick_count = 0;
 volatile uint32_t g_tick_interval_us = 1000u; /* 默认 1ms @ 1000Hz */
+volatile uint32_t g_core1_tick_count = 0;      /* 诊断：core1 实际产生多少次 tick */
 
-/* 寄存器位掩码常量（ALARM3 = bit3）——集中定义一处避免写错 */
-#define KTICK_ALARM_IDX       3u                         /* alarm[3] */
-#define KTICK_TIMER_IRQ       TIMER_IRQ_3                /* 对应中断号 = 3 */
-#define KTICK_TIMER_BIT       (1u << KTICK_ALARM_IDX)    /* intr / inte / armed 寄存器 bit3 */
+/* 【多核】每个核心独立占一个 ALARM + 对应 IRQ，互不争抢硬件寄存器：
+ *   core0 → ALARM0 + TIMER_IRQ_0
+ *   core1 → ALARM1 + TIMER_IRQ_1
+ * 由 hal_core_id() 在当前核心上取对应索引。alarm[0]/alarm[1] 是独立
+ * 的硬件寄存器，两核各自写自己的 alarm、各自清自己的 intr 位，无竞争。 */
+#define KTICK_ALARM_BASE        0u    /* core0 用 alarm[0]，core1 用 alarm[1] */
+#define KTICK_IRQ_BASE          TIMER_IRQ_0
+static inline uint32_t ktick_alarm_idx(void) { return KTICK_ALARM_BASE + hal_core_id(); }
+static inline uint32_t ktick_bit(void)        { return (1u << ktick_alarm_idx()); }
+static inline uint32_t ktick_irq(void)        { return KTICK_IRQ_BASE + hal_core_id(); }
 
-/* TIMER_IRQ_3 中断处理：清中断 + 累计 tick + 重设 alarm3 + 调内核钩子。
+/* TIMER_IRQ_n 中断处理：清中断 + 累计 tick + 重设本核 alarm + 调内核钩子。
  *
  *   RP2040 Timer 每个 ALARM 都是一次性触发：触发后 armed 位自动清 0，
  *   必须在中断里重写 alarm[N] 才能产生下一个周期。
- *   intr 寄存器是 write-1-to-clear，写 KTICK_TIMER_BIT 清 ALARM3 flag。
- *   间隔基于 timerawl（当前计数器低 32 位）+ interval_us，避免
- *   漂移累积。 */
+ *   intr 寄存器是 write-1-to-clear，写 ktick_bit() 清本核 ALARM 的 flag。
+ *   间隔基于 timerawl（当前计数器低 32 位）+ interval_us，避免漂移累积。 */
 void systick_irq_handler(void) {
     /* 【致命 Bug 修复】INTR 是 write-1-to-clear 寄存器。
      * hw_clear_bits 做的是 *addr &= ~mask，对 W1C 寄存器等于写 0 → 不清中断！
-     * 导致 tick 中断无限重入 → CPU 卡死在 TIMER_IRQ_3 → 调度器状态损坏 → HardFault。
-     * 正确做法：直接写 KTICK_TIMER_BIT 到 INTR（写 1 清除对应位）。 */
-    timer_hw->intr = KTICK_TIMER_BIT;                     /* 清 ALARM3 中断 (W1C) */
-    timer_hw->alarm[KTICK_ALARM_IDX] = timer_hw->timerawl + g_tick_interval_us;
+     * 正确做法：直接写 ktick_bit() 到 INTR（写 1 清除对应位）。 */
+    timer_hw->intr = ktick_bit();                     /* 清本核 ALARM 中断 (W1C) */
+    timer_hw->alarm[ktick_alarm_idx()] = timer_hw->timerawl + g_tick_interval_us;
     g_tick_count++;
-    kernel_tick_hook();
+    if (hal_core_id() == 1) g_core1_tick_count++;      /* 诊断：core1 tick 计数 */
+    kernel_tick_hook();                                /* 推进本核调度器 */
 }
 
 static void hal_systick_init_impl(uint32_t tick_hz) {
     if (tick_hz == 0u) tick_hz = 1000u;
     g_tick_interval_us = 1000000u / tick_hz;
 
-    /* 关闭 alarm3 中断使能 + 清 armed 标志，配置过程中不触发 IRQ。
-     * ARMED 也是 write-1-to-clear，必须直接写 KTICK_TIMER_BIT（不能用 hw_clear_bits）。 */
-    hw_clear_bits(&timer_hw->inte, KTICK_TIMER_BIT);
-    timer_hw->armed = KTICK_TIMER_BIT;
+    uint32_t bit  = ktick_bit();
+    uint32_t irq  = ktick_irq();
+    uint32_t idx  = ktick_alarm_idx();
+
+    /* 关闭本核 alarm 中断使能 + 清 armed 标志，配置过程中不触发 IRQ。
+     * ARMED 也是 write-1-to-clear，必须直接写 bit（不能用 hw_clear_bits）。 */
+    hw_clear_bits(&timer_hw->inte, bit);
+    timer_hw->armed = bit;
 
     /* 设置首次 alarm */
-    timer_hw->alarm[KTICK_ALARM_IDX] = timer_hw->timerawl + g_tick_interval_us;
+    timer_hw->alarm[idx] = timer_hw->timerawl + g_tick_interval_us;
 
     /* 注册 IRQ 处理函数 + 设优先级最低（不抢占 TinyUSB / SDK 关键中断） */
-    irq_set_exclusive_handler(KTICK_TIMER_IRQ, systick_irq_handler);
-    irq_set_priority(KTICK_TIMER_IRQ, 0xFFu);
+    irq_set_exclusive_handler(irq, systick_irq_handler);
+    irq_set_priority(irq, 0xFFu);
 
     /* PendSV 优先级最低（0xE000ED22 = SHPR3[2] = EXC#14 PendSV），
-     * 避免 PendSV 抢占 TIMER_IRQ_3 tick 中断导致调度器重入、队列损坏。
+     * 避免 PendSV 抢占 TIMER_IRQ_n tick 中断导致调度器重入、队列损坏。
      * Cortex-M0+ SHPR3 字节布局：[20]=#12 [21]=#13 [22]=#14 PendSV [23]=#15 SysTick */
     *(volatile uint8_t *)0xE000ED22u = 0xFFu;
 
-    /* 开启 alarm3 INTE + NVIC */
-    hw_set_bits(&timer_hw->inte, KTICK_TIMER_BIT);
-    irq_set_enabled(KTICK_TIMER_IRQ, true);
+    /* 开启本核 alarm INTE + NVIC */
+    hw_set_bits(&timer_hw->inte, bit);
+    irq_set_enabled(irq, true);
 }
 
 static uint32_t hal_systick_get_tick_impl(void) {
@@ -152,8 +172,46 @@ static void hal_console_init_impl(uint32_t baudrate) {
  *   dcd_int_handler / tud_task_ext，这些函数与 USB IRQ handler 重入时
  *   会导致 TinyUSB 内部状态混乱 → HardFault。idle 任务里的 hal_usb_poll
  *   是安全的设计上下文，不应该从其他任务直接调用。*/
+/* ================================================================
+ * 开机日志缓存回放（v2.4.3）
+ *
+ *  用户需求：无论何时打开终端，都能看到完整开机日志（之前超时=0 时
+ *  开机打印一次性瞬间完成，终端没打开就全丢了）。
+ *
+ *  方案：
+ *    · 启动阶段（控制台初始化 → sched_start 前）把每次 hal_console_putc
+ *      的字符同步捕获进 RAM 缓冲（纯内存写，不阻塞、不丢）；
+ *    · sched_start 前由内核调用 hal_bootlog_end() 停止捕获；
+ *    · hal_usb_poll 里解析 CDC SET_CONTROL_LINE_STATE(0x21 0x22) 的
+ *      DTR 上升沿（= 用户刚打开终端），把缓存的完整开机日志回放一遍。
+ *      已在启动时开着的终端本来就能实时看到，不会触发回放（无上升沿）。
+ * ================================================================ */
+#define BOOTLOG_SIZE 2048u
+static char             s_bootlog[BOOTLOG_SIZE];
+static volatile uint16_t s_bootlog_len     = 0u;
+static volatile bool    s_bootlog_capture  = true;   /* 启动阶段捕获中 */
+static volatile bool    s_bootlog_replayed = false;  /* 已回放过（避免每次连接都重放） */
+
+/* 控制台输出时同步捕获（由 hal_console_putc_impl 调用） */
+static void hal_bootlog_putc(char c) {
+    if (!s_bootlog_capture) return;
+    if (s_bootlog_len < BOOTLOG_SIZE) {
+        s_bootlog[s_bootlog_len++] = c;
+    }
+}
+
+/* 停止捕获（内核在 sched_start 前调用 hal_bootlog_end，见 hal_interface.h） */
+void hal_bootlog_end(void) {
+    s_bootlog_capture = false;
+}
+
+static void _bootlog_dtr_check(void);   /* 实现见文件后部（依赖 SETUP 快照） */
+
 static int hal_console_putc_impl(char c) {
     static uint8_t s_yield_counter = 0;
+
+    /* 开机日志捕获（内存写，放最前，与中断保护无关） */
+    hal_bootlog_putc(c);
 
     /* 每 32 字符让出 CPU，让 idle 任务调 hal_usb_poll 刷新 FIFO */
     if (++s_yield_counter >= 32) {
@@ -362,6 +420,31 @@ static inline void _snapshot_setup_if_pending(void) {
     }
 }
 
+/* 回放完整开机日志（仅一次；经控制台输出，半阻塞保证送达） */
+static void _bootlog_replay(void) {
+    if (s_bootlog_replayed) return;
+    if (s_bootlog_len == 0u) return;
+    s_bootlog_replayed = true;
+    for (uint16_t i = 0; i < s_bootlog_len; i++) {
+        hal_console_putc(s_bootlog[i]);
+    }
+}
+
+/* 由 hal_usb_poll 调用：解析最近 SETUP 包，检测 CDC DTR 上升沿。
+ * w0: byte0=bmRequestType, byte1=bRequest, byte2..3=wValue(bit0=DTR)。
+ * 0x21/0x22 = SET_CONTROL_LINE_STATE；DTR 0→1 = 用户刚打开终端。 */
+static void _bootlog_dtr_check(void) {
+    static volatile bool s_dtr_prev = false;
+    uint32_t w0 = s_last_setup_w0;
+    if ((w0 & 0xFFFFu) == 0x2221u) {
+        bool dtr = (bool)((w0 >> 16) & 1u);
+        if (dtr && !s_dtr_prev) {
+            _bootlog_replay();   /* 终端刚打开 → 回放开机日志 */
+        }
+        s_dtr_prev = dtr;
+    }
+}
+
 uint32_t hal_usb_force_poll_and_snapshot(uint32_t *inte_after, uint32_t *iser_after,
                                          uint32_t *safe_mask_written,
                                          uint32_t *dcd_enable_calls) {
@@ -454,6 +537,8 @@ uint32_t hal_usb_diag_ep1_hw_avail(void) {
 /* idle/shell/heartbeat 等任务调用：驱动 USB 状态机，保持 USB CDC 双向通畅。 */
 void hal_usb_poll(void) {
     _usb_force_poll();
+    /* 检测终端是否刚打开（DTR 上升沿）→ 回放开机日志（v2.4.3） */
+    _bootlog_dtr_check();
 }
 
 const hal_console_ops_t hal_console_ops = {
@@ -837,8 +922,326 @@ const hal_flash_ops_t hal_flash_ops = {
 };
 
 /* ================================================================
+ * 8. 系统时钟档位（超频）— v2.4
+ *
+ *  RP2040 双核共享 SYS PLL，CPU 主频对两核一视同仁。切换档位时：
+ *   1) 高主频先升压（vreg），保证 PLL/核心时序余量；
+ *   2) set_sys_clock_khz() 重配 SYS PLL（内部会先把 clk_peri 切到
+ *      48MHz USB PLL，保证切换瞬间外设不超速）；
+ *   3) 把 clk_peri 钳回 125MHz（源 = SYS PLL 分频）→ 外设总线速度不变，
+ *      从而 UART/I2C/SPI/Timer 波特率与节拍完全不受超频影响；
+ *   4) 缩放 XIP flash 的 SSI 分频，使 flash 读取速度与旧主频相当，
+ *      避免高主频下 XIP 读崩（症状看起来像代码损坏 / HardFault）。
+ * ================================================================ */
+const sysclk_tier_t g_sysclk_tiers[SYSCLK_TIER_COUNT] = {
+    { 125u, "125MHz", false },
+    { 250u, "250MHz", false },
+    { 375u, "375MHz", false },
+    { 500u, "500MHz", true  },   /* 隐藏档：500=125×4（整数），clk_peri 精确 125MHz，UART 波特率不偏 */
+};
+
+uint32_t sysclk_current_mhz(void) {
+    return (clock_get_hz(clk_sys) + 999999u) / 1000000u;
+}
+
+int sysclk_current_tier(void) {
+    uint32_t mhz = sysclk_current_mhz();
+    for (int i = 0; i < SYSCLK_TIER_COUNT; i++) {
+        if (g_sysclk_tiers[i].mhz == mhz) return i;
+    }
+    return -1;
+}
+
+/* 在请求频率附近（±16MHz）寻找可被 SYS PLL 精确锁定的频率。
+ * 纯计算（check_sys_clock_khz 不改任何寄存器），返回可达频率（MHz）；
+ * 找不到返回 0。RP2040 的 PLL 只能整数分频，任意输入值未必能精确达到，
+ * 这里就近取一个可达值，保证"自行输入频率"尽量贴近目标。 */
+static uint32_t sysclk_nearest_achievable_mhz(uint32_t want) {
+    for (int32_t d = 0; d <= 16; d++) {
+        uint vco, p1, p2;
+        if (check_sys_clock_khz((want + (uint32_t)d) * 1000u, &vco, &p1, &p2))
+            return want + (uint32_t)d;
+        if (d > 0 && want > (uint32_t)d &&
+            check_sys_clock_khz((want - (uint32_t)d) * 1000u, &vco, &p1, &p2))
+            return want - (uint32_t)d;
+    }
+    return 0u;
+}
+
+bool sysclk_apply_mhz(uint32_t mhz) {
+    if (mhz < SYSCLK_MHZ_MIN || mhz > SYSCLK_MHZ_MAX) return false;
+
+    /* 就近锁定可达频率（升压/分频都用它，保证 PLL 一定能切过去） */
+    uint32_t target = sysclk_nearest_achievable_mhz(mhz);
+    if (target == 0u) {
+        set_sys_clock_khz(SYSCLK_MHZ_DEFAULT * 1000u, true);
+        return false;
+    }
+
+    /* 【v2.4.3 · 切换全程关中断】
+     * 内核 tick(TIMER_IRQ_0)/USB IRQ 在 clk_sys 重新配置的瞬间若抢占，
+     * ISR 会在过渡频率 + 过渡 flash 分频下从 XIP 取指 → 二次崩溃风险。
+     * 这里把"升压 + flash 分频 + PLL 切换 + clk_peri"整个临界区关中断，
+     * 保证切换原子性（耗时几百 µs，丢一两个 tick 无碍，USB 短暂停顿可恢复）。 */
+    uint32_t irq_save = save_and_disable_interrupts();
+
+    /* 高主频先升压，保证 PLL/核心时序余量。
+     * 375/500MHz 属极限档，一律用最高 1.25V。 */
+    if (target > 250u) {
+        vreg_set_voltage(VREG_VOLTAGE_1_25);
+    } else if (target > 125u) {
+        vreg_set_voltage(VREG_VOLTAGE_1_20);
+    } else {
+        vreg_set_voltage(VREG_VOLTAGE_1_10);
+    }
+
+    /* 【v2.4.2 · XIP flash 分频必须在时钟切换的"正确时机"写入】
+     * set_sys_clock_khz 内部序列：切 clk_sys 到 pll_usb(48MHz) → 重配
+     * pll_sys → **把 clk_sys 直接切到目标频率**。若分频没提前准备好，
+     * 切到 375MHz 的瞬间 flash 时钟 = 375 / 旧分频(≈2) ≈ 187MHz 远超
+     * flash 上限 → XIP 取指失败 → CPU 挂死（现象：`ovclk try 2` 打出
+     * "applying now..." 后串口立刻断，连 apply 结果都来不及打印）。
+     *
+     * 正确顺序（保证整个切换过程 flash 时钟都不超 SYSCLK_FLASH_MAX_MHZ）：
+     *   · 升频：先把分频加大（此刻 clk_sys 还低，flash 只会更慢，安全），
+     *     再切 PLL —— 切到目标频率瞬间 flash 时钟 = 目标/新分频 ≤ 上限；
+     *   · 降频：先降 clk_sys（旧分频下 flash 时钟随 clk_sys 一起下降，
+     *     不会超速），切完再把分频减小。
+     * （set_sys_clock_khz 不触碰 pll_usb，USB 时钟独立保持 48MHz。） */
+    uint32_t new_baud = (target + SYSCLK_FLASH_MAX_MHZ - 1u) / SYSCLK_FLASH_MAX_MHZ;
+    if (new_baud < 1u) new_baud = 1u;
+    const bool up = (target > sysclk_current_mhz());
+    if (up) ssi_hw->baudr = new_baud;
+
+    /* 切换 SYS PLL 到目标频率（target 已由 check_sys_clock_khz 确认可达）。 */
+    if (!set_sys_clock_khz(target * 1000u, true)) {
+        set_sys_clock_khz(SYSCLK_MHZ_DEFAULT * 1000u, true);
+        ssi_hw->baudr = (SYSCLK_MHZ_DEFAULT + SYSCLK_FLASH_MAX_MHZ - 1u) / SYSCLK_FLASH_MAX_MHZ;
+        restore_interrupts(irq_save);
+        return false;
+    }
+    if (!up) ssi_hw->baudr = new_baud;
+
+    /* 把 clk_peri 钳到 SYSCLK_PERI_MAX_MHZ 以内（自动整数分频）。
+     *   · 预设档都是 125 的整数倍（125/250/375/500）→ ceil(f/133) 分频后
+     *     clk_peri 恰好 = 125MHz（整数），UART/SPI/I2C/Timer 波特率与节拍
+     *     完全不变；
+     *   · 任意频率按真实 clk_sys 就近取整数分频，clk_peri ≤ 133MHz 保证
+     *     外设不超规格；USB 在 pll_usb(48MHz) 上，始终不受影响。 */
+    uint32_t actual_mhz = sysclk_current_mhz();
+    uint32_t pdiv = (actual_mhz + SYSCLK_PERI_MAX_MHZ - 1u) / SYSCLK_PERI_MAX_MHZ;
+    if (pdiv < 1u) pdiv = 1u;
+    clock_configure(clk_peri,
+                    0u,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    actual_mhz * 1000u * 1000u,
+                    (actual_mhz / pdiv) * 1000u * 1000u);
+
+    /* 【v2.4.3 · 按新 clk_peri 重设 UART0 波特率】
+     * clk_peri 被整数分频后（任意频率 ≠125 的倍数时 ≠125MHz），UART0 分频
+     * 仍按旧 clk_peri 算 → TTL 调试串口波特率会偏。RP2040 UART 分频器带
+     * 6 位小数部分，这里按新 clk_peri 重算（uart_set_baudrate 内部读
+     * clock_get_hz(clk_peri)），把 TTL 调试口精确恢复到 115200。 */
+    uart_set_baudrate(uart0, 115200);
+
+    restore_interrupts(irq_save);
+    return true;
+}
+
+bool sysclk_apply_tier(int tier) {
+    if (tier < 0 || tier >= SYSCLK_TIER_COUNT) return false;
+    return sysclk_apply_mhz(g_sysclk_tiers[tier].mhz);
+}
+
+/* ================================================================
  * 8. HAL 导出表（内核唯一访问入口）
  * ================================================================ */
+
+/* ================================================================
+ * 8.5 板级基础功能（hal_interface.h 第 1.5 节）
+ *
+ *  这些强符号把内核启动/诊断阶段对板子的依赖全部收到移植层，
+ *  内核核心（kernel/core）只调这些接口，不直接碰 Pico SDK / RP2040
+ *  寄存器，从而保证内核库纯净、可移植到其它 MCU。
+ * ================================================================ */
+#ifndef PICO_DEFAULT_LED_PIN
+#define PICO_DEFAULT_LED_PIN 25
+#endif
+
+/* 早期诊断 UART0 直写：与 HardFault dump 同一条通道（115200-8N1）。
+ * 直接写寄存器，绝不触发调度/中断（PendSV 安全）。
+ * UART0 基址 0x40034000：DR=+0, FR=+0x18, FR bit5=TX FIFO 满。 */
+#define DIAG_UART_DR   (*(volatile uint32_t *)0x40034000u)
+#define DIAG_UART_FR   (*(volatile uint32_t *)0x40034018u)
+#define DIAG_UART_TXFF (1u << 5)
+
+void hal_led_init(void) {
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_set_slew_rate(PICO_DEFAULT_LED_PIN, GPIO_SLEW_RATE_SLOW);
+    gpio_set_drive_strength(PICO_DEFAULT_LED_PIN, GPIO_DRIVE_STRENGTH_4MA);
+    gpio_put(PICO_DEFAULT_LED_PIN, 0);
+}
+void hal_led_set(int on)                { gpio_put(PICO_DEFAULT_LED_PIN, on ? 1 : 0); }
+void hal_led_on(void)                   { gpio_put(PICO_DEFAULT_LED_PIN, 1); }
+void hal_led_off(void)                  { gpio_put(PICO_DEFAULT_LED_PIN, 0); }
+void hal_delay_ms(uint32_t ms)          { busy_wait_us_32(ms * 1000u); }
+
+/* 控制台就绪：WITHOUT_DTR=1 时 stdio_usb_connected() = tud_ready()（USB 已枚举） */
+extern bool stdio_usb_connected(void);
+int  hal_console_ready(void)            { return stdio_usb_connected() ? 1 : 0; }
+
+void hal_irq_enable(void)               { __asm volatile ("cpsie i" ::: "memory"); }
+void hal_irq_disable(void)              { __asm volatile ("cpsid i" ::: "memory"); }
+
+/* 当前核心号：RP2040 SIO_CPUID 寄存器（0xD0000000，bit0=core, 1=core1）。 */
+uint32_t hal_core_id(void)              { return (*(volatile uint32_t *)0xD0000000u) & 0xFFu; }
+
+/* ================================================================
+ * 多核启动（config_mcore_apply 强符号，覆盖 config_store.c 的 weak no-op）
+ *
+ *   core1 调度器入口：在 core1 上运行（MSP 上下文）。先配置 core1 的
+ *   systick（ALARM1 + TIMER_IRQ_1，见 ktick_*），再启动 core1 调度器。
+ *   core1 的首任务由 sched_start 从 core1 就绪队列选取（空则为其 idle）。
+ *   注意：core1 的 idle / 各核心 idle 上下文已在 task_module_init 预初始化。
+ * ================================================================ */
+extern void sched_start(void);
+extern void multicore_launch_core1(void (*entry)(void));  /* pico_multicore */
+static void __attribute__((noreturn)) core1_scheduler_entry(void) {
+    hal_systick_init(OS_CFG_TICK_HZ);   /* 在 core1 上配置其 tick */
+    sched_start();                       /* core1 首任务，不返回 */
+    while (1) { }
+}
+
+/* 多核启动请求标志：config_mcore_apply 只记录（固化语义），
+ * 实际启动由 `mcore demo` 命令调用 hal_mcore_start() 显式执行。 */
+static volatile int g_mcore_requested = 0;
+void config_mcore_apply(bool enable) {
+    g_mcore_requested = enable ? 1 : 0;
+}
+void hal_mcore_start(void) {
+    /* TODO(多核诊断)：core1 启动当前会引发内存损坏/乱码，先只允许
+     * 通过 mcore demo 显式启动；boot 不自动启动。 */
+    if (hal_core_id() == 0) {
+        multicore_launch_core1(core1_scheduler_entry);
+    }
+}
+uint32_t hal_mcore_core1_ticks(void) { return g_core1_tick_count; }
+
+void hal_diag_init(void) {
+    /* boot 最早期初始化 UART0(115200, GP0=TX/GP1=RX)，让 HardFault dump /
+     * [CONFIG] 等诊断能经 UART0 直写输出。 */
+    uart_init(uart0, 115200);
+    gpio_set_function(0, GPIO_FUNC_UART);
+    gpio_set_function(1, GPIO_FUNC_UART);
+}
+void hal_diag_putc(char c) {
+    while (DIAG_UART_FR & DIAG_UART_TXFF) { }   /* 忙等 TX FIFO 非满 */
+    DIAG_UART_DR = (uint32_t)(uint8_t)c;
+}
+void hal_diag_puts(const char *s) { while (*s) hal_diag_putc(*s++); }
+void hal_diag_put_u32(uint32_t v) {
+    char buf[8]; int bi = 0;
+    if (v == 0) { hal_diag_putc('0'); return; }
+    while (v > 0) { buf[bi++] = (char)('0' + (v % 10)); v /= 10; }
+    while (bi > 0) hal_diag_putc(buf[--bi]);
+}
+
+/* ================================================================
+ * 8.6 HardFault 现场转储（UART0 直写寄存器）
+ *  由 context_switch.S 的 isr_hardfault 调用（Handler 模式，MSP 上）。
+ *  用最底层 UART0 直写输出故障寄存器，不走 putchar/SDK/TinyUSB
+ *  （fault 时 USB 状态未知，调用 SDK 易二次 fault → Lockup）。
+ * ================================================================ */
+volatile uint32_t g_fault_psp = 0;
+volatile uint32_t g_fault_msp = 0;
+
+#define FAULT_SRAM_LO    0x20000000u
+#define FAULT_SRAM_HI    0x20042000u   /* RP2040 264KB SRAM 上界 */
+
+static void _fault_putc(char c) {
+    while (DIAG_UART_FR & DIAG_UART_TXFF) { }   /* 忙等 TX FIFO 非满 */
+    DIAG_UART_DR = (uint32_t)(uint8_t)c;
+}
+static void _fault_puts(const char *s) { while (*s) _fault_putc(*s++); }
+static void _fault_puthex32(uint32_t v) {
+    const char hex[] = "0123456789ABCDEF";
+    _fault_putc('0'); _fault_putc('x');
+    for (int i = 28; i >= 0; i -= 4) _fault_putc(hex[(v >> i) & 0xF]);
+}
+
+/* 由 isr_hardfault 调用（Handler 模式，跑在 MSP 上，C 函数栈安全） */
+void hardfault_dump_c(void) {
+    /* 【v2.4.3 · 按当前 clk_peri 重设 UART0 波特率再转储】
+     * 超频切换中途崩溃时（clk_peri 已被 SDK 临时切到 48MHz、UART0 分频还是
+     * 按旧 clk_peri 算的），直接 115200 输出会波特率错位 → 乱码。
+     * 这里先按 clock_get_hz(clk_peri) 重算 UART0 分频（仅寄存器写 + RAM 读，
+     * 故障现场安全），保证 dump 在任何频率下都可读。 */
+    uart_set_baudrate(uart0, 115200);
+
+    uint32_t hfsr = *(volatile uint32_t *)0xE000ED2Cu;  /* HardFault Status */
+    uint32_t cfsr = *(volatile uint32_t *)0xE000ED28u;  /* Configurable Fault Status */
+    uint32_t bfar = *(volatile uint32_t *)0xE000ED38u;  /* BusFault Address */
+
+    _fault_puts("\r\n\n!!! HardFault !!!\r\n");
+    _fault_puts("MSP=");   _fault_puthex32(g_fault_msp);
+    _fault_puts("  PSP="); _fault_puthex32(g_fault_psp);
+    _fault_puts("  CFSR="); _fault_puthex32(cfsr);
+    _fault_puts("  HFSR="); _fault_puthex32(hfsr);
+    _fault_puts("  BFAR="); _fault_puthex32(bfar);
+
+    /* PSP 指向被打断任务的硬件栈帧底：
+     * [0]r0 [1]r1 [2]r2 [3]r3 [4]r12 [5]lr [6]pc [7]xpsr */
+    if (g_fault_psp >= FAULT_SRAM_LO && g_fault_psp < FAULT_SRAM_HI) {
+        volatile uint32_t *f = (volatile uint32_t *)g_fault_psp;
+        _fault_puts("\r\nFault PC=");  _fault_puthex32(f[6]);
+        _fault_puts("  LR=");          _fault_puthex32(f[5]);
+        _fault_puts("  xPSR=");        _fault_puthex32(f[7]);
+        _fault_puts("  R0=");          _fault_puthex32(f[0]);
+        _fault_puts("  R12=");         _fault_puthex32(f[4]);
+    } else {
+        _fault_puts("\r\nPSP invalid (fault in Handler mode?)");
+    }
+
+    /* 出错任务名（指针先做 SRAM 范围校验，防二次 fault） */
+    {
+        uint32_t t = (uint32_t)(uintptr_t)g_current_task;
+        if (t >= FAULT_SRAM_LO && t < FAULT_SRAM_HI) {
+            const char *n = ((tcb_t *)(uintptr_t)t)->name;
+            _fault_puts("\r\ntask='");
+            for (int i = 0; i < 12 && n[i]; i++) _fault_putc(n[i]);
+            _fault_putc('\'');
+        }
+    }
+    _fault_puts("\r\n(v2.2.8 fault dump, UART0 115200-8N1)\r\n");
+}
+
+/* 软复位系统：写 AIRCR 的 SYSRESETREQ 位触发系统复位。
+ * 复位后重新执行完整启动流程（kernel_main → [CONFIG] → boot setup → banner），
+ * 从而重现首次开机画面。shell `reboot` 命令调用。 */
+void hal_system_reset(void) {
+    /* 先刷出 pending 输出，再关中断复位 */
+    busy_wait_us_32(20000u);   /* 短暂等待 USB/TTL 输出排空 */
+
+    /* 【Bugfix】软复位前先断开 USB D+ 上拉（USB_SIE_CTRL.PULLUP_EN=0）。
+     *   RP2040 软件复位（AIRCR）时若 D+ 上拉仍保持，Windows 不会把设备
+     *   当作"断开→重新枚举"，导致复位后 USB CDC 完全无输出（TTL 仍正常）。
+     *   先清 PULLUP_EN 让主机识别到干净的断开事件，复位后 stdio_init_all()
+     *   重新拉上 D+ → Windows 重新枚举 → PuTTY 恢复输出。 */
+    {
+        volatile uint32_t *sie_ctrl = (volatile uint32_t *)0x5011004Cu; /* USB_SIE_CTRL */
+        *sie_ctrl = *sie_ctrl & ~(1u << 16);   /* PULLUP_EN = 0 → 断开 D+ */
+        busy_wait_us_32(60000u);                /* 等主机识别断开（USB spec >2.5ms，取 50ms 稳妥） */
+    }
+
+    __asm volatile ("cpsid i" ::: "memory");
+    /* AIRCR = 0xE000ED0C: 写 0x05FA0000 | (1<<2) = SYSRESETREQ */
+    *(volatile uint32_t *)0xE000ED0Cu = 0x05FA0004u;
+    /* 同步请求，循环等待复位生效 */
+    for (volatile uint32_t i = 0; i < 1000000u; i++) __asm("nop");
+    /* 正常情况下不可达 */
+    while (1) { }
+}
 const hal_export_t hal_export = {
     .systick  = &hal_systick_ops,
     .console  = &hal_console_ops,

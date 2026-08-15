@@ -53,13 +53,20 @@ typedef struct tcb {
     /* 任务标识 */
     char                name[12];       /* 任务名，以 \0 结尾 */
     uint32_t            id;             /* 任务 ID */
+    uint8_t             core;           /* 绑定的核心号（0=core0, 1=core1） */
 } tcb_t;
 
-/* 空闲任务 TCB（静态分配） */
-extern tcb_t g_idle_task;
-extern tcb_t *g_current_task;
+/* 空闲任务 TCB（每核一个，静态分配） */
+extern tcb_t g_idle_task_table[OS_CFG_CORE_COUNT];
+extern tcb_t *g_current_task_table[OS_CFG_CORE_COUNT];
 extern tcb_t *g_task_pool[OS_CFG_MAX_TASKS];
 extern uint8_t g_task_bitmap;           /* 位图：bit=1 表示槽位已用 */
+
+/* 【多核】g_idle_task / g_current_task 按当前运行核心自动展开。
+ * 这样内核/调度器/中断里所有既有引用（g_current_task->xxx 等）无需改动，
+ * 自动作用到"本核心"的实例。 */
+#define g_idle_task      (g_idle_task_table[hal_core_id()])
+#define g_current_task   (g_current_task_table[hal_core_id()])
 
 /* 【v2.2.9 · 栈限额统计（内核/用户分离）】
  *   g_user_stack_used_bytes    — 用户任务(id>2)动态栈总和
@@ -74,6 +81,8 @@ extern size_t g_kernel_stack_used_bytes;
 void    task_module_init(void);
 tcb_t  *task_create(const char *name, void (*entry)(void *), void *arg,
                     size_t stack_size, uint8_t priority);
+tcb_t  *task_create_on(const char *name, void (*entry)(void *), void *arg,
+                       size_t stack_size, uint8_t priority, uint8_t core); /* 多核：显式指定核心（0/1） */
 void    task_destroy(tcb_t *task);
 void    task_sleep(uint32_t ticks);
 void    task_wakeup(tcb_t *task);

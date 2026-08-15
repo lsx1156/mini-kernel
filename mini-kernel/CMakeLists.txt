@@ -150,13 +150,13 @@ add_compile_definitions(${OS_CFG_DEFINES})
 #   设为 1 后，只要 USB 完成枚举即可输出，兼容所有终端工具。
 add_compile_definitions(PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1)
 
-# PICO_STDIO_USB_STDOUT_TIMEOUT_US=0:
-#   CDC FIFO 满时（主机未读）stdio_usb_out_chars 的等待超时。
-#   SDK 默认 60 秒 → demo_app_init 打印几百字节后 FIFO 满 → 阻塞 60s/字符
-#   → sched_start 永远不执行 → LED 不亮。
-#   设为 0 → FIFO 满时立即 break 丢弃（不阻塞），系统快速启动。
-#   主机打开终端后 FIFO 被持续读取，后续输出正常不丢。
-add_compile_definitions(PICO_STDIO_USB_STDOUT_TIMEOUT_US=0)
+# PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000:
+#   CDC FIFO 满时（主机未及时读）stdio_usb_out_chars 的等待超时。
+#   SDK 默认 60 秒 → FIFO 满一次就卡 60s → sched_start 不执行。
+#   设为 0 → FIFO 满即丢（开机输出不全）。
+#   1000000（1s，v2.4.3 用户要求"半阻塞"）→ FIFO 满时边 pump tud_task
+#   边等主机读走最多 1s，超时才丢；未连接时立即丢弃不卡启动。
+add_compile_definitions(PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000)
 
 message(STATUS "OS Config Defines: ${OS_CFG_DEFINES}")
 
@@ -243,8 +243,13 @@ function(add_module_if_enabled name src_dir define_flag)
     message(STATUS "add_module_if_enabled: ${define_flag}=${${define_flag}}")
     
     if(${define_flag})
-        # 不用 file(GLOB) 避免 CMake cache 不自动发现新增的 bootscript.c 这类文件；
-        # 显式 CONFIGURE_DEPENDS 让重新 cmake --build 时 glob 会更新。
+        if(NOT EXISTS "${src_dir}")
+            # 目录不存在（如 periph / loader 尚未有实现）→ 视为未启用，
+            # 避免对不存在的目录做 file(GLOB CONFIGURE_DEPENDS)。
+            set(${name}_ENABLED FALSE CACHE INTERNAL "${name} module disabled")
+            return()
+        endif()
+        # CONFIGURE_DEPENDS：重新 cmake --build 时自动发现新增源文件。
         file(GLOB _srcs CONFIGURE_DEPENDS ${src_dir}/*.c)
         message(STATUS "add_module_if_enabled: ${name} - found ${_srcs} source files")
         if(_srcs)
@@ -402,6 +407,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_spi
     hardware_i2c
     hardware_irq
+    # v2.4 超频档位（sysclk_apply_tier）依赖 vreg / pll / clocks；
+    # SSI(flash 控制器)是直接寄存器访问(hardware/structs/ssi.h)，无独立库
+    hardware_vreg
+    hardware_pll
+    hardware_clocks
+    # v2.4 多核：config_mcore_apply 用 multicore_launch_core1 启动 core1
+    pico_multicore
 )
 # 按模块裁剪开关按需链接（模块未启用时 target 不存在，不能直接写进上面的列表）
 # 依赖顺序：模块 → kernel_core → hal_port（模块引用内核核心的符号）

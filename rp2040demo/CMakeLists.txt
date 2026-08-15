@@ -91,16 +91,17 @@ if(OS_CFG_DEFINES)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ${OS_CFG_DEFINES})
 endif()
 
-# USB CDC 关键定义：确保串口输出不阻塞、USB 枚举不要求 DTR
+# USB CDC 关键定义：半阻塞输出（FIFO 满等 1s 让主机读走，避免开机打印不全）、
+# USB 枚举不要求 DTR
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
-    PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
-    # 【v2.2.5 致命修复】SDK default alarm_pool 默认用 ALARM3，
-    #   与内核 hal_systick_init 的 ALARM3 + TIMER_IRQ_3 冲突！
-    #   irq_set_exclusive_handler(3, systick_irq_handler) 内部
-    #   hard_assert 失败 → panic("Hard assert") → bkpt#0 → HardFault → 爆闪
-    #   修复：让 SDK alarm_pool 用 ALARM0，内核独占 ALARM3
-    PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=0
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000
+    # 【v2.4 调整】内核 systick 已改用 ALARM0 + TIMER_IRQ_0（见 hal_port.c
+    #   KTICK_ALARM_IDX=0），因此 SDK alarm_pool 必须用 ALARM3（即 SDK
+    #   默认值），两者不冲突。之前设成 0 是为了给旧内核 ALARM3 让路，
+    #   现在内核改用 ALARM0，若仍设 0 会与内核抢占 ALARM0 →
+    #   irq_set_exclusive_handler 断言失败 → panic → LED 爆闪。
+    PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=3
 )
 
 # v2.2: USB Composite (CDC+MSC) 强制 TinyUSB 打开 MSC class。
@@ -146,6 +147,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_spi
     hardware_i2c
     hardware_irq
+    pico_multicore   # 多核：config_mcore_apply 启动 core1
 )
 # 直接使用 *_ENABLED 变量判断模块链接（由 mini-kernel 的 add_module_if_enabled 设置）
 if(periph_module_ENABLED)

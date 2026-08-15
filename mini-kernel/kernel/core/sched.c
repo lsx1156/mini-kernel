@@ -8,9 +8,12 @@
 
 /* ================================================================
  * 就绪队列：双向循环链表，按权重分桶（简化版：单队列 + 计数器）
+ * 【多核】每核心一份独立队列，任务按 core 字段归入对应核心队列。
  * ================================================================ */
-static tcb_t g_ready_head = { .next = &g_ready_head, .prev = &g_ready_head };
-static tcb_t g_sleep_head = { .next = &g_sleep_head, .prev = &g_sleep_head };
+static tcb_t g_ready_head[OS_CFG_CORE_COUNT];
+static tcb_t g_sleep_head[OS_CFG_CORE_COUNT];
+
+static inline uint32_t sched_core(void) { return hal_core_id(); }
 
 /* ================================================================
  * 就绪队列操作
@@ -37,11 +40,12 @@ void _sched_ready_enqueue(tcb_t *task) {
     if (task->next != NULL || task->prev != NULL) {
         return;
     }
-    /* 尾插 */
-    task->next = &g_ready_head;
-    task->prev = g_ready_head.prev;
-    g_ready_head.prev->next = task;
-    g_ready_head.prev = task;
+    /* 尾插到 task->core 对应核心的就绪队列 */
+    tcb_t *head = &g_ready_head[task->core];
+    task->next = head;
+    task->prev = head->prev;
+    head->prev->next = task;
+    head->prev = task;
 }
 
 void _sched_ready_remove(tcb_t *task) {
@@ -71,8 +75,10 @@ void sched_ready_remove(tcb_t *task) {
 }
 
 tcb_t *sched_ready_pick_next(void) {
-    if (g_ready_head.next == &g_ready_head) {
-        return &g_idle_task;  /* 无就绪任务，跑空闲任务 */
+    uint32_t core = sched_core();
+    tcb_t *head = &g_ready_head[core];
+    if (head->next == head) {
+        return &g_idle_task_table[core];  /* 无就绪任务，跑本核空闲任务 */
     }
 
     /* 取队头并从队列移除（变为 RUNNING，不在就绪队列中）。
@@ -89,7 +95,7 @@ tcb_t *sched_ready_pick_next(void) {
      *    重新入队（仅当仍为 READY）。idle 永不入队，是空队列兜底。
      *
      *    注意：此函数可能在中断上下文中被调用，使用内部版本 */
-    tcb_t *next = g_ready_head.next;
+    tcb_t *next = head->next;
     _sched_ready_remove(next);  /* 可能在中断上下文，使用内部版本 */
     return next;
 }
@@ -105,9 +111,11 @@ void _sched_sleep_enqueue(tcb_t *task) {
     if (task->next != NULL || task->prev != NULL) {
         return;
     }
-    /* 按剩余 tick 排序（小在前），O(n) 够用，任务数 ≤ 16 */
-    tcb_t *pos = g_sleep_head.next;
-    while (pos != &g_sleep_head && pos->ticks_to_sleep <= task->ticks_to_sleep) {
+    /* 按剩余 tick 排序（小在前），O(n) 够用，任务数 ≤ 16。
+     * 归入 task->core 对应核心的睡眠队列。 */
+    tcb_t *head = &g_sleep_head[task->core];
+    tcb_t *pos = head->next;
+    while (pos != head && pos->ticks_to_sleep <= task->ticks_to_sleep) {
         pos = pos->next;
     }
     task->next = pos;
@@ -143,11 +151,13 @@ void sched_sleep_remove(tcb_t *task) {
 }
 
 void sched_sleep_tick(void) {
-    /* 注意：此函数在 SysTick 中断上下文中被调用
+    /* 注意：此函数在 SysTick 中断上下文中被调用（本核心）
      * 不需要额外关中断（硬件已自动禁止中断嵌套）
-     * 使用内部版本直接操作链表 */
-    tcb_t *curr = g_sleep_head.next;
-    while (curr != &g_sleep_head) {
+     * 使用内部版本直接操作链表，只推进本核睡眠队列 */
+    uint32_t core = sched_core();
+    tcb_t *head = &g_sleep_head[core];
+    tcb_t *curr = head->next;
+    while (curr != head) {
         if (curr->ticks_to_sleep > 0) {
             curr->ticks_to_sleep--;
         }
@@ -167,7 +177,13 @@ void sched_sleep_tick(void) {
  * 调度器初始化与启动
  * ================================================================ */
 void sched_init(void) {
-    /* 队列已静态初始化 */
+    /* 初始化每核就绪/睡眠队列为自环空队列 */
+    for (uint32_t c = 0; c < OS_CFG_CORE_COUNT; c++) {
+        g_ready_head[c].next = &g_ready_head[c];
+        g_ready_head[c].prev = &g_ready_head[c];
+        g_sleep_head[c].next = &g_sleep_head[c];
+        g_sleep_head[c].prev = &g_sleep_head[c];
+    }
 }
 
 void sched_start(void) {

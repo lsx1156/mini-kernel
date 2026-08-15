@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.2.6 ✅ STABLE` — 🟢 **调度系统已完全正常 + Linux 风格任务控制**：vtest 三任务嵌套调度验证器 + Ctrl+C 中断 + jobs 命令 + readline 输入行保护
+> **当前版本**：`2.4.0 🔬 探索` — 🟡 **超频档位 + 多核固化**（v2.4）：默认单核 + 125MHz，通过 `ovclk` 指令设置档位/多核并固化到独立 Flash Config 区，冷启动应用；未固化/损坏则安全回退单核 + 原始频率。多核调度器为脚手架（标志已持久化，`config_mcore_apply` 钩子预留）。
 >
 > **v2.2 大版本亮点**
 >
@@ -96,6 +96,7 @@ project/
 | **v2.2.7**         | ✅ Released | 🟢 **0.96" I2C OLED 底层驱动重构 + 调度权重可调**：① 底层驱动抽离——命令/数据统一走 16 位 I2C 编码（Co 控制字节），`set_addr` 改旧式寻址 + 列偏移，`write_block` 数据块写入，与网上通用 0.96 驱动写法对齐，解决花屏/寻址错位。② 驱动缓冲全部从任务栈移出到 BSS 静态区，消除 GCC nested function trampoline 与栈帧指针错乱导致的 HardFault。③ I2C 事务失败自动重试 + `hal_i2c_init` 外设复位重试，解决 VT3 suspend/resume 打断白帧刷新导致 page 1~7 全挂。④ I2C 时钟 100kHz → 400kHz，刷新提速 4 倍。⑤ VT2 权重 1 → 8（时间片 5ms → 40ms），整帧 25ms 在一个时间片内跑完 → 肉眼瞬间整屏切换（消除逐行扫描）。⑥ `help` 新增"调度说明"：weight=时间片倍数、非抢占、无优先级。⚠️ 曾标注已知问题：应用层轮询连续 >30 次 HardFault 崩溃风险 → **已在 v2.3.6 根治**。 |
 | **v2.3.6**         | ✅ **当前稳定**（HEAD） | 🟢 **根治 >30 次轮询崩溃（I2C 单事务原子性）**：**根因**——VT3 每 10s 对 VT2 做 `task_suspend/resume`，若 VT2 恰在 `i2c_write_timeout_us` 中途被挂起 3s，SDK 的 200ms 超时是"调用起点算起的绝对截止"，恢复后立即判超时 → `HAL_ERR_IO` → 反复 `reinit`（`i2c_init` 复位外设）→ 累积约 30 轮后 I2C 外设状态/堆被反复复位打乱 → HardFault；同时表现为"屏幕刷新错误随轮询递增"。**修复**——用 PRIMASK 临界区包住 VT2 的"单次 I2C 事务"（`vt2_oled_tx_cmds` / `vt2_oled_write_block` 内的 `hal_i2c_tx`），使 PendSV 上下文切换无法打断一次 START..STOP 事务（400kHz 下单次约 6B~133B，最多 ~3ms 关中断）；VT3 的 suspend 在 VT2 完成本次事务、重新开中断后才生效，VT2 永不带着过期截止指针被挂起。 |
 | v2.3               | 📋 规划      | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示                                                                                                                                                                                                                                                |
+| **v2.4.0**         | 🔬 探索（HEAD） | 🟡 **超频档位 + 多核固化**：默认单核 + 125MHz；`ovclk list/set/mcore/get/save/unsave` 指令设置档位（125/150/200/250/270/300MHz，后两档隐藏）与多核标志，固化到 MSC 尾部新划的独立 **Flash Config 区**（4KB，魔数+版本+CRC32 保护）；冷启动 `config_apply()` 在 `sched_start` 前应用，未固化/损坏安全回退单核 + 125MHz。超频切换 SYS PLL + CLK\_PERI 钳回 125MHz + SSI/XIP 分频缩放 + vreg 升压。多核调度器为脚手架（标志持久化 + `config_mcore_apply` 弱钩子，实装待 v3.5）。                                                                                                                                                                                                                                                |
 | v3.0               | 🗓️ 规划     | VFS 抽象层 + 多分区 + SD Card (SPI1)                                                                                                                                                                                                                                                         |
 | v3.5               | 🗓️ 规划     | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植                                                                                                                                                                                                                                               |
 

@@ -32,11 +32,11 @@ set "TOOLCHAIN_BIN=C:\Users\master\.platformio\packages\toolchain-gccarmnoneeabi
 set "CMAKE_BIN=C:\Program Files\CMake\bin"
 set "NINJA_BIN=C:\Users\master\AppData\Local\Programs\Python\Python312\Scripts"
 set "PROJECT_ROOT=%~dp0"
-REM 去掉 %~dp0 末尾的反斜杠，否则 -S "%PROJECT_ROOT%" 中 \" 会转义引号
+REM strip trailing backslash from %~dp0 so -S "%PROJECT_ROOT%" does not escape the quote
 if "%PROJECT_ROOT:~-1%"=="\" set "PROJECT_ROOT=%PROJECT_ROOT:~0,-1%"
-set "BUILD_DIR=%PROJECT_ROOT%build"
+set "BUILD_DIR=%PROJECT_ROOT%\build"
 set "UF2=%BUILD_DIR%\mini_kernel.uf2"
-set "TOOLCHAIN_FILE=%PROJECT_ROOT%toolchain-arm-none-eabi.cmake"
+set "TOOLCHAIN_FILE=%PROJECT_ROOT%\toolchain-arm-none-eabi.cmake"
 set "LOG=%BUILD_DIR%\build.log"
 
 cd /d "%PROJECT_ROOT%"

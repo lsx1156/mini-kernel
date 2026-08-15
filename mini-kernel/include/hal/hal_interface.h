@@ -147,6 +147,46 @@ typedef struct {
 /* 由移植层 hal_port.c 定义并导出 */
 extern const hal_export_t hal_export;
 
+/* 软复位系统（重启后重新执行完整启动流程，重现开机 banner）。
+ * 由移植层 hal_port.c 强符号实现，shell `reboot` 命令调用。 */
+void hal_system_reset(void) __attribute__((noreturn));
+
+/* ================================================================
+ * 1.5 板级基础功能（移植必须实现强符号，让内核核心保持平台无关）
+ *
+ *  这些接口把内核启动/诊断阶段对"板子"的依赖（LED、延时、早期诊断
+ *  串口、控制台就绪、全局中断开关）全部收敛到移植层。新 MCU 只要在
+ *  对应的 hal_port.c 实现它们，内核核心（kernel/core）无需改动即可
+ *  编译运行，从而保证内核库纯净、可移植到任意 MCU。
+ * ================================================================ */
+void hal_led_init(void);              /* 初始化板载状态 LED */
+void hal_led_set(int on);             /* 设置 LED 状态（1=亮 0=灭） */
+void hal_led_on(void);                /* 点亮板载 LED */
+void hal_led_off(void);               /* 熄灭板载 LED */
+void hal_delay_ms(uint32_t ms);       /* 阻塞延时（诊断/空闲循环用，轮询实现，不依赖调度器） */
+int  hal_console_ready(void);         /* 控制台是否就绪（如 USB CDC 已枚举），非阻塞 */
+void hal_irq_enable(void);            /* 开全局中断 */
+void hal_irq_disable(void);           /* 关全局中断 */
+uint32_t hal_core_id(void);           /* 当前运行核心号（0/1） */
+void hal_mcore_start(void);           /* 若已固化多核，启动 core1（由 boot_setup 在 core0 稳定后调用） */
+uint32_t hal_mcore_core1_ticks(void); /* 诊断：core1 产生的 tick 计数 */
+
+/* 开机日志缓存回放（v2.4.3）：
+ *   启动阶段 hal_console_putc 的输出会被移植层同步捕获进 RAM 缓冲；
+ *   内核在启动流程结束（sched_start 前）调用 hal_bootlog_end() 停止捕获。
+ *   之后若主机（如 USB 终端）迟于启动才连接，移植层检测到连接时会把
+ *   缓存的完整开机日志回放一遍，保证"无论何时打开终端都能看到开机画面"。 */
+void hal_bootlog_end(void);
+
+/* 早期诊断输出：在调度器启动前（sched_start 之前）也必须可用。
+ *   · hal_diag_init()  初始化早期诊断通道（如 UART0 115200）
+ *   · hal_diag_putc()  直接写硬件寄存器，绝不触发调度/中断（PendSV 安全）
+ * 用于打印 [CONFIG] 等冷启动关键信息，移植层用 UART 或其它早期通道实现。 */
+void hal_diag_init(void);
+void hal_diag_putc(char c);
+void hal_diag_puts(const char *s);
+void hal_diag_put_u32(uint32_t v);
+
 /* ================================================================
  * 4. 便捷宏（内核内部使用，上层应用勿直接调用）
  * ================================================================ */

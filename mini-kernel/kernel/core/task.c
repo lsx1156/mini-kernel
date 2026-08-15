@@ -11,8 +11,8 @@
 /* ================================================================
  * 静态资源
  * ================================================================ */
-tcb_t g_idle_task;
-tcb_t *g_current_task = NULL;
+tcb_t g_idle_task_table[OS_CFG_CORE_COUNT];
+tcb_t *g_current_task_table[OS_CFG_CORE_COUNT] = {0};
 tcb_t *g_task_pool[OS_CFG_MAX_TASKS] = {0};
 uint8_t g_task_bitmap = 0;
 static uint32_t g_next_task_id = 1;
@@ -53,28 +53,32 @@ static void task_free_slot(int slot) {
  * 模块初始化
  * ================================================================ */
 void task_module_init(void) {
-    /* 创建空闲任务 */
-    memset(&g_idle_task, 0, sizeof(tcb_t));
-    g_idle_task.stack_base = g_idle_stack + OS_CFG_IDLE_STACK_SIZE;
-    g_idle_task.stack_size = OS_CFG_IDLE_STACK_SIZE;
-    g_idle_task.priority = 0;
-    g_idle_task.weight = 1;
-    g_idle_task.state = TASK_STATE_READY;
-    g_idle_task.id = 0;
-    strncpy(g_idle_task.name, "idle", sizeof(g_idle_task.name) - 1);
-    task_stack_init(&g_idle_task);
+    /* 为每个核心创建空闲任务。空闲任务不入就绪队列，是空队列兜底。
+     * 上下文初始化只需写 RAM 栈帧，可在 core0 上为所有核心统一完成。 */
+    for (uint32_t c = 0; c < OS_CFG_CORE_COUNT; c++) {
+        tcb_t *idle = &g_idle_task_table[c];
+        memset(idle, 0, sizeof(tcb_t));
+        idle->stack_base = g_idle_stack + OS_CFG_IDLE_STACK_SIZE;
+        idle->stack_size = OS_CFG_IDLE_STACK_SIZE;
+        idle->priority = 0;
+        idle->weight = 1;
+        idle->state = TASK_STATE_READY;
+        idle->id = 0;
+        idle->core = (uint8_t)c;
+        strncpy(idle->name, "idle", sizeof(idle->name) - 1);
+        task_stack_init(idle);
 
-    /* 初始化上下文 */
-    hal_context_t ctx;
-    hal_context_init(&ctx, g_idle_task.stack_base, idle_task_entry, NULL);
-    g_idle_task.sp = (uint32_t *)ctx.sp;
+        hal_context_t ctx;
+        hal_context_init(&ctx, idle->stack_base, idle_task_entry, NULL);
+        idle->sp = (uint32_t *)ctx.sp;
+    }
 
     /* 加入任务池（供 ps 命令列出），但**不入就绪队列**。
      * idle 是 sched_ready_pick_next 空队列时的兜底，永远不应出现在
      * 就绪队列中——否则会被 pick_next 选为 RUNNING 并从队列移除，
      * 与"兜底"语义冲突，且在旧版 pick_next（remove+enqueue）下
      * 会引发链表重复入队损坏。 */
-    g_task_pool[0] = &g_idle_task;
+    g_task_pool[0] = &g_idle_task_table[0];
     g_task_bitmap |= 1;
 }
 
@@ -83,7 +87,13 @@ void task_module_init(void) {
  * ================================================================ */
 tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
                    size_t stack_size, uint8_t priority) {
+    return task_create_on(name, entry, arg, stack_size, priority, 0);
+}
+
+tcb_t *task_create_on(const char *name, void (*entry)(void *), void *arg,
+                      size_t stack_size, uint8_t priority, uint8_t core) {
     if (!entry || stack_size < 128) return NULL;
+    if (core >= OS_CFG_CORE_COUNT) core = 0;   /* 非法核心回退 core0 */
 
     /* 对齐栈大小 */
     stack_size = (stack_size + 7) & ~7;
@@ -133,6 +143,7 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
     task->priority = priority;
     task->weight = (priority > 0) ? priority : 1;
     task->state = TASK_STATE_READY;
+    task->core = core;                       /* 多核：绑定核心 */
     if (name) {
         strncpy(task->name, name, sizeof(task->name) - 1);
     } else {
@@ -146,7 +157,7 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
     hal_context_init(&ctx, task->stack_base, entry, arg);
     task->sp = (uint32_t *)ctx.sp;
 
-    /* 加入任务池与就绪队列（队列操作内部有临界区保护） */
+    /* 加入任务池与就绪队列（入队到 task->core 对应核心的队列） */
     g_task_pool[slot] = task;
     sched_ready_enqueue(task);
 
@@ -326,26 +337,25 @@ void task_resume(tcb_t *task) {
 void idle_task_entry(void *arg) {
     (void)arg;
 
-    register const uint32_t SIO_BASE = 0xD0000000u;
-    register const uint32_t MASK25   = 0x02000000u;
-
     for (;;) {
 #if OS_CFG_TICKLESS
         /* TICKLESS 模式：进入 WFI 等中断唤醒，最低功耗 */
         __asm volatile ("wfi");
 #else
-        /* 驱动 TinyUSB 状态机：与 usb_print_test 的主循环
-         *   while(1) { tud_task(); ... sleep_ms(500); }
-         * 等价，但这里更频繁（1ms 级），确保 CDC OUT 数据不堆积。 */
-        extern void hal_usb_poll(void);
-        hal_usb_poll();
+        /* 驱动 TinyUSB 状态机（仅 core0）：core1 的空闲任务不触碰 USB，
+         * 避免双核同时调用 dcd_int_handler/tud_task 破坏 TinyUSB 状态。
+         * 与 usb_print_test 的主循环等价，但这里更频繁（1ms 级）。
+         * core1 空闲时纯忙等，把 CPU 让给可能的 core1 业务任务。 */
+        if (hal_core_id() == 0) {
+            extern void hal_usb_poll(void);
+            hal_usb_poll();
+        }
 
         /* 短 busy-wait ≈ 1ms，不调 task_sleep（idle 不能睡）。
          * 用 hal_systick_delay_us 而非 nop 循环，可自动适配实际时钟频率
          * （底层调 busy_wait_us_32，基于硬件 timer 计数，精度高且不依赖
          * CPU 频率硬编码）。 */
         hal_systick_delay_us(1000);
-        (void)SIO_BASE; (void)MASK25;  /* 避免未使用警告 */
 #endif
     }
 }

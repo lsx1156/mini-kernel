@@ -62,7 +62,20 @@ int shell_ext_get(int idx, const char **out_name, shell_cmd_fn_ext_t *out_fn,
 
 /* ---------- 输出 helper（直接走 hal_console_putc，避免依赖 shell.c static 内部）---------- */
 void shell_putc(shell_ctx_t *ctx, char c)           { (void)ctx; hal_console_putc(c); }
-void shell_puts(shell_ctx_t *ctx, const char *s)    { (void)ctx; while (*s) hal_console_putc(*s++); }
+
+/* 【换行修复】裸 "\n" → "\r\n"：终端（PuTTY）收到单个 \n 只下移、不回行首，
+ * 导致连续多行输出错乱（每行都从上一行末尾续写）。这里把裸 \n 补上 \r；
+ * 若已是 "\r\n"（prev=='\r'）则不再重复补，避免 "\r\r\n"。 */
+void shell_puts(shell_ctx_t *ctx, const char *s) {
+    (void)ctx;
+    char prev = 0;
+    while (*s) {
+        char c = *s++;
+        if (c == '\n' && prev != '\r') hal_console_putc('\r');
+        hal_console_putc(c);
+        prev = c;
+    }
+}
 
 int  shell_snprintf(char *buf, size_t bufsz, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);

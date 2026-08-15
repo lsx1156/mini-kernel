@@ -207,6 +207,7 @@ static int cmd_unsave(int argc, char **argv);
 static int cmd_list(int argc, char **argv);
 static int cmd_boot(int argc, char **argv);
 static int cmd_factory_reset(int argc, char **argv);
+static int cmd_reboot(int argc, char **argv);
 static int cmd_vtest(int argc, char **argv);
 static int cmd_jobs(int argc, char **argv);
 
@@ -287,6 +288,7 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "boot: 固化指令子系统；exec=立即跑；status=查看上次回放结果(解决启动时USB输出被丢)；flash_test=B线路SPI自检" },
     { "factory_reset", cmd_factory_reset, "factory_reset | factory_reset confirm",
                                                     "出厂重置：擦除所有持久化数据(bootscript+末尾保留区)；保留内核固件本身" },
+    { "reboot",   cmd_reboot,   "reboot",            "软复位系统：重新执行完整启动流程(重现开机画面 + 应用固化超频/多核)" },
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
@@ -1426,6 +1428,20 @@ static int cmd_factory_reset(int argc, char **argv) {
 }
 
 /* ================================================================
+ * reboot：软复位系统
+ *   写 AIRCR.SYSRESETREQ 触发系统复位 → 重新执行完整启动流程，
+ *   从而重现首次开机画面（[CONFIG] 超频档位 + boot banner + MSC 状态）。
+ *   若已 `ovclk save` 固化档位/多核，也会在重启后应用。
+ * ================================================================ */
+static int cmd_reboot(int argc, char **argv) {
+    (void)argc; (void)argv;
+    sh_puts("Rebooting now... (system will re-run full boot sequence)\r\n");
+    /* 排空 CDC 输出后复位。此函数不返回。 */
+    hal_system_reset();
+    return 0;   /* 不可达 */
+}
+
+/* ================================================================
  * 执行单条命令（新增："!" 前缀糖衣）
  *   "! gpio init 25 out 1" → 先执行 "gpio init 25 out 1"，
  *                             成功 (rc=0) 再 save 到 Flash；
@@ -2371,6 +2387,10 @@ static void task_shell(void *arg) {
     /* v2.2 ① 先注册扩展命令（msc/ls/cd/pwd/mkdir/rmdir/rm/cat）到 shell_register
      *        动态命令表。这样 help + dispatch 都能立即看到它们。 */
     shell_fs_register();
+    /* v2.4 ② 注册 ovclk（超频 / 多核固化）命令 */
+    shell_ovclk_register();
+    /* v2.4 ③ 注册 mcore（多核调度测试）命令 */
+    shell_mcore_register();
 
 #if OS_CFG_FATFS
     /* v2.2 ② 挂载 FatFs（空片时会自动 f_mkfs FAT16）
