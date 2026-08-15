@@ -432,22 +432,16 @@ endif()
 # 这样一根 USB 线既能烧录也能交互，不用再接 USB-UART 线。
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
-pico_add_extra_outputs(${PROJECT_NAME})
 
 # ================================================================
-# 8. 体积红线检查（构建后自动解析 .map 文件）
+# 【顺序关键】先构建诊断固件，再修改 pico_stdio_usb 的 INTERFACE_SOURCES。
+#   诊断固件（usb_print_test）依赖 Pico SDK 自带的默认 CDC 描述符
+#   （stdio_usb_descriptors.c）；修改 pico_stdio_usb 会全局影响所有后续
+#   链接它的目标，所以必须先建诊断目标，再做过滤。
 # ================================================================
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -DCMAKE_SOURCE_DIR=${MINIK_ROOT}
-        -DPROJECT_NAME=${PROJECT_NAME}
-        -DMAX_FLASH_KB=10 -DMAX_RAM_KB=4
-        -P ${MINIK_ROOT}/cmake/check_size.cmake
-    COMMENT "Checking firmware size against volume limits..."
-    VERBATIM
-)
 
 # ================================================================
-# 9. 诊断固件：最小 SDK 闪灯（不链接 Mini Kernel，纯 SDK API）
+# 8. 诊断固件：最小 SDK 闪灯（不链接 Mini Kernel，纯 SDK API）
 #    用途：分流"硬件/烧录通路问题" vs "Mini Kernel 内部问题"
 #    → 若本程序烧录后也不亮：硬件/板型/刷写操作问题
 #    → 若本程序正常闪：硬件通路 OK，问题在内核代码
@@ -483,6 +477,46 @@ if(EXISTS ${MINIK_ROOT}/tests/usb_print_test.c)
     pico_add_extra_outputs(usb_print_test)
     message(STATUS "Diagnostic target: usb_print_test (pure SDK USB CDC print)")
 endif()
+
+# ================================================================
+# 9. v2.2：移除 Pico SDK 自带的默认 USB 描述符（仅 CDC），
+#       我们在 port/rp2040/msc_usb.c 里提供 Composite (CDC+MSC) 的描述符。
+#       否则会出现 multiple definition 链接错误。
+#       pico_stdio_usb 是 INTERFACE 库：修改其 INTERFACE_SOURCES 属性，
+#       过滤掉 stdio_usb_descriptors.c，保留 reset_interface.c + stdio_usb.c
+#       （后者提供 CDC ACM 的读写逻辑）。
+#       注意：此修改全局生效，**必须在诊断固件 usb_print_test 之后执行**。
+# ================================================================
+if(TARGET pico_stdio_usb)
+    get_target_property(_STDIO_USB_IFACE_SRCS pico_stdio_usb INTERFACE_SOURCES)
+    if(_STDIO_USB_IFACE_SRCS)
+        set(_STDIO_USB_FILTERED "")
+        foreach(_s ${_STDIO_USB_IFACE_SRCS})
+            get_filename_component(_s_name "${_s}" NAME)
+            if(NOT "${_s_name}" STREQUAL "stdio_usb_descriptors.c")
+                list(APPEND _STDIO_USB_FILTERED "${_s}")
+            endif()
+        endforeach()
+        set_target_properties(pico_stdio_usb PROPERTIES
+            INTERFACE_SOURCES "${_STDIO_USB_FILTERED}"
+        )
+        message(STATUS "[mini-kernel v2.2] Removed stdio_usb_descriptors.c from pico_stdio_usb (using msc_usb.c Composite descriptors)")
+    endif()
+endif()
+
+pico_add_extra_outputs(${PROJECT_NAME})
+
+# ================================================================
+# 10. 体积红线检查（构建后自动解析 .map 文件）
+# ================================================================
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_SOURCE_DIR=${MINIK_ROOT}
+        -DPROJECT_NAME=${PROJECT_NAME}
+        -DMAX_FLASH_KB=10 -DMAX_RAM_KB=4
+        -P ${MINIK_ROOT}/cmake/check_size.cmake
+    COMMENT "Checking firmware size against volume limits..."
+    VERBATIM
+)
 
 # ================================================================
 # 10. 单元测试目标（Unity + 本地运行）

@@ -45,22 +45,44 @@ extern void tud_task_ext(uint32_t timeout_ms, int in_isr);
 extern void kernel_tick_hook(void);
 
 /* ================================================================
- * 1. 系统滴答定时器（TIMER_IRQ_0）
- * ================================================================ */
-static volatile uint32_t g_tick_count = 0;
-static volatile uint32_t g_tick_interval_us = 1000u; /* 默认 1ms @ 1000Hz */
-
-/* TIMER_IRQ_0 中断处理：清中断 + 累计 tick + 重设 alarm + 调内核钩子。
+ * 1. 系统滴答定时器（TIMER_IRQ_3 ← 使用 ALARM3，不与 SDK alarm_pool 冲突）
  *
- *   RP2040 Timer 的 ALARM0 是一次性触发：触发后 armed 位自动清 0，
- *   必须在中断里重写 alarm[0] 才能产生下一个周期。
- *   intr 寄存器是 write-1-to-clear，写 bit0 清 ALARM0 flag。
+ * ⚠️ 【v2.2.4 修复：电脑烧录后看不到串口（USB 完全不枚举）的根因】
+ *   Pico SDK 默认 alarm_pool（驱动 stdio_usb / TinyUSB 的超时、端点握手定时、
+ *   alarm_pool 回调等）**独占使用 ALARM0 + TIMER_IRQ_0**。
+ *   旧代码调用 `irq_set_exclusive_handler(TIMER_IRQ_0, systick_irq_handler)`
+ *   直接覆盖 SDK 已注册好的 ALARM0 handler → SDK alarm_pool 回调从此永远
+ *   不触发 → TinyUSB 的 CDC/MSC 状态机（SET_ADDRESS、端点 0 DATA 阶段、
+ *   帧间隔 SOF 等）超时机制全失效 → USB 枚举走到一半卡死 → Windows 完全
+ *   识别不出 COM 口 / U 盘盘符 → 用户症状："烧录后没看到串口"。
+ *
+ * ✅ 修复：改用 ALARM3 + TIMER_IRQ_3。Pico SDK 约定：ALARM0 给默认
+ *   alarm_pool 用，ALARM1/2/3 留给用户代码自由使用。我们的内核 tick 只
+ *   需要一个周期性 alarm，用 ALARM3 零冲突。
+ * ================================================================ */
+volatile uint32_t g_tick_count = 0;
+volatile uint32_t g_tick_interval_us = 1000u; /* 默认 1ms @ 1000Hz */
+
+/* 寄存器位掩码常量（ALARM3 = bit3）——集中定义一处避免写错 */
+#define KTICK_ALARM_IDX       3u                         /* alarm[3] */
+#define KTICK_TIMER_IRQ       TIMER_IRQ_3                /* 对应中断号 = 3 */
+#define KTICK_TIMER_BIT       (1u << KTICK_ALARM_IDX)    /* intr / inte / armed 寄存器 bit3 */
+
+/* TIMER_IRQ_3 中断处理：清中断 + 累计 tick + 重设 alarm3 + 调内核钩子。
+ *
+ *   RP2040 Timer 每个 ALARM 都是一次性触发：触发后 armed 位自动清 0，
+ *   必须在中断里重写 alarm[N] 才能产生下一个周期。
+ *   intr 寄存器是 write-1-to-clear，写 KTICK_TIMER_BIT 清 ALARM3 flag。
  *   间隔基于 timerawl（当前计数器低 32 位）+ interval_us，避免
  *   漂移累积。 */
-static void systick_irq_handler(void) {
-    hw_clear_bits(&timer_hw->intr, 1u);                   /* 清 ALARM0 中断 */
+void systick_irq_handler(void) {
+    /* 【致命 Bug 修复】INTR 是 write-1-to-clear 寄存器。
+     * hw_clear_bits 做的是 *addr &= ~mask，对 W1C 寄存器等于写 0 → 不清中断！
+     * 导致 tick 中断无限重入 → CPU 卡死在 TIMER_IRQ_3 → 调度器状态损坏 → HardFault。
+     * 正确做法：直接写 KTICK_TIMER_BIT 到 INTR（写 1 清除对应位）。 */
+    timer_hw->intr = KTICK_TIMER_BIT;                     /* 清 ALARM3 中断 (W1C) */
+    timer_hw->alarm[KTICK_ALARM_IDX] = timer_hw->timerawl + g_tick_interval_us;
     g_tick_count++;
-    timer_hw->alarm[0] = timer_hw->timerawl + g_tick_interval_us;
     kernel_tick_hook();
 }
 
@@ -68,24 +90,26 @@ static void hal_systick_init_impl(uint32_t tick_hz) {
     if (tick_hz == 0u) tick_hz = 1000u;
     g_tick_interval_us = 1000000u / tick_hz;
 
-    /* 关闭 alarm0 中断使能 + 清 armed 标志，配置过程中不触发 IRQ */
-    hw_clear_bits(&timer_hw->inte, 1u);
-    hw_clear_bits(&timer_hw->armed, 1u);
+    /* 关闭 alarm3 中断使能 + 清 armed 标志，配置过程中不触发 IRQ。
+     * ARMED 也是 write-1-to-clear，必须直接写 KTICK_TIMER_BIT（不能用 hw_clear_bits）。 */
+    hw_clear_bits(&timer_hw->inte, KTICK_TIMER_BIT);
+    timer_hw->armed = KTICK_TIMER_BIT;
 
     /* 设置首次 alarm */
-    timer_hw->alarm[0] = timer_hw->timerawl + g_tick_interval_us;
+    timer_hw->alarm[KTICK_ALARM_IDX] = timer_hw->timerawl + g_tick_interval_us;
 
-    /* 注册 IRQ 处理函数 + 设优先级最低 */
-    irq_set_exclusive_handler(TIMER_IRQ_0, systick_irq_handler);
-    irq_set_priority(TIMER_IRQ_0, 0xFFu);
+    /* 注册 IRQ 处理函数 + 设优先级最低（不抢占 TinyUSB / SDK 关键中断） */
+    irq_set_exclusive_handler(KTICK_TIMER_IRQ, systick_irq_handler);
+    irq_set_priority(KTICK_TIMER_IRQ, 0xFFu);
 
-    /* PendSV 优先级最低（0xE000ED23 = SHPR3 的高字节，对应 PendSV），
-     * 避免 PendSV 抢占 TIMER_IRQ_0 导致 tick_hook 重入。 */
-    *(volatile uint8_t *)0xE000ED23u = 0xFFu;
+    /* PendSV 优先级最低（0xE000ED22 = SHPR3[2] = EXC#14 PendSV），
+     * 避免 PendSV 抢占 TIMER_IRQ_3 tick 中断导致调度器重入、队列损坏。
+     * Cortex-M0+ SHPR3 字节布局：[20]=#12 [21]=#13 [22]=#14 PendSV [23]=#15 SysTick */
+    *(volatile uint8_t *)0xE000ED22u = 0xFFu;
 
-    /* 开启 alarm0 INTE + NVIC */
-    hw_set_bits(&timer_hw->inte, 1u);
-    irq_set_enabled(TIMER_IRQ_0, true);
+    /* 开启 alarm3 INTE + NVIC */
+    hw_set_bits(&timer_hw->inte, KTICK_TIMER_BIT);
+    irq_set_enabled(KTICK_TIMER_IRQ, true);
 }
 
 static uint32_t hal_systick_get_tick_impl(void) {

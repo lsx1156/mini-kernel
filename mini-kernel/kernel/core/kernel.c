@@ -22,7 +22,13 @@
 #include "os_config.h"
 
 #include "pico/stdlib.h"
+#include "pico/time.h"   /* sleep_ms / busy_wait — 不依赖 stdio 初始化，关中断也能工作 */
+#include "hardware/timer.h"
+#include "hardware/irq.h"
 #include <stdio.h>
+
+/* 从 hal_port.c 导出的符号 */
+extern volatile uint32_t g_tick_interval_us;
 #ifndef PICO_DEFAULT_LED_PIN
 #  define PICO_DEFAULT_LED_PIN 25
 #endif
@@ -42,7 +48,7 @@
  *                            给用户"打开 PuTTY 再开机"捕捉 banner 的时间。
  * ================================================================ */
 #ifndef MK_BOOT_DIAG_LED
-#  define MK_BOOT_DIAG_LED   0
+#  define MK_BOOT_DIAG_LED   0   /* 0 = 关闭所有 stage 闪烁 */
 #endif
 
 extern uint8_t __end__;
@@ -63,21 +69,20 @@ void SysTick_Handler(void);
 void kernel_tick_hook(void);
 
 /* ================================================================
- * 板载 LED 初始化（main 开头直接写寄存器，避免 SDK 行为）
+ * 板载 LED 初始化（v2.2.4 修复：用 SDK gpio_* API，与 minimal_led_test.c
+ * 完全一致；sleep_ms / busy_wait_until 直接读 TIMER 硬件寄存器，
+ * 关中断下也能正常工作，不依赖 systick 或 alarm IRQ）。
  * ================================================================ */
 static inline void _led_init(void) {
-    /* PADS_BANK0: GPIO25 — ISO=0 OD=0 IE=0 DRIVE=1(4mA) PUE=0 PDE=0 SCHMITT=1 SLEWFAST=0 */
-    *(volatile uint32_t *)(0x4001C000 + 0x6C) = 0x00000056;
-    /* IO_BANK0: GPIO25 = FUNC5 (SIO) */
-    *(volatile uint32_t *)(0x40014000 + 0x0CC) = 0x00000005;
-    /* SIO GPIO_OE set */
-    *(volatile uint32_t *)(0xD0000000 + 0x024) = 0x02000000u;
-    /* SIO OUT_CLR */
-    *(volatile uint32_t *)(0xD0000000 + 0x018) = 0x02000000u;
+    const uint LED = (uint)PICO_DEFAULT_LED_PIN;
+    gpio_init(LED);
+    gpio_set_dir(LED, GPIO_OUT);
+    gpio_set_slew_rate(LED, GPIO_SLEW_RATE_SLOW);
+    gpio_set_drive_strength(LED, GPIO_DRIVE_STRENGTH_4MA);
+    gpio_put(LED, 0);
 }
 static inline void _led_set(int on) {
-    if (on) *(volatile uint32_t *)(0xD0000000 + 0x014) = 0x02000000u;
-    else     *(volatile uint32_t *)(0xD0000000 + 0x018) = 0x02000000u;
+    gpio_put((uint)PICO_DEFAULT_LED_PIN, on ? 1 : 0);
 }
 
 /* boot_setup 任务：调度器首次运行后执行的热初始化阶段
@@ -89,31 +94,32 @@ static inline void _led_set(int on) {
  *   4. demo_app_init (4 个 demo 任务 + shell)
  *   5. 自挂起（启动任务一次性） */
 
-/* LED 设置：GPIO25 SIO 直接写 */
+/* LED 设置：GPIO25 通过 SDK API 操作 */
 static inline void _led_on(void) {
-    *(volatile uint32_t *)(0xD0000000u + 0x014) = 0x02000000u;
+    gpio_put((uint)PICO_DEFAULT_LED_PIN, 1);
 }
 static inline void _led_off(void) {
-    *(volatile uint32_t *)(0xD0000000u + 0x018) = 0x02000000u;
+    gpio_put((uint)PICO_DEFAULT_LED_PIN, 0);
 }
 
 /* LED 诊断辅助函数：通过 LED 闪烁次数指示当前阶段
- * 用法：_led_stage(3) 会让 LED 闪 3 次（每次亮灭各 ~200ms）
+ * 用法：_led_stage(3) 会让 LED 闪 3 次（每次亮灭各 200ms）
  * 这样用户可以告诉我们 LED 闪了几下，就能定位崩溃位置。
- * 【v0.2.1 性能优化】MK_BOOT_DIAG_LED=0 时此函数体折叠为空。 */
+ * 【v0.2.1 性能优化】MK_BOOT_DIAG_LED=0 时此函数体折叠为空。
+ * 【v2.2.4 修复】节奏改为 250ms on / 250ms off，与 main.c 开头的 5 闪
+ *               节奏一致，便于用户对比；sleep_ms 基于硬件 TIMER
+ *               （非忙等 nop 计数），关中断也准确。 */
 static void _led_stage(uint8_t count) {
 #if MK_BOOT_DIAG_LED
-    register const uint32_t sio_base = 0xD0000000u;
-    register const uint32_t gpio25_mask = 0x02000000u;
-    
+    const uint LED = (uint)PICO_DEFAULT_LED_PIN;
     for (uint8_t i = 0; i < count; i++) {
-        *(volatile uint32_t *)(sio_base + 0x014) = gpio25_mask;  /* ON */
-        for (volatile uint32_t j = 0; j < 2500000; j++) __asm("nop");
-        *(volatile uint32_t *)(sio_base + 0x018) = gpio25_mask;  /* OFF */
-        for (volatile uint32_t j = 0; j < 2500000; j++) __asm("nop");
+        gpio_put(LED, 1);  /* ON  250ms */
+        sleep_ms(250);
+        gpio_put(LED, 0);  /* OFF 250ms */
+        sleep_ms(250);
     }
-    /* 结束后留 1 秒停顿 */
-    for (volatile uint32_t j = 0; j < 6250000; j++) __asm("nop");
+    /* 结束后留 1 秒停顿，便于区分数组 */
+    sleep_ms(1000);
 #else
     (void)count;
 #endif
@@ -128,102 +134,46 @@ static void _led_stage(uint8_t count) {
  *   4. demo_app_init (4 个 demo 任务 + shell)
  *   5. 自挂起（启动任务一次性） */
 
+/* ────────── 精简诊断：只闪 1 次 ────────── */
+static inline void _blink1(void) {
+    _led_on();  busy_wait_us_32(200000u);
+    _led_off(); busy_wait_us_32(200000u);
+}
+
 static void _boot_setup_task(void *arg) {
     (void)arg;
 
-    /* 阶段 9：boot_setup 任务开始运行 */
-    _led_stage(9);
-
-    /* — Step 1: 系统滴答定时器 — */
+    /* — Step 1: 初始化内核 systick (ALARM3 + TIMER_IRQ_3) —
+     * SDK alarm_pool 已在 hal_console_init 中初始化，使用 ALARM0
+     * (PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=0)，不与内核 ALARM3 冲突。
+     * irq_set_exclusive_handler(3, ...) 的 hard_assert 能通过
+     * (vtable 中 TIMER_IRQ_3 仍是 __unhandled_user_irq)。 */
     hal_systick_init(OS_CFG_TICK_HZ);
-
-    /* 阶段 10：systick 初始化完成 */
-    _led_stage(10);
-
-    /* 【关键修复】确保全局中断开启
-     * sched_start() 中的 svc #0 进入 SVC_Handler，SVC_Handler 内部可能
-     * 执行了 cpsid i 但未恢复 cpsie i → 从 SVC 返回后 PRIMASK=1 →
-     * TIMER_IRQ_0 无法触发 → tick 永远是 0 → task_sleep 永远不唤醒。
-     * 在 hal_systick_init 之后显式 cpsie i，确保 systick 中断能触发。 */
-    __asm volatile ("cpsie i" ::: "memory");
-
-    /* 阶段 11：中断已开启 */
-    _led_stage(11);
 
     /* — Step 2: 打印启动横幅（USB 已就绪，直接输出） — */
     {
         for (int i = 0; i < 60; i++) hal_console_putc('=');
         hal_console_putc('\r'); hal_console_putc('\n');
-        hal_console_putc('\r'); hal_console_putc('\n');
         const char *banner = "=== Mini Kernel Boot ===\r\n";
         for (const char *p = banner; *p; p++) hal_console_putc(*p);
         for (int i = 0; i < 60; i++) hal_console_putc('=');
         hal_console_putc('\r'); hal_console_putc('\n');
-        hal_console_putc('\r'); hal_console_putc('\n');
     }
 
-    /* 阶段 12：横幅打印完成，准备创建 demo 任务 */
-    _led_stage(12);
-
-    /* ── Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） ──
-     * 【v0.2.0-beta 修复：**绝对不要在 demo_app_init 返回后再写 GPIO25！**】
-     *   之前的 bug：demo_app_init 内部调用 shell_start() → bootscript_run_all()
-     *   → 用户固化的 "led on" 把 GPIO25 HIGH，然后返回 boot_setup_task，
-     *   接着 _led_stage(13) 做了 13 次 "ON → long wait → OFF → long wait"，
-     *   最后一步 SIO_OUT_CLR 直接把用户设置的 HIGH 拉回 LOW，LED 表现为
-     *   "启动亮了一下然后又灭了"。用户输入 list 能看到 #0: led on，
-     *   但灯实际是灭的，这就是 2026-08-15 用户报告的 "操作系统这样是不对的"。
-     *
-     *   修复原则：
-     *     · 所有 _led_stage 诊断指示必须放在 demo_app_init 之前跑完；
-     *     · demo_app_init（及其内部 bootscript 回放）之后，**永不**
-     *       无条件操纵 GPIO25（除了 HardFault / NMI 处理的故障指示）。
-     *
-     *   阶段 13 合并入阶段 12，取消独立的"demo 任务创建完成"指示，避免冲突。
-     * ──────────────────────────────────────────────────────────────── */
+    /* — Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） — */
     if (&demo_app_init != NULL) {
         demo_app_init();
     }
 
-    /* ── v2.2.3: FatFs / MSC 分区初始化（可移植内核独立完成，不依赖 demo 应用）
-     *
-     *  ⚠️ 【为什么放在 demo_app_init 之后（= 原 v2.2.0 位置），不能在前面？】
-     *  1. 【修复死机 Bug v2.2.1】boot_setup_task 栈很小（虽然已经从 1024 扩到
-     *     2048），首启动空片时 fatfs_init_and_mount → f_mkfs() 内部调用链极深
-     *     （FatFs 格式化计算 FAT 表、分簇、大量局部变量），demo_app_init() 内部
-     *     的 shell_start() 会调用 bootscript_run_all()，boot_setup_task 的
-     *     调用栈深度如果在 banner 打印帧 + 前置函数帧基础上，再立刻跑
-     *     f_mkfs，容易在 1024 栈顶时硬爆栈 → 写坏 kmem 链表头 / 就绪队列
-     *     → 调度器 HardFault 死机，用户看到"根本开不了机"。
-     *  2. 【时序一致】OS_CFG_DEMO_APP=1（RP2040 demo 默认开）时，demo_app_init()
-     *     里本来就已经调用过 fatfs_init_and_mount()（见 demo_app.c L398），
-     *     我们放在它之后，s_fs_mounted=true 直接返回 FR_OK（幂等安全），
-     *     不会重复 mkfs；而且运行顺序严格恢复到 v2.2.0 用户验证通过的：
-     *        shell_start() → fatfs_init_and_mount()
-     *  3. 【OS_CFG_DEMO_APP=0 不依赖 example】demo_app_init 是空桩直接返回，
-     *     我们仍在这之后执行 fatfs_init_and_mount()，确保关闭示例应用时
-     *     用户自有应用也能自动用到 FatFs + Shell 目录命令。
-     *
-     *  ⚠️ 【boot_setup_task 栈大小说明 v2.2.3】
-     *     task_create("boot_setup", 栈 1024 → 2048)：f_mkfs 在 FF_USE_LFN=0
-     *     下的最坏栈也需要 ~800B（DIR + FILINFO + MKFS_PARM + FatFs 内部
-     *     多层调用帧），1024 字节在 banner 打印帧之后的连续调用下，留的
-     *     安全边界只有 ~150B，首启动触发格式化时 100% 越界写。
-     *     扩到 2048 后给格式化 / Shell 启动命令回放留 1KB 安全边界。
-     *
-     *   头文件隔离：fatfs_api.h 内部 #include "ff.h"，当 OS_CFG_FATFS=0 时
-     *     fatfs shim 目录不在 include path，直接 #include 会编译错。因此用
-     *     extern 前向声明，整个块也放在 #if OS_CFG_FATFS 中，关闭时被
-     *     预处理器彻底移除。
-     * ──────────────────────────────────────────────────────────────── */
+    /* — Step 4: FatFs / MSC 分区初始化 — */
 #if OS_CFG_FATFS
     {
-        extern int fatfs_init_and_mount(void);   /* FRESULT 与 int 兼容（返回值 0-20，枚举 1 字节，ARM AAPCS r0 返回） */
-        (void)fatfs_init_and_mount();            /* 结果忽略：demo app / Shell banner 会做更详细诊断打印 */
+        extern int fatfs_init_and_mount(void);
+        (void)fatfs_init_and_mount();
     }
 #endif
 
-    /* — Step 4: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
+    /* — Step 5: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
     task_suspend(g_current_task);
     while (1) task_sleep(1000);
 }

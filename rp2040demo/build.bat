@@ -37,6 +37,9 @@ REM output lands inside the source tree as "rp2040demo\build", not a
 REM confusing sibling directory called "rp2040demobuild".
 set "BUILD_DIR=%PROJECT_ROOT%\build"
 set "UF2=%BUILD_DIR%\rp2040demo.uf2"
+set "MINIK_DIR=%BUILD_DIR%\minik-build"
+set "UF2_LED=%MINIK_DIR%\minimal_led_test.uf2"
+set "UF2_USB=%MINIK_DIR%\usb_print_test.uf2"
 set "TOOLCHAIN_FILE=%PROJECT_ROOT%\..\mini-kernel\toolchain-arm-none-eabi.cmake"
 set "LOG=%BUILD_DIR%\build.log"
 
@@ -95,6 +98,20 @@ if not exist "%UF2%" (
 )
 for %%F in ("%UF2%") do >> "%LOG%" echo BUILD OK - UF2 %%~zF bytes @ %%~fF
 
+REM -------- Also build + publish diagnostic firmwares to build root --------
+if exist "%UF2_LED%" (
+    copy /y "%UF2_LED%" "%BUILD_DIR%\diagnostic_minimal_led_test.uf2" >> "%LOG%" 2>&1
+    >> "%LOG%" echo [PUBLISH] diagnostic_minimal_led_test.uf2 (pure SDK LED blink, HW verify)
+) else (
+    >> "%LOG%" echo [WARN] diagnostic_minimal_led_test.uf2 not built (build.ninja target out of date? run with 'clean')
+)
+if exist "%UF2_USB%" (
+    copy /y "%UF2_USB%" "%BUILD_DIR%\diagnostic_usb_print_test.uf2" >> "%LOG%" 2>&1
+    >> "%LOG%" echo [PUBLISH] diagnostic_usb_print_test.uf2 (pure SDK USB CDC print, USB verify)
+) else (
+    >> "%LOG%" echo [WARN] diagnostic_usb_print_test.uf2 not built (build.ninja target out of date? run with 'clean')
+)
+
 REM -------- Flash step --------
 if %DO_FLASH% NEQ 1 goto OK
 
@@ -149,7 +166,7 @@ exit /b %errorlevel%
 
 REM -------- Subroutine: Run CMake Build --------
 :RUN_CMAKE_BUILD
->> "%LOG%" echo [CMAKE BUILD] Building RP2040 Demo...
+>> "%LOG%" echo [CMAKE BUILD] Building RP2040 Demo + diagnostic firmwares...
 cd /d "%BUILD_DIR%"
-"%NINJA_BIN%\ninja.exe" rp2040demo >> "%LOG%" 2>&1
+"%NINJA_BIN%\ninja.exe" rp2040demo minimal_led_test usb_print_test >> "%LOG%" 2>&1
 exit /b %errorlevel%

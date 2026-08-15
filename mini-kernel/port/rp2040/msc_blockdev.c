@@ -10,8 +10,19 @@
 /* 4KB RMW 缓冲：放在 .bss，不占 kmalloc 堆。擦除/写入时保护。 */
 static uint8_t s_rmw_buf[HAL_FLASH_SECTOR_SIZE] __attribute__((aligned(4)));
 
-/* ejected 标志（true = 主机认为 U 盘已被安全删除） */
-static bool s_ejected = false;
+/* ejected 标志（true = 主机认为 U 盘已被安全删除）
+ *
+ * 【v2.2.4 修复 · 启动期间 HardFault 根因】
+ *   旧版默认 false → USB 枚举后 Windows 立刻看到 MSC "就绪" →
+ *   在 demo_app_init / fatfs_init_and_mount 尚未运行时就尝试
+ *   挂载+写 Flash（创建 System Volume Information 等）→
+ *   tud_msc_write10_cb 从 USBCTRL_IRQ 上下文调用 flash_range_erase →
+ *   在内核数据结构未完全初始化时擦写 Flash → HardFault 爆闪。
+ *
+ *   修复：默认 true（ejected），Windows 看到"无介质"，不读不写。
+ *   fatfs_init_and_mount 完成后保持 true（Shell 独占模式）。
+ *   用户 `msc mount` 命令才设 false 让主机访问。 */
+static bool s_ejected = true;
 
 /* --------------------------------------------------------------------------
  *  LBA ↔ Flash Offset 翻译

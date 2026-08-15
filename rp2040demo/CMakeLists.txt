@@ -95,6 +95,12 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
     PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
+    # 【v2.2.5 致命修复】SDK default alarm_pool 默认用 ALARM3，
+    #   与内核 hal_systick_init 的 ALARM3 + TIMER_IRQ_3 冲突！
+    #   irq_set_exclusive_handler(3, systick_irq_handler) 内部
+    #   hard_assert 失败 → panic("Hard assert") → bkpt#0 → HardFault → 爆闪
+    #   修复：让 SDK alarm_pool 用 ALARM0，内核独占 ALARM3
+    PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=0
 )
 
 # v2.2: USB Composite (CDC+MSC) 强制 TinyUSB 打开 MSC class。
@@ -159,28 +165,49 @@ endif()
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
 
-# ===== v2.2：移除 Pico SDK 自带的默认 USB 描述符（仅 CDC），
-#       我们在 mini-kernel/port/rp2040/msc_usb.c 里提供 Composite
-#       (CDC+MSC) 的描述符。否则会出现 multiple definition 链接错误。
-#       pico_stdio_usb 是 INTERFACE 库：修改其 INTERFACE_SOURCES 属性，
-#       过滤掉 stdio_usb_descriptors.c，保留 reset_interface.c + stdio_usb.c
-#       （后者提供 CDC ACM 的读写逻辑）。
-if(TARGET pico_stdio_usb)
-    get_target_property(_STDIO_USB_IFACE_SRCS pico_stdio_usb INTERFACE_SOURCES)
-    if(_STDIO_USB_IFACE_SRCS)
-        set(_STDIO_USB_FILTERED "")
-        foreach(_s ${_STDIO_USB_IFACE_SRCS})
-            get_filename_component(_s_name "${_s}" NAME)
-            if(NOT "${_s_name}" STREQUAL "stdio_usb_descriptors.c")
-                list(APPEND _STDIO_USB_FILTERED "${_s}")
-            endif()
-        endforeach()
-        set_target_properties(pico_stdio_usb PROPERTIES
-            INTERFACE_SOURCES "${_STDIO_USB_FILTERED}"
-        )
-        message(STATUS "[rp2040demo v2.2] Removed stdio_usb_descriptors.c from pico_stdio_usb (using msc_usb.c Composite descriptors)")
-    endif()
-endif()
+# ================================================================
+# 【v2.2.4 致命修复：GCC multilib 路径错误导致 crt0.o 指令集不兼容！】
+#
+#  map file 对比证据：
+#    diagnostic_minimal_led_test 用的 crt0.o 在：
+#       .../arm-none-eabi/lib/thumb/v6-m/nofp/crt0.o   ✅ ARMv6-M 专用
+#    rp2040demo 之前用的 crt0.o 在：
+#       .../arm-none-eabi/lib/crt0.o                   ❌ 通用 ARM 版
+#
+#  通用版 crt0.o 包含 Cortex-M0+（ARMv6-M）**不支持的指令**：
+#  例如 ARMv7-M 的 `muls r0,r1,r2`（3-operand mul）、`udiv/sdiv`、
+#  Thumb-2 32-bit 非 ARMv6-M 子集指令。这些指令在 runtime_init 中
+#  一旦被执行就立刻触发 UsageFault → HardFault 死循环 → 表现：
+#  "LED 完全不亮，USB 完全不枚举"（连 main 第一行都到不了）。
+#
+#  为什么 diagnostic_minimal_led_test 没问题？
+#    → mini-kernel/CMakeLists.txt 中 diagnostic 目标直接 target_link_libraries
+#      pico_stdlib，Pico SDK 的 pico_standard_link 会把 `-mcpu=cortex-m0plus
+#      -mthumb -mfloat-abi=soft --specs=nosys.specs --specs=nano.specs` 这些
+#      multilib 关键选项通过 INTERFACE_LINK_OPTIONS 准确注入到最终 link 命令。
+#    → rp2040demo 通过 add_subdirectory(mini-kernel EXCLUDE_FROM_ALL)，
+#      再加上我们在 rp2040demo CMakeLists.txt 中手写了全局 CMAKE_C_FLAGS，
+#      导致 Pico SDK 的 target_link_options 注入被覆盖/顺序错误，GCC 链接时
+#      找不到 `-mcpu=cortex-m0plus -mthumb` → 回退到通用 ARM crt0.o → 崩。
+#
+#  修复：在最终可执行目标上显式加 target_link_options（这是 CMake 3.13+
+#  最可靠方式，优先级高于全局 CMAKE_EXE_LINKER_FLAGS），强制 GCC 链接驱动
+#  选择 thumb/v6-m/nofp multilib 路径。
+# ================================================================
+target_link_options(${PROJECT_NAME} PRIVATE
+    -mcpu=cortex-m0plus
+    -mthumb
+    -mfloat-abi=soft
+    --specs=nosys.specs
+    --specs=nano.specs
+    -Wl,--gc-sections
+)
+
+# 说明：pico_stdio_usb 的 stdio_usb_descriptors.c 移除
+#   已经在 mini-kernel/CMakeLists.txt 中（诊断固件创建之后、
+#   mini_kernel 主目标链接之前）执行过。pico_stdio_usb 是
+#   INTERFACE 库，修改全局生效，rp2040demo 在此 add_subdirectory
+#   之后，自动继承过滤后的 INTERFACE_SOURCES（无重复定义）。
 
 pico_add_extra_outputs(${PROJECT_NAME})
 
