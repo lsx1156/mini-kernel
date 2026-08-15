@@ -1495,6 +1495,10 @@ static void vt_task_led(void *arg) {
     }
     /* 被 kill 前：灭灯，避免一直亮着 */
     *(volatile uint32_t *)(SIO_BASE + 0x018) = MASK25;
+    /* g_vtest_running=0 → 退出循环后必须自挂起，不能 return（LR=0 → HardFault 爆闪）。
+     * task_suspend 触发 PendSV 切走自己，等 shell task_destroy 安全销毁。 */
+    task_suspend(g_current_task);
+    while (1) {}
 }
 
 /* — VT2: OLED 周期性刷新任务（每 2s 写一帧 1024B SSD1306 GDRAM）
@@ -1554,6 +1558,9 @@ static void vt_task_oled(void *arg) {
         g_vt2_frames++;
         task_sleep(2000);   /* 2s at 1kHz tick — SLEEP 队列轮转验证 */
     }
+    /* g_vtest_running=0 → 自挂起，等 shell task_destroy 销毁（不能 return） */
+    task_suspend(g_current_task);
+    while (1) {}
 }
 
 /* — VT3: 压力 + 嵌套控制任务（每 10s 一轮）
@@ -1634,6 +1641,9 @@ static void vt_task_ctrl(void *arg) {
         /* 下一轮：离上一轮起点约 10s（不含上面 suspend 已占的 3s，再等 7s）*/
         task_sleep(7000);
     }
+    /* g_vtest_running=0 → 自挂起，等 shell task_destroy 销毁（不能 return） */
+    task_suspend(g_current_task);
+    while (1) {}
     #undef VT3_NMEM
 }
 
