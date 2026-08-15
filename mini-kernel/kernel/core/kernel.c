@@ -308,12 +308,34 @@ void kernel_main(void) {
 }
 
 /* ================================================================
- * kernel_tick_hook：HAL TIMER_IRQ_0 尾部回调
+ * kernel_tick_hook：HAL TIMER_IRQ_3 尾部回调
  * ================================================================ */
 void kernel_tick_hook(void) {
     sched_sleep_tick();
 
     if (g_current_task) {
+        /* 【v2.2.7 · 栈金丝雀检查】task_stack_check 读栈底魔值 0xDEADBEEF，
+         * 被写穿 = 栈溢出。此前该检查写了却从无人调用（静默溢出）。
+         * 检测到溢出：打印诊断（一次）+ 挂起该任务自保。
+         *   · 打印走 hal_console_putc：内部 PRIMASK 临界区 + USB FIFO 满时
+         *     立即丢弃（STDOUT_TIMEOUT_US=0），中断上下文调用安全；
+         *   · task_suspend 对 RUNNING 任务走 self_suspend 路径设 PendSV，
+         *     退出本 IRQ 后调度器切走它，sched_do_switch 不会再入队
+         *     （state=SUSPEND）——已踩坏的栈/TCB 不再继续扩散；
+         *   · 不销毁（禁止在中断里释放正在运行的任务内存），
+         *     用户看到诊断后用 'kill <id>' 或重启处理。 */
+        if (g_current_task != &g_idle_task &&
+            g_current_task->state == TASK_STATE_RUNNING &&
+            !task_stack_check(g_current_task)) {
+            hal_console_putc('\r'); hal_console_putc('\n');
+            const char *w = "[KERNEL] Stack overflow in task '";
+            for (const char *p = w; *p; p++) hal_console_putc(*p);
+            for (const char *p = g_current_task->name; *p; p++) hal_console_putc(*p);
+            const char *w2 = "' — suspended. Use 'ps' + reboot.\r\n";
+            for (const char *p = w2; *p; p++) hal_console_putc(*p);
+            task_suspend(g_current_task);
+        }
+
         /* 首次 tick 时初始化 time_slice（首次进入 tick 才赋值） */
         if (g_current_task->time_slice == 0) {
             g_current_task->time_slice = OS_CFG_TIME_SLICE_TICKS *

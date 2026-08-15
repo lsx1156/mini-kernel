@@ -1560,6 +1560,9 @@ static void vt_task_oled(void *arg) {
          *   指针 wrap 后多余字节会自然覆盖起点，不影响显示。*/
         uint8_t chunk_byte = 0u;
         for (uint8_t c = 0; c < 5; c++) {
+            /* 【v2.2.7】停止复查：被 vtest_stop_all 从 SLEEP 唤醒后不再发
+             * 剩余 chunk（否则 4 chunk ≈ 90ms 无法停靠，拖垮 stop 流程）*/
+            if (!g_vtest_running) break;
             /* 动态生成此 chunk 的 255 字节填充数据 */
             for (uint16_t i = 1; i <= 255; i++) {
                 /* 128 列 / 8 = 16 字节 per page row；每 16 字节切换一次图案 */
@@ -1672,6 +1675,10 @@ static void vt_task_ctrl(void *arg) {
             g_vt3_susps++;
             /* 3s 内：VT2 是 SUSPEND，OLED 不应再刷新新帧；VT1 必须继续跳 */
             task_sleep(3000);
+            /* 【v2.2.7】停止复查：stop_all 已唤醒本任务，此时 g_vt2 可能已被
+             * 销毁（g_vt2=NULL）或正在销毁——绝不能再 task_resume(悬空句柄)。
+             * 直接跳出循环走自挂起停靠。 */
+            if (!g_vtest_running) break;
             shell_async_enter();
             sh_puts("[VT3]   Resume VT2 (oled_refresh) — OLED should continue.\r\n");
             shell_async_exit();
@@ -1692,14 +1699,44 @@ static void vt_task_ctrl(void *arg) {
     #undef VT3_NMEM
 }
 
-/* vtest_stop_all: 提取的停止+清理逻辑，供 cmd_vtest stop 和 Ctrl+C 共用 */
+/* vtest_stop_all: 提取的停止+清理逻辑，供 cmd_vtest stop 和 Ctrl+C 共用
+ *
+ *   【v2.2.7 修复 · vtest stop 爆闪根因】
+ *   旧版：置 flag → 唤醒 → 盲等 5ms → 直接 destroy。
+ *   问题：被唤醒的任务并不保证 5ms 内停靠——
+ *     · VT2 恢复在 hal_i2c_tx 的 chunk 循环里，剩余 4 chunk ≈ 90ms；
+ *     · VT3 恢复在 task_sleep(3000) 内，还会执行 task_resume(g_vt2)
+ *       （读可能已释放的 TCB）再睡 7s。
+ *   于是 destroy 时任务可能在任意状态，且与 VT3 垂死代码形成 use-after-free
+ *   竞态窗口。改为：轮询等待三任务全部停靠（SUSPEND/不存在），上限 200ms；
+ *   超时则放弃 destroy（宁可泄漏 TCB 也不冒险踩 freed 内存）。 */
 static void vtest_stop_all(void) {
     g_vtest_running = 0;
     if (g_vt2 && g_vt2->state == TASK_STATE_SUSPEND) task_resume(g_vt2);
     if (g_vt1) task_wakeup(g_vt1);
     if (g_vt2) task_wakeup(g_vt2);
     if (g_vt3) task_wakeup(g_vt3);
-    hal_systick_delay_us(5000);
+
+    /* 等三个任务都停靠（自挂起到 SUSPEND 或句柄已空），最多 200ms */
+    int parked_ok = 1;
+    for (int i = 0; i < 200; i++) {
+        int parked =
+            (!g_vt1 || g_vt1->state == TASK_STATE_SUSPEND) &&
+            (!g_vt2 || g_vt2->state == TASK_STATE_SUSPEND) &&
+            (!g_vt3 || g_vt3->state == TASK_STATE_SUSPEND);
+        if (parked) break;
+        if (i == 199) parked_ok = 0;
+        hal_systick_delay_us(1000);
+    }
+
+    if (!parked_ok) {
+        /* 超时未停靠：VT2 可能仍卡在长 I2C 传输。不 destroy ——
+         * 强行释放仍会运行的任务 = use-after-free = HardFault。
+         * 留任务在 SUSPEND/READY，用户可再次 stop 或 kill 单个任务。 */
+        sh_puts("vtest: WARN - tasks not parked in 200ms, skip destroy (retry 'vtest stop' or 'kill <id>').\r\n");
+        return;
+    }
+
     if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
     if (g_vt2) { task_destroy(g_vt2); g_vt2 = NULL; }
     if (g_vt3) { task_destroy(g_vt3); g_vt3 = NULL; }
@@ -1815,14 +1852,14 @@ static int cmd_vtest(int argc, char **argv) {
         __asm volatile ("" ::: "memory");   /* 编译器屏障，防止任务创建后乱序 */
 
         sh_puts("vtest: Creating 3 validation tasks...\r\n");
-        sh_puts("  VT1 (led_beat)      : stack=384, weight=1 — LED flip every 500ms\r\n");
+        sh_puts("  VT1 (led_beat)      : stack=512, weight=1 — LED flip every 500ms\r\n");
         sh_puts("  VT2 (oled_refresh) : stack=1536, weight=1 — 1024B GDRAM every 2s via I2C");
         sh_puts(" bus="); shell_put_uint32(bus); sh_puts(" addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf();
-        sh_puts("  VT3 (ctrl_pressure): stack=1024, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
+        sh_puts("  VT3 (ctrl_pressure): stack=2048, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
 
-        g_vt1 = task_create("vt_led",   vt_task_led,   NULL, 384, 1);
+        g_vt1 = task_create("vt_led",   vt_task_led,   NULL, 512, 1);
         g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 1536, 1);  /* 768 溢出：block[256]+i2c_write_blocking SDK 调用栈+PendSV 64B+TIMER_IRQ 嵌套 → 25 轮后踩坏 heap header */
-        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 1024, 2);  /* 768 紧张：sizes[8]+order[8]+p[8]=72B + sh_puts 调用栈 */
+        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 2048, 2);  /* v2.2.7: 1024 不够——vt_task_ctrl→shell_async_enter→sh_puts→hal_console_putc→putchar_raw→stdio_usb_out_chars→tud_cdc_n_write 深链路 + PendSV 64B + IRQ 嵌套，溢出即踩下方 VT2 TCB → HardFault 爆闪 */
 
         if (!g_vt1 || !g_vt2 || !g_vt3) {
             sh_puts("vtest: task_create FAILED (heap exhausted?)\r\n");

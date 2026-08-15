@@ -46,10 +46,11 @@
 #define OS_CFG_MAX_TIMERS             4   /* 最大软件定时器数             */
 /* 内核堆大小（任务栈 + TCB + kmalloc 都从此分配，统一管理）：
  *   - 最小内核（关 Shell/VFS/Periph）：4KB 足够（仅 boot_setup 任务）
- *   - 完整基础版（含 Shell + VFS + Periph + demo）：需 8KB
- *     7 个任务栈合计 ~4KB + 7×TCB(~56B) + mem_pool bitmap + 碎片缓冲。
- * 当前配置开启了完整基础版，使用 8KB。裁剪时按比例调小。 */
-#define OS_CFG_HEAP_SIZE_BYTES        (8*1024)  /* 内核堆大小，0=关闭堆     */
+ *   - 完整基础版（含 Shell + FatFs + MSC + Periph + demo）：需 8KB
+ *   - 开启 vtest（VT1/VT2/VT3 三验证任务）时 8KB 仅剩 ~800B（93% 满载），
+ *     VT3 栈紧贴 VT2 TCB，一旦深链路打印溢出即踩坏 TCB → HardFault 爆闪。
+ *     v2.2.7 修复：扩到 16KB，留足余量（RP2040 256KB SRAM 充足）。 */
+#define OS_CFG_HEAP_SIZE_BYTES        (16*1024) /* 内核堆大小，0=关闭堆     */
 #define OS_CFG_IDLE_STACK_SIZE        256 /* 空闲任务栈 (字节)            */
 #define OS_CFG_DEFAULT_TASK_STACK     512 /* 默认任务栈 (字节)            */
 
