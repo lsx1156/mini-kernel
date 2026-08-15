@@ -1,14 +1,16 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.2.5 · 2026-08
+> **当前版本**：v2.2.6 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
 >
-> 🟢 **v2.2.5 更新：调度系统已完全正常**
-> · 修复 boot_setup 任务自挂起后被 task_sleep "复活" 导致 g_task_pool[] 指针重复覆盖 → ps 乱码/LED 爆闪
-> · 修复 SHELL_TASK_STACK 768B 不足 → cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动 + 中断栈帧 → 栈溢出踩坏 TCB
-> · 所有 demo 任务 / shell / idle / boot_setup 状态机与队列归属契约 100% 符合设计，长时间运行无异常
-> · 新增 `vtest` 三任务嵌套调度验证命令（LED 心跳 / OLED 刷新 / 压力+嵌套 suspend-resume），使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
+> 🟢 **v2.2.6 更新：Linux 风格任务控制 + vtest 三任务嵌套验证器**
+> · 新增 `vtest` 命令：三任务嵌套调度验证（LED 心跳 / OLED 刷新 / 压力+嵌套 suspend-resume），一次性验证 5 大调度器契约
+> · 新增 **Ctrl+C 中断**：PuTTY 按 Ctrl+C 停止 vtest + 清空输入行（类似 Linux 信号中断）
+> · 新增 `jobs` 命令：列出用户创建的后台任务（类似 Linux jobs）
+> · 新增 **readline 输入行保护**：后台任务输出不覆盖用户正在输入的命令
+> · Bug 修复：VT3 p[] 未初始化导致 kfree 野指针 → HardFault；任务退出循环 return → LR=0 → HardFault；VT2 栈 768B 溢出
+> · 使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
 
 ---
 
