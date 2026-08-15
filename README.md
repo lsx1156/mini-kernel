@@ -1,8 +1,13 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.2.2 · 2026-08
+> **当前版本**：v2.2.5 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
+>
+> 🟢 **v2.2.5 更新：调度系统已完全正常**
+> · 修复 boot_setup 任务自挂起后被 task_sleep "复活" 导致 g_task_pool[] 指针重复覆盖 → ps 乱码/LED 爆闪
+> · 修复 SHELL_TASK_STACK 768B 不足 → cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动 + 中断栈帧 → 栈溢出踩坏 TCB
+> · 所有 demo 任务 / shell / idle / boot_setup 状态机与队列归属契约 100% 符合设计，长时间运行无异常
 
 ---
 
@@ -86,7 +91,8 @@ cd rp2040demo
 
 | 版本 | 状态 | 关键词 |
 |---|---|---|
-| v2.2.x | ✅ **当前稳定**（仓库 HEAD） | 三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / 诊断闪灯 / mkfs 实现 / 8 项内核 Bug 同步 |
+| v2.2.5 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **调度系统完全正常**：boot_setup "复活" Bug 修复 + Shell 栈溢出修复；状态机/队列契约 100% 合规 |
+| v2.2.x | ✅ 已发布历史 | v2.2.0~v2.2.4：三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / 诊断闪灯 / mkfs 实现 / ALARM3 tick 修复 |
 | v2.3 | 📅 规划中（下一版） | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp 复制 / mv 重命名） |
 | v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |
 | v3.5 | 📅 远期规划 | RP2350 多核（SMP）+ RISC-V（CH32V/bl702）移植 |

@@ -173,9 +173,25 @@ static void _boot_setup_task(void *arg) {
     }
 #endif
 
-    /* — Step 5: 启动流程结束 — boot_setup 自挂起，不再调度到 — */
+    /* — Step 5: 启动流程结束 — boot_setup 自挂起，永久不再调度 —
+     *
+     *   【v2.2.5 修复 · TCB 损坏 / ps 乱码 / LED 爆闪 根因】
+     *
+     *   旧版：task_suspend + while(1) task_sleep(1000)
+     *     · task_suspend 设 state=SUSPEND，hal_yield_trigger 设 PendSV pending
+     *     · 但 PendSV 在 cpsie i 后才真正进入，此期间代码继续执行
+     *     · task_sleep 不检查 state，直接覆盖 SUSPEND→SLEEP，
+     *       并 _sched_sleep_enqueue 把 SUSPEND 任务塞进睡眠队列
+     *     · 1000 tick 后 sched_tick_hook 唤醒 → READY → 重新入就绪队列
+     *     · boot_setup "复活"后再次执行 demo_app_init / fatfs_init，
+     *       重复创建已存在的任务 → g_task_pool 指针被覆盖为新 TCB，
+     *       旧 TCB 悬空 → ps 输出 ID=0x20000464 等垃圾值 → LED 爆闪。
+     *
+     *   修复：task_suspend 后用空循环等待 PendSV 切换。SUSPEND 状态
+     *   永远不会被 sched_ready_pick_next 选中，while(1) 只是防止
+     *   noreturn 任务返回触发 HardFault（LR=0）。 */
     task_suspend(g_current_task);
-    while (1) task_sleep(1000);
+    while (1) { /* SUSPEND 后不会再被调度；空循环仅作 noreturn 守卫 */ }
 }
 
 /* ================================================================

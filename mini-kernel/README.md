@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.2.4 ✅ STABLE`（修复烧录后看不到串口 Bug — ALARM3 不与 SDK alarm\_pool 冲突）
+> **当前版本**：`2.2.5 ✅ STABLE` — 🟢 **调度系统已完全正常**：boot_setup "复活" Bug 修复 + Shell 栈溢出修复；状态机/就绪/睡眠队列归属契约 100% 合规，长时间运行无 LED 爆闪 / ps 乱码
 >
 > **v2.2 大版本亮点**
 >
@@ -90,7 +90,8 @@ project/
 | **v2.2.1**         | ✅ Released | README 彻底重写（补全特性表/分区图/命令手册/架构图）+ 可移植内核独立 FatFs 初始化（不依赖 demo\_app.c）                                                                                                                                                                                                                    |
 | **v2.2.2**         | ✅ Released | 🛑 **定位澄清：≠RTOS**（两个 README 新增 RTOS vs 分时内核对比表；仓库首页 project/README 从 v0.1 同步到 v2.2，删除错误"轻量级 RTOS 内核"命名）                                                                                                                                                                                |
 | **v2.2.3**         | ✅ Released | 🐛 **修复首启动死机 v2.2.1 回归**：① boot\_setup\_task 栈 1024 → 2048（f\_mkfs 格式化最坏栈溢出写坏 kmem/TCB → HardFault）；② fatfs\_init\_and\_mount() 从 demo\_app\_init 之前挪到之后（恢复 v2.2.0 时序：shell\_start → mount；OS\_CFG\_DEMO\_APP=0 空桩后仍独立执行）；③ demo\_app.c 默认 KERNEL\_VERSION\_STR 从 2.2.0 UNTESTED 同步    |
-| **v2.2.4**         | ✅ **当前稳定** | 🐛 **修复烧录后看不到串口 / U 盘 Bug**（v2.2.0\~v2.2.3 全都存在）：内核 tick 使用 ALARM0 + TIMER\_IRQ\_0，直接覆盖 Pico SDK 默认 alarm\_pool handler → TinyUSB 的 CDC/MSC 端点握手定时 / SCSI 超时全部失效 → USB 枚举中途卡死 → Windows 识别不出 COM 口和盘符。✅ 修复：改用 **ALARM3 + TIMER\_IRQ\_3**（Pico SDK 保留给用户用，不冲突）。FAQ 新增 Q1\~Q5 3 步硬件自检流程。 |
+| **v2.2.4**         | ✅ Released | 🐛 **修复烧录后看不到串口 / U 盘 Bug**（v2.2.0\~v2.2.3 全都存在）：内核 tick 使用 ALARM0 + TIMER\_IRQ\_0，直接覆盖 Pico SDK 默认 alarm\_pool handler → TinyUSB 的 CDC/MSC 端点握手定时 / SCSI 超时全部失效 → USB 枚举中途卡死 → Windows 识别不出 COM 口和盘符。✅ 修复：改用 **ALARM3 + TIMER\_IRQ\_3**（Pico SDK 保留给用户用，不冲突）。FAQ 新增 Q1\~Q5 3 步硬件自检流程。 |
+| **v2.2.5**         | ✅ **当前稳定** | 🟢 **调度系统完全正常（收尾修复）**：① **boot\_setup 任务状态机 Bug**：`task_suspend(g_current_task)` 后又执行 `while(1) task_sleep(1000)` → task\_sleep 不检查 state，强制把 SUSPEND 覆盖成 SLEEP 并塞入睡眠队列 → 1000 tick 后 boot\_setup "复活" → 再次执行 demo\_app\_init 重复创建已存在的任务 → g\_task\_pool[] 指针被新 TCB 覆盖，旧 TCB 悬空 → `ps` 输出 ID=0x20000xxx 乱码 / LED 任务 tight loop 爆闪。修复：task\_suspend 后空 while(1) 等待 PendSV 切换（SUSPEND 永久不调度）。② **Shell 栈溢出踩坏 TCB**：`SHELL_TASK_STACK=768B`，`cmd_i2c fill` 用 `uint8_t block[256]`、`cmd_i2c rd` 用 `buf[256]`，加上 I2C 驱动调用栈和 PendSV 中断栈帧（64B）→ 768B 不够 → 溢出写坏相邻堆内存（g\_task\_pool[] 的指针）。修复：SHELL\_TASK\_STACK → 2048B。③ 验证：`ps` 输出 ID=0 idle / 1 boot\_setup(SUSPEND) / 2 shell(RUNNING)，所有任务状态与队列归属契约 100% 符合设计，OLED I2C 初始化 + fill 1024B 分块发送后 `ps` 依然干净。 |
 | v2.3               | 📋 规划      | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示                                                                                                                                                                                                                                                |
 | v3.0               | 🗓️ 规划     | VFS 抽象层 + 多分区 + SD Card (SPI1)                                                                                                                                                                                                                                                         |
 | v3.5               | 🗓️ 规划     | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植                                                                                                                                                                                                                                               |
@@ -106,6 +107,7 @@ project/
 | <br />                     | RP2040 演示版 (v2.2)         | Flash \~111KB, RAM \~20KB（含 Pico SDK + USB + FatFs）                            |
 | **调度**                     | 策略                        | 时间片轮转 + 权重比例（**无优先级抢占**，非硬实时）                                                  |
 | <br />                     | 防重入修复                     | `sched_ready_pick_next` 不复入队；`sched_do_switch` 仅 `RUNNING` 状态重入队；**无自引用链表死循环** |
+| <br />                     | 🟢 v2.2.5 状态机验证              | boot\_setup(SUSPEND) / shell(RUNNING) / idle(READY) 状态+队列契约 100% 合规；OLED I2C fill 1024B 后 `ps` 仍干净；长时间无爆闪/乱码 |
 | **内存**                     | 模型                        | 固定内存池（内核对象）+ 简易堆（首次适配），**零碎片**                                                 |
 | <br />                     | 临界区                       | `kmalloc/kfree` / `task_sleep` / 就绪队列均 `mrs/msr PRIMASK` 保护（Cortex-M 通用）       |
 | **移植**                     | 分层                        | 4 层垂直：应用 → Syscall → Kernel Core → HAL                                         |
@@ -244,7 +246,7 @@ E:\ppCD\project\rp2040demo\build\build.log         ← 编译日志（失败看 
 ========================================
   Mini Kernel Demo Platform Ready
 ========================================
-Kernel version: 2.2.4 ✅ STABLE
+Kernel version: 2.2.5 ✅ STABLE
 Config: MAX_TASKS=16  HEAP=8192B  TICK_HZ=1000  TIME_SLICE=5
 PeriphService=ON  Shell=ON  VFS=OFF  FatFs=ON
 ========================================
@@ -466,6 +468,8 @@ mk> msc mount
 | 启动慢（10s+）          | 开机十几秒 LED 才心跳                                    | 12 阶段 \_led\_stage + 50M nop USB 忙等                  | `MK_BOOT_DIAG_LED=0` 默认关；删除 5s 忙等                                                                                |
 | save 失败误报 Unknown  | `save cmd` 失败后，Shell 又打印 "Unknown command: save" | dispatch 按 rc==1 判"未知命令"，但 cmd\_save 返回 1 表示失败       | shell.c L1400 `bool found` 机制独立跟踪                                                                                |
 | FatFs f\_mkfs 未定义  | 链接报错 `undefined reference to f_mkfs`             | SDK ff.h 的 "" include 优先 SDK 自带 ffconf.h（MKFS=0）     | CMakeLists 生成 fatfs\_shim：复制 SDK ff.h + ff.c + ffunicode.c + 自定义 ffconf.h 到同目录                                   |
+| 🟢 boot\_setup "复活"（v2.2.5 修复） | ps 输出 ID=0x20000xxx 乱码、TCB 悬空、LED 爆闪 | task\_suspend 后紧跟 task\_sleep，SUSPEND 被覆盖 SLEEP 入睡眠队列 → tick 唤醒 → 重复 demo\_app\_init | [kernel.c](file:///E:/ppCD/project/mini-kernel/kernel/core/kernel.c) — task\_suspend 后空 while(1) 等待 PendSV，不再调用 task\_sleep |
+| 🟢 Shell 栈溢出踩 TCB（v2.2.5 修复） | 执行 i2c fill/rd 后 ps 乱码、HardFault、LED 爆闪 | SHELL\_TASK\_STACK=768B 放不下 256B block[] + 256B buf[] + 调用栈 + 64B 中断栈帧 → 溢出写坏堆上相邻 g\_task\_pool[] | [shell.c](file:///E:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c) — SHELL\_TASK\_STACK 768 → 2048 |
 
 ### 移植到新 MCU
 

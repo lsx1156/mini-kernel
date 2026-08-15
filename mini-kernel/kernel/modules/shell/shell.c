@@ -58,7 +58,7 @@ extern const char *k_version(void);
                                      *   且无任何报错。16 足够 I2C/SPI/UART 长命令。 */
 #define SHELL_PROMPT_STR      "mk> "
 #define SHELL_TASK_NAME       "shell"
-#define SHELL_TASK_STACK      768   /* 行解析 + 打印任务列表足够 */
+#define SHELL_TASK_STACK      2048  /* cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动调用 + 中断栈帧，768 会溢出破坏 g_task_pool */
 #define SHELL_TASK_WEIGHT     1
 
 /* ================================================================

@@ -446,7 +446,7 @@ void demo_app_init(void) {
  *       即可重新启用数闪定位。
  * ================================================================ */
 #ifndef KERNEL_VERSION_STR
-#define KERNEL_VERSION_STR  "2.2.4 ✅ STABLE"
+#define KERNEL_VERSION_STR  "2.2.5 ✅ STABLE"
 #endif
 
 const char *k_version(void) {
