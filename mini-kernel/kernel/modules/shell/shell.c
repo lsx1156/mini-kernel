@@ -70,6 +70,39 @@ static void sh_putc(char c)           { hal_console_putc(c); }
 static void sh_puts(const char *s)    { while (*s) hal_console_putc(*s++); }
 static void sh_crlf(void)             { sh_puts("\r\n"); }
 
+/* ================================================================
+ * readline 风格输入行保护（v2.2.5 新增）
+ *
+ *   问题：后台任务（如 vtest 的 VT3）输出会打断用户正在输入的命令行，
+ *         导致用户看到 `mk> vtest st[VT3] Round #10` 混在一起，
+ *         容易输错（如把 `v` 误输成 `/v`）。
+ *
+ *   解决：shell_async_enter() 清当前行 → 后台输出 → shell_async_exit() 恢复
+ *         `mk> ` + 用户已输入的字符。效果类似 Linux readline。
+ *
+ *   用法：
+ *     shell_async_enter();
+ *     sh_puts("...后台输出...\r\n");
+ *     shell_async_exit();
+ * ================================================================ */
+static char g_shell_line[SHELL_LINE_SIZE];
+static volatile int g_shell_pos = 0;
+
+static void shell_async_enter(void) {
+    /* \r 回到行首 + VT100 \033[K 清除当前行 */
+    hal_console_putc('\r');
+    hal_console_putc(0x1B); hal_console_putc('['); hal_console_putc('K');
+}
+
+static void shell_async_exit(void) {
+    /* 恢复提示符 + 用户已输入的内容 */
+    sh_puts(SHELL_PROMPT_STR);
+    int pos = g_shell_pos;
+    for (int i = 0; i < pos && i < SHELL_LINE_SIZE; i++) {
+        hal_console_putc(g_shell_line[i]);
+    }
+}
+
 static void shell_put_uint32(uint32_t v) {
     char buf[16];
     int i = 0;
@@ -1583,6 +1616,9 @@ static void vt_task_ctrl(void *arg) {
 
     while (g_vtest_running) {
         g_vt3_rounds++;
+
+        /* 【readline 保护】后台输出前清当前输入行，输出后恢复 mk> + 已输入内容 */
+        shell_async_enter();
         sh_puts("[VT3] Round #"); shell_put_uint32(g_vt3_rounds); sh_crlf();
 
         /* ── ① 堆压力 (alloc + 写 + 乱序 free) ─────────────────── */
@@ -1623,19 +1659,26 @@ static void vt_task_ctrl(void *arg) {
             }
             sh_crlf();
         }
+        shell_async_exit();
 
         /* ── ② 嵌套 suspend/resume VT2（如果 VT2 还存活） ──────── */
         if (g_vt2) {
+            shell_async_enter();
             sh_puts("[VT3]   Suspend VT2 (oled_refresh) — OLED should stop for 3s.\r\n");
+            shell_async_exit();
             task_suspend(g_vt2);
             g_vt3_susps++;
             /* 3s 内：VT2 是 SUSPEND，OLED 不应再刷新新帧；VT1 必须继续跳 */
             task_sleep(3000);
+            shell_async_enter();
             sh_puts("[VT3]   Resume VT2 (oled_refresh) — OLED should continue.\r\n");
+            shell_async_exit();
             task_resume(g_vt2);
             g_vt3_rsms++;
         } else {
+            shell_async_enter();
             sh_puts("[VT3]   VT2 not alive, skip suspend/resume (check OLED init commands).\r\n");
+            shell_async_exit();
         }
 
         /* 下一轮：离上一轮起点约 10s（不含上面 suspend 已占的 3s，再等 7s）*/
@@ -1793,8 +1836,9 @@ static int cmd_vtest(int argc, char **argv) {
  * ================================================================ */
 static void task_shell(void *arg) {
     (void)arg;
-    static char line_buf[SHELL_LINE_SIZE];
-    int pos = 0;
+    /* v2.2.5: line_buf/pos 改为模块级全局（g_shell_line/g_shell_pos），
+     *         供 shell_async_enter/exit 保护后台输出时的前台输入行。 */
+    g_shell_pos = 0;
 
     /* v2.2 ① 先注册扩展命令（msc/ls/cd/pwd/mkdir/rmdir/rm/cat）到 shell_register
      *        动态命令表。这样 help + dispatch 都能立即看到它们。 */
@@ -1891,16 +1935,16 @@ static void task_shell(void *arg) {
             case '\r':   /* 回车 → Mac/Windows 终端行结束 */
             case '\n':   /* 换行 → Unix 终端行结束 */
                 sh_crlf();
-                line_buf[pos] = '\0';
-                shell_exec_line(line_buf);
-                pos = 0;
+                g_shell_line[g_shell_pos] = '\0';
+                shell_exec_line(g_shell_line);
+                g_shell_pos = 0;
                 sh_puts(SHELL_PROMPT_STR);
                 break;
 
             case '\b':   /* 退格：VT100 序列：打印 \b 空格 \b */
             case 0x7F:   /* DEL：也当作退格 */
-                if (pos > 0) {
-                    pos--;
+                if (g_shell_pos > 0) {
+                    g_shell_pos--;
                     sh_putc('\b');
                     sh_putc(' ');
                     sh_putc('\b');
@@ -1910,8 +1954,8 @@ static void task_shell(void *arg) {
             default:
                 /* 过滤掉不可见字符（除 Tab，也允许） */
                 if ((c >= 0x20 && c < 0x7F) || c == '\t') {
-                    if (pos + 1 < SHELL_LINE_SIZE) {
-                        line_buf[pos++] = c;
+                    if (g_shell_pos + 1 < SHELL_LINE_SIZE) {
+                        g_shell_line[g_shell_pos++] = c;
                         sh_putc(c);   /* 本地回显（仅此一次） */
                     }
                 }
