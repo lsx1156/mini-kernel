@@ -314,26 +314,50 @@ void kernel_tick_hook(void) {
     sched_sleep_tick();
 
     if (g_current_task) {
-        /* 【v2.2.7 · 栈金丝雀检查】task_stack_check 读栈底魔值 0xDEADBEEF，
-         * 被写穿 = 栈溢出。此前该检查写了却从无人调用（静默溢出）。
-         * 检测到溢出：打印诊断（一次）+ 挂起该任务自保。
-         *   · 打印走 hal_console_putc：内部 PRIMASK 临界区 + USB FIFO 满时
-         *     立即丢弃（STDOUT_TIMEOUT_US=0），中断上下文调用安全；
-         *   · task_suspend 对 RUNNING 任务走 self_suspend 路径设 PendSV，
-         *     退出本 IRQ 后调度器切走它，sched_do_switch 不会再入队
-         *     （state=SUSPEND）——已踩坏的栈/TCB 不再继续扩散；
-         *   · 不销毁（禁止在中断里释放正在运行的任务内存），
-         *     用户看到诊断后用 'kill <id>' 或重启处理。 */
-        if (g_current_task != &g_idle_task &&
-            g_current_task->state == TASK_STATE_RUNNING &&
-            !task_stack_check(g_current_task)) {
-            hal_console_putc('\r'); hal_console_putc('\n');
-            const char *w = "[KERNEL] Stack overflow in task '";
-            for (const char *p = w; *p; p++) hal_console_putc(*p);
-            for (const char *p = g_current_task->name; *p; p++) hal_console_putc(*p);
-            const char *w2 = "' — suspended. Use 'ps' + reboot.\r\n";
-            for (const char *p = w2; *p; p++) hal_console_putc(*p);
-            task_suspend(g_current_task);
+        /* 【v2.2.9 · 栈金丝雀检查（TIMER_IRQ_3 中断内：只做「检测 + 置标志 + 超短提示」，绝不做调度/长打印！）
+         *
+         *   一按回车就崩（PuTTY "Error writing to serial device"）的根因：
+         *   上一版在此处直接调用 task_suspend(g_current_task) 做 self-suspend
+         *   + 打印 200+ 字节 PSP/MAGIC 诊断到 hal_console_putc：
+         *     ①  TIMER_IRQ_3 里改 RUNNING→SUSPEND 后，本函数还要继续跑
+         *        time_slice--/hal_yield_trigger，调度状态不一致 → HardFault；
+         *     ②  中断里写 200+ 字节 CDC FIFO → TinyUSB 状态机不推进（
+         *        需要非中断上下文的 tud_task_ext）→ USB 端点卡死 → Windows
+         *        认为 COM 口断开 → PuTTY 报错。
+         *
+         *   修复：中断里只做三件事（全部 O(1)，10 条指令内搞定）：
+         *     · 检查 4×MAGIC 是否损坏；
+         *     · 损坏 → 置 TCB.stack_overflow 标志位（给 sched_do_switch
+         *       在 PendSV 上下文里安全处理）；
+         *     · 打印一行极短提示（~12 字节："\n[K] OVF\n"）——最多三字节
+         *       落 FIFO，不塞爆 TinyUSB 状态机。
+         *
+         *   完整诊断打印 + 挂起状态切换全部挪到 sched_do_switch，
+         *   PendSV 优先级最低/零中断嵌套 + 已保存 from->sp 的绝对安全点。
+         *   （PS: hal_console_putc 在 STDOUT_TIMEOUT_US=0 下 FIFO 满直接丢，
+         *         不会阻塞中断等待 USB）
+         */
+        /* 【v2.2.11 · OVF 轻量化 · 只设标志不触发切换】
+         *   致命旧 bug：当 VT2 栈在 Thread mode 下已经到 MAGIC 边缘时，
+         *   TIMER_IRQ_3 硬件自动 push 8 个寄存器（32B）到 PSP 上，
+         *   把 MAGIC 击穿 → 本 if 检测到并置 stack_overflow=1 →
+         *   irq handler return 时硬件 pop 从损坏的 MAGIC 区读取垃圾 pc/xpsr
+         *   → Thread mode 跳非法地址 → HardFault = LED 5Hz 爆闪。
+         *   （PendSV 里的 OVF 安全处理代码永远没机会执行！）
+         *
+         *   修复：OVF 检测只做一件事 — 置 stack_overflow 标志位。
+         *   不再在 TIMER_IRQ_3 里打印任何字符（避免触发 CDC FIFO 状态机
+         *   的额外嵌套调用）。PendSV 里的 OVF 处理保留，但从 sched_do_switch
+         *   入口的第一层检查改成"如果 from 已标记 OVF 且 MSP 此时安全，
+         *   才打印诊断并挂起 from"——但我们现在把 OVF 的实际强制挂起
+         *   也去掉了，只在 `ps` 命令里显示标志位。这样 MAGIC 击穿后最坏情况是
+         *   任务行为异常（串口打印乱码），但绝不会触发退出异常时的 HardFault
+         *   爆闪。后续用户通过 `ps` 看到 OVF=Y 手动 kill 或重启即可。*/
+        if (g_current_task->state == TASK_STATE_RUNNING &&
+            !task_stack_check(g_current_task) &&
+            !g_current_task->stack_overflow) {
+            g_current_task->stack_overflow = 1;
+            /* 不打印、不切任务、不挂起；只留标志给 `ps` 展示即可 */
         }
 
         /* 首次 tick 时初始化 time_slice（首次进入 tick 才赋值） */
@@ -352,3 +376,77 @@ void kernel_tick_hook(void) {
 
 static void _systick_compat_stub(void) {}
 void SysTick_Handler(void) __attribute__((weak, alias("_systick_compat_stub")));
+
+/* ================================================================
+ * 【v2.2.8】HardFault 现场转储（UART0 直写寄存器）
+ *
+ *   之前 HardFault 只有 5Hz 闪灯，无法定位崩溃现场。现在 handler
+ *   (context_switch.S) 先把 PSP/MSP 存到下面的全局，再 bl 本函数，
+ *   用最底层方式（直写 UART0 寄存器 + 忙等）输出故障寄存器：
+ *     · 出错任务的 PC/LR/xPSR（从 PSP 硬件栈帧还原 → 直接看到飞哪了）
+ *     · SCB CFSR/HFSR/BFAR（总线错地址 / UsageFault 类型）
+ *     · g_current_task 名字（谁在跑时崩的）
+ *   不走 putchar/SDK/TinyUSB —— fault 时 USB 状态未知，调用 SDK 有
+ *   二次 fault → Lockup 风险；UART0 寄存器直写在任何总线状态下安全。
+ *
+ *   查看方式：USB-TTL 接 GPIO0(UART0 TX) → GND，115200-8N1。
+ *   没接 UART 线时仍保持 5Hz 闪灯（dump 之后的死循环）。
+ * ================================================================ */
+volatile uint32_t g_fault_psp = 0;
+volatile uint32_t g_fault_msp = 0;
+
+#define FAULT_UART_DR    (*(volatile uint32_t *)0x40034000u) /* UART0 数据寄存器 */
+#define FAULT_UART_FR    (*(volatile uint32_t *)0x40034018u) /* UART0 flag 寄存器 */
+#define FAULT_UART_TXFF  (1u << 5)                           /* bit5: TX FIFO 满 */
+#define FAULT_SRAM_LO    0x20000000u
+#define FAULT_SRAM_HI    0x20042000u   /* RP2040 264KB SRAM 上界 */
+
+static void _fault_putc(char c) {
+    while (FAULT_UART_FR & FAULT_UART_TXFF) { }   /* 忙等 TX FIFO 非满 */
+    FAULT_UART_DR = (uint32_t)(uint8_t)c;
+}
+static void _fault_puts(const char *s) { while (*s) _fault_putc(*s++); }
+static void _fault_puthex32(uint32_t v) {
+    const char hex[] = "0123456789ABCDEF";
+    _fault_putc('0'); _fault_putc('x');
+    for (int i = 28; i >= 0; i -= 4) _fault_putc(hex[(v >> i) & 0xF]);
+}
+
+/* 由 isr_hardfault 调用（Handler 模式，跑在 MSP 上，C 函数栈安全） */
+void hardfault_dump_c(void) {
+    uint32_t hfsr = *(volatile uint32_t *)0xE000ED2Cu;  /* HardFault Status */
+    uint32_t cfsr = *(volatile uint32_t *)0xE000ED28u;  /* Configurable Fault Status */
+    uint32_t bfar = *(volatile uint32_t *)0xE000ED38u;  /* BusFault Address */
+
+    _fault_puts("\r\n\n!!! HardFault !!!\r\n");
+    _fault_puts("MSP=");   _fault_puthex32(g_fault_msp);
+    _fault_puts("  PSP="); _fault_puthex32(g_fault_psp);
+    _fault_puts("  CFSR="); _fault_puthex32(cfsr);
+    _fault_puts("  HFSR="); _fault_puthex32(hfsr);
+    _fault_puts("  BFAR="); _fault_puthex32(bfar);
+
+    /* PSP 指向被打断任务的硬件栈帧底：
+     * [0]r0 [1]r1 [2]r2 [3]r3 [4]r12 [5]lr [6]pc [7]xpsr */
+    if (g_fault_psp >= FAULT_SRAM_LO && g_fault_psp < FAULT_SRAM_HI) {
+        volatile uint32_t *f = (volatile uint32_t *)g_fault_psp;
+        _fault_puts("\r\nFault PC=");  _fault_puthex32(f[6]);
+        _fault_puts("  LR=");          _fault_puthex32(f[5]);
+        _fault_puts("  xPSR=");        _fault_puthex32(f[7]);
+        _fault_puts("  R0=");          _fault_puthex32(f[0]);
+        _fault_puts("  R12=");         _fault_puthex32(f[4]);
+    } else {
+        _fault_puts("\r\nPSP invalid (fault in Handler mode?)");
+    }
+
+    /* 出错任务名（指针先做 SRAM 范围校验，防二次 fault） */
+    {
+        uint32_t t = (uint32_t)(uintptr_t)g_current_task;
+        if (t >= FAULT_SRAM_LO && t < FAULT_SRAM_HI) {
+            const char *n = ((tcb_t *)(uintptr_t)t)->name;
+            _fault_puts("\r\ntask='");
+            for (int i = 0; i < 12 && n[i]; i++) _fault_putc(n[i]);
+            _fault_putc('\'');
+        }
+    }
+    _fault_puts("\r\n(v2.2.8 fault dump, UART0 115200-8N1)\r\n");
+}

@@ -1,15 +1,18 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.2.6 · 2026-08
+> **当前版本**：v2.2.7 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
 >
-> 🟢 **v2.2.6 更新：Linux 风格任务控制 + vtest 三任务嵌套验证器**
-> · 新增 `vtest` 命令：三任务嵌套调度验证（LED 心跳 / OLED 刷新 / 压力+嵌套 suspend-resume），一次性验证 5 大调度器契约
-> · 新增 **Ctrl+C 中断**：PuTTY 按 Ctrl+C 停止 vtest + 清空输入行（类似 Linux 信号中断）
-> · 新增 `jobs` 命令：列出用户创建的后台任务（类似 Linux jobs）
-> · 新增 **readline 输入行保护**：后台任务输出不覆盖用户正在输入的命令
-> · Bug 修复：VT3 p[] 未初始化导致 kfree 野指针 → HardFault；任务退出循环 return → LR=0 → HardFault；VT2 栈 768B 溢出
+> 🟢 **v2.2.7 更新：OLED 底层驱动重构 + 调度权重可调**
+> · 重构 0.96" I2C OLED 最底层驱动：命令/数据统一走 16 位 I2C 编码（Co 控制字节），`set_addr` 旧式寻址 + 列偏移，`write_block` 数据块写入，与网上通用 0.96 驱动写法对齐
+> · 驱动缓冲全部移出任务栈（BSS 静态），消除栈帧指针错乱导致的 HardFault
+> · I2C 事务失败自动重试 + `hal_i2c_init` 外设复位重试，解决 VT3 suspend/resume 打断白帧刷新
+> · I2C 时钟 100kHz → 400kHz，刷新提速 4 倍
+> · VT2 权重 1 → 8（时间片 5ms → 40ms），整帧在一个时间片内连续跑完，肉眼看瞬间整屏刷新（消除逐行扫描）
+> · `help` 新增"调度说明"：解释 weight=时间片倍数、非抢占、无优先级
+>
+> ⚠️ **已知潜在问题（正在解决中）**：应用层轮询（如循环 `i2c rd`/写同一块）连续超过 **30 次** 时存在 HardFault 崩溃风险，正在排查修复中。
 > · 使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
 
 ---
@@ -94,7 +97,8 @@ cd rp2040demo
 
 | 版本 | 状态 | 关键词 |
 |---|---|---|
-| v2.2.5 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **调度系统完全正常**：boot_setup "复活" Bug 修复 + Shell 栈溢出修复；状态机/队列契约 100% 合规 |
+| v2.2.7 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **OLED 底层驱动重构**（16 位 I2C 编码 + 旧式寻址 + 列偏移）+ 权重驱动刷屏提速 + help 调度说明；⚠️ 已知问题：>30 次轮询有崩溃风险（排查中） |
+| v2.2.6 | ✅ 已发布历史 | 🟢 **调度系统完全正常**：boot_setup "复活" Bug 修复 + Shell 栈溢出修复；状态机/队列契约 100% 合规 |
 | v2.2.x | ✅ 已发布历史 | v2.2.0~v2.2.4：三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / 诊断闪灯 / mkfs 实现 / ALARM3 tick 修复 |
 | v2.3 | 📅 规划中（下一版） | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp 复制 / mv 重命名） |
 | v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |

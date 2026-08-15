@@ -87,8 +87,19 @@ static void sh_crlf(void)             { sh_puts("\r\n"); }
  * ================================================================ */
 static char g_shell_line[SHELL_LINE_SIZE];
 static volatile int g_shell_pos = 0;
+/* 【v2.2.10 修复】async 互斥锁：防止多个后台任务同时调用
+ *   shell_async_enter/exit 导致 g_shell_pos/g_shell_line 状态损坏。
+ *   例如 VT2 和 VT3 同时输出会互相覆盖 readline 状态 → 崩溃。*/
+static volatile int g_shell_async_busy = 0;
 
 static void shell_async_enter(void) {
+    /* 自旋等待其他任务的 async 块完成（单核时间片调度，等待期间
+     *   会被切走，让持锁任务有机会执行 exit 释放锁）。*/
+    while (g_shell_async_busy) {
+        task_sleep(1);   /* 让出 CPU，等持锁任务退出 async 块 */
+    }
+    g_shell_async_busy = 1;
+    __asm volatile ("" ::: "memory");
     /* \r 回到行首 + VT100 \033[K 清除当前行 */
     hal_console_putc('\r');
     hal_console_putc(0x1B); hal_console_putc('['); hal_console_putc('K');
@@ -101,6 +112,8 @@ static void shell_async_exit(void) {
     for (int i = 0; i < pos && i < SHELL_LINE_SIZE; i++) {
         hal_console_putc(g_shell_line[i]);
     }
+    __asm volatile ("" ::: "memory");
+    g_shell_async_busy = 0;
 }
 
 static void shell_put_uint32(uint32_t v) {
@@ -211,6 +224,14 @@ static tcb_t *g_vt3 = NULL;  /* 压力/嵌套控制任务句柄 */
 static volatile uint8_t  g_vtest_running = 0;   /* 1=在跑，0=已停止/未启动 */
 static volatile uint8_t  g_vt_oled_bus  = 0;    /* VT2 用的 I2C 总线号 (0/1) */
 static volatile uint8_t  g_vt_oled_addr = 0x3C; /* VT2 用的 OLED 7-bit 地址 */
+/* 【v2.2.11 · 栈保险】VT2 的 256B chunk buffer 放静态 BSS 段，不占栈空间。
+ *   旧版放 `uint8_t block[256]` 局部变量 = 栈直接少 256B。
+ *   1536B 总栈减去调用深度 ≈ 剩 1000B 余量，再砍 256B 很容易触发
+ *   tick_hook 的 4×MAGIC 金丝雀检测 → 静默挂起 → 看起来像"崩溃黑屏"。
+ *   移到静态后相当于 VT2 栈凭空多 256B 余量，且不违反用户"不增任务栈大小"的要求。
+ *   同时把 5B 命令缓冲 cbuf 也静态化（本来 5B 影响不大，但顺手做了一致）。*/
+static uint8_t g_vt2_block[256];
+static uint8_t g_vt2_cbuf[5];
 /* 统计计数器（vtest status 展示）：用户可直观判断三个任务都在被调度 */
 static volatile uint32_t g_vt1_beats   = 0;  /* LED 心跳翻转次数 */
 static volatile uint32_t g_vt2_frames  = 0;  /* OLED 写 GDRAM 帧数 (含 NACK 失败) */
@@ -330,6 +351,10 @@ static int cmd_help(int argc, char **argv) {
     }
     sh_puts("----------------------------------------\r\n");
     sh_puts("Tips: 支持退格键(\\b)。任务ID用 'ps' 命令查询。\r\n");
+    sh_puts("调度说明: 本内核为时间片轮转(非抢占)。weight=任务权重倍数,\r\n");
+    sh_puts("          单次连续运行 = 5ms × weight。weight 只影响每次轮到\r\n");
+    sh_puts("          能连续占用的时长, 不改变排队顺序, 无优先级抢占。\r\n");
+    sh_puts("          任务创建见 'k_task_create(name,fn,arg,stack,weight)'。\r\n");
     return 0;
 }
 
@@ -1542,59 +1567,383 @@ static void vt_task_led(void *arg) {
  *   I2C 用 5 个 chunk × 255B 发送（与 i2c fill 命令完全相同）。
  *   如果 OLED 初始化命令没跑（用户没 save 那 17 条 cmds），
  *   这里也会 NACK 但不会崩，用户从 g_vt2_errs 可看到。*/
+
+/* ================================================================
+ * 【v2.3.2 · 0.96" I2C OLED 最底层驱动 — 文件作用域 + 纯静态缓冲】
+ *   v2.3.1 三个函数内部用 uint8_t txbuf[] / c[] 在栈上分配，在
+ *   Cortex-M0+ 上偶发 HardFault。现在：
+ *     · txbuf、cbuf 全部放 BSS（静态数组）
+ *     · 所有调用方传入的数组也必须是静态或全局（不占栈）
+ * ================================================================ */
+#define VT2_MAX_CMD_BYTES  8   /* 单条命令 + 参数最多 8 字节 */
+
+/* 全部缓冲放静态 BSS（16B + 3B = 19B，零栈开销）*/
+static uint8_t g_vt2_txbuf[VT2_MAX_CMD_BYTES * 2];   /* 命令编码用：16B */
+static uint8_t g_vt2_addrc[3];                        /* set_addr 编码用：3B */
+
+/* I2C 引脚 PADS 寄存器（文件作用域，reinit 用）*/
+#define VT2_PADS_BANK0_BASE   0x4001C000u
+#define VT2_PADS_GPIO(n)      (*(volatile uint32_t *)(VT2_PADS_BANK0_BASE + 0x04u + 4u*(n)))
+#define VT2_PADS_PUE          (1u << 3)
+#define VT2_PADS_PDE          (1u << 2)
+
+/* 【v2.3.3 · vt2_i2c_reinit : I2C 外设硬复位】
+ *   VT2 在 i2c_write_timeout_us 传输中途被 VT3 suspend 3s：
+ *     · 超时用绝对时间 time_us_32() → 恢复后立即超时返回；
+ *     · I2C 状态机停在半途（START 已发/TX FIFO 残留/从机等字节流），
+ *       后续所有传输 NACK，单纯重试永远失败（实测 page 1..7 全挂）。
+ *   唯一可靠恢复：hal_i2c_init 重置外设（幂等，i2c_init 会 reset 外设 +
+ *   重新使能）+ 重配上拉。重试失败路径都先调本函数。*/
+static void vt2_i2c_reinit(void)
+{
+    uint32_t bus = (uint32_t)g_vt_oled_bus;
+    uint8_t sda_pin = (g_vt_oled_bus == 0) ? 4 : 6;
+    uint8_t scl_pin = (g_vt_oled_bus == 0) ? 5 : 7;
+    hal_i2c_init(bus, 400000);
+    VT2_PADS_GPIO(sda_pin) = (VT2_PADS_GPIO(sda_pin) | VT2_PADS_PUE) & ~VT2_PADS_PDE;
+    VT2_PADS_GPIO(scl_pin) = (VT2_PADS_GPIO(scl_pin) | VT2_PADS_PUE) & ~VT2_PADS_PDE;
+}
+
+/* (1) oled_tx_cmds : 发送命令字节流（16b 编码 + Co=1/0 + 失败 reinit 重试）
+ *   注意：cmds 可以是栈数组（本函数内部先复制到静态 txbuf，再发 I2C）*/
+static hal_err_t vt2_oled_tx_cmds(const uint8_t *cmds, int ncmds)
+{
+    if (ncmds <= 0) return HAL_OK;
+    if (ncmds > VT2_MAX_CMD_BYTES) return HAL_ERR_PARAM;
+    for (int i = 0; i < ncmds; i++) {
+        g_vt2_txbuf[2 * i    ] = (i == ncmds - 1) ? 0x00 : 0x80;
+        g_vt2_txbuf[2 * i + 1] = cmds[i];
+    }
+    for (int retry = 0; retry < 3; retry++) {
+        hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
+                                 g_vt2_txbuf, (size_t)(2 * ncmds));
+        if (r == HAL_OK) return HAL_OK;
+        vt2_i2c_reinit();   /* 外设可能被 suspend 打坏，硬复位再试 */
+        task_sleep(2);
+    }
+    return HAL_ERR_IO;
+}
+
+/* (2) oled_set_addr : 设置 GRAM 写指针 = (page, col) 【旧式寻址，偏移=0】
+ *   【v2.3.4 · 列偏移修复】实测用户屏映射为 col 0..127（非 132 列屏的
+ *     col 2..129），写死 +2 会导致最左 2 列永远写不到 → 左侧残留小黑点/
+ *     小白点。通用做法：从 col 0 开始写满 132B（VT2_OLED_COLS），
+ *     SH1106 132 列全覆盖、SSD1306 128 列 + 4B wrap 回本页 col 0（无害）。
+ *     任何列映射下整屏都会被刷新。*/
+#define VT2_OLED_COLS  132   /* 写满整行：SH1106=132 列全覆盖，SSD1306=128+4 wrap */
+static hal_err_t vt2_oled_set_addr(uint8_t page, uint8_t col)
+{
+    g_vt2_addrc[0] = (uint8_t)(0xB0 | ((uint8_t)(page & 0x07)));
+    g_vt2_addrc[1] = (uint8_t)(0x00 | ((uint8_t)(col  & 0x0F)));
+    g_vt2_addrc[2] = (uint8_t)(0x10 | ((uint8_t)((col >> 4) & 0x0F)));
+    return vt2_oled_tx_cmds(g_vt2_addrc, 3);
+}
+
+/* (3) oled_write_block : 写 GRAM 数据块（首字节=0x40 + 失败 reinit 重试）*/
+static hal_err_t vt2_oled_write_block(const uint8_t *block, int block_len)
+{
+    if (block_len <= 0) return HAL_OK;
+    for (int retry = 0; retry < 3; retry++) {
+        hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
+                                 block, (size_t)block_len);
+        if (r == HAL_OK) return HAL_OK;
+        vt2_i2c_reinit();   /* 同 vt2_oled_tx_cmds 的恢复策略 */
+        task_sleep(2);
+    }
+    return HAL_ERR_IO;
+}
+#undef VT2_MAX_CMD_BYTES
+#undef VT2_PADS_BANK0_BASE
+#undef VT2_PADS_GPIO
+#undef VT2_PADS_PUE
+#undef VT2_PADS_PDE
+/* ================================================================
+ * End of 0.96" I2C OLED bottom driver
+ * ================================================================ */
 static void vt_task_oled(void *arg) {
     (void)arg;
-    /* 1024B frame buffer — 放栈上 (VT2 栈 768B，不够)。改为 256B chunk
-     * buffer，按 8 行 × 128 列 动态生成分块发送。SSD1306 的列指针在
+    /* 【v2.2.10 修复】启动延迟：等 shell 打印完 "OK: vtest STARTED" +
+     *   Validation checklist（约 500 字符）。否则 VT2 输出和 shell 输出
+     *   严重交错（"ta[VTsks running"），且 console 竞争可能导致状态损坏。
+     *   用 1500ms 错开 VT3 的 2000ms，避免两者同时唤醒争抢 async 锁。*/
+    task_sleep(1500);
+
+    /* 1024B frame buffer — 使用全局静态 g_vt2_block[]（不占栈）。
+     * 256B chunk buffer，按 8 行 × 128 列 动态生成分块发送。SSD1306 的列指针在
      * horizontal addressing mode 下自动 wrap，不会因为分 5 次
      * START 断续发送 D/C=1 流而错位。*/
-    uint8_t block[256];
-    block[0] = 0x40;        /* D/C=1: 后续为 GDRAM 数据 */
+    g_vt2_block[0] = 0x40;        /* D/C=1: 后续为 GDRAM 数据 */
+
+    /* 【v2.2.9 修复 · I2C 自初始化】
+     *   旧版依赖 bootscript 里的 `i2c init 0 4 5 100000` 来初始化 I2C 外设。
+     *   用户删了该固化命令后，I2C 外设未初始化、GPIO 未复用 →
+     *   i2c_write_blocking 无超时地永久阻塞 → VT2 卡死 → VT3 suspend/resume
+     *   一个卡死的任务导致状态混乱 → 崩溃。
+     *
+     *   修复：VT2 启动时自己调 hal_i2c_init + 手动配置 GPIO 上拉，
+     *   不依赖 bootscript。init 是幂等的（重复调 i2c_init 只重置外设），
+     *   所以即使 bootscript 也有 i2c init 也不会冲突。
+     *
+     * 【v2.2.11 · 栈溢出静默挂起排查】
+     *   用户报告：VT2 打印完 "hal_i2c_init ret=0" 后静默死亡（无 HardFault 爆闪，
+     *   shell 正常运行，说明是 tick_hook 的 STACK_OVF_CHECK 把 VT2 挂起了）。
+     *   在每个 I/O 里程碑打印当前栈使用量，定位是哪一步踩了 4×MAGIC 金丝雀。*/
+    hal_err_t ri = HAL_OK;
+    {
+        /* I2C0 默认引脚: GP4=SDA, GP5=SCL */
+        uint8_t sda_pin = (g_vt_oled_bus == 0) ? 4 : 6;
+        uint8_t scl_pin = (g_vt_oled_bus == 0) ? 5 : 7;
+        /* 【v2.3.5 · 100k → 400kHz】SSD1306 官方支持 Fast-mode。
+         *   100kHz 时一帧 8 页 × 139B ≈ 1112B × 9bit ≈ 100ms（纯总线时间），
+         *   叠加时间片切换导致的 FIFO 停等（VT2 每片只喂一点），
+         *   肉眼看就是"逐行慢慢刷"。400kHz 后总线时间降到 ~25ms，
+         *   一帧几乎瞬间完成。上拉是 RP2040 内部 50kΩ，400k 下拉电流
+         *   约 (3.3V/50k)=66µA，上升沿稍缓但对 10~20pF 负载足够。*/
+        ri = hal_i2c_init((uint32_t)g_vt_oled_bus, 400000);
+        /* 开内部上拉（同 cmd_i2c init 的 PADS_BANK0 逻辑）*/
+        #define PADS_BANK0_BASE_   0x4001C000u
+        #define PADS_GPIO_(n)      (*(volatile uint32_t *)(PADS_BANK0_BASE_ + 0x04u + 4u*(n)))
+        #define PADS_PUE_          (1u << 3)
+        #define PADS_PDE_          (1u << 2)
+        PADS_GPIO_(sda_pin) = (PADS_GPIO_(sda_pin) | PADS_PUE_) & ~PADS_PDE_;
+        PADS_GPIO_(scl_pin) = (PADS_GPIO_(scl_pin) | PADS_PUE_) & ~PADS_PDE_;
+        #undef PADS_BANK0_BASE_
+        #undef PADS_GPIO_
+        #undef PADS_PUE_
+        #undef PADS_PDE_
+    }
+    {
+        shell_async_enter();
+        sh_puts("[VT2] hal_i2c_init ret="); shell_put_uint32((uint32_t)ri);
+        sh_puts("  stack_used=");
+        shell_put_uint32((uint32_t)task_stack_used(g_current_task));
+        sh_puts("B\r\n");
+        shell_async_exit();
+    }
+
+    /* 底层驱动函数已移到文件作用域（v2.3.2），此处直接调用 */
+
+    /* 【SSD1306 初始化命令序列】
+     *   每条命令单独发一个 I2C 事务 (0x00 前缀 + 命令)。
+     *   每 3 条命令汇总打印一次 ret 位图，避免 console 过度竞争；
+     *   若某条命令返回非 0，立即单独打印该条，精准定位卡死/超时位置。*/
+    {
+        /* 【v2.2.12 修复：SSD1306 cmd[11] NACK → 对比度紧跟电荷泵 + STOP→START 延时】
+         *   用户现场：cmds[0..8] 全部 OK，唯有 cmd[11] = Contrast(0x81,0xFF) NACK。
+         *   原因有二：
+         *     (a) 便宜 SSD1306 clone 对 STOP→START 间隔有严格要求（≥1.3μs bus free），
+         *         原来组内 3 条命令连续调用 hal_i2c_tx 无任何间隔，第 3 条容易 NACK；
+         *     (b) Contrast(0x81) 部分 clone 要求紧跟 Charge Pump(0x8D,0x14) 之后，
+         *         不允许被 Addressing/Remap 命令隔开，否则偶发 NACK。
+         *   修复：
+         *     · (a) 每条命令后 busy-wait 200 cycles（RP2040 125MHz ≈ 1.6μs ≥ 1.3μs）
+         *     · (b) Contrast 移到 cmd[6]，紧跟 Charge Pump(cmd[5])
+         *     · (c) 保存 first_err_ret，打印不再用 last_ret(最后一条 cmd)做假阳性
+         *   其他命令与 I2C 调用链完全不变。*/
+        /* 【v2.3 · 初始化命令按网上通用 0.96" OLED 写法重排】
+         *   移除 SH1106/便宜 clone 常 NACK 的 0x21(列范围)/0x22(页范围) 三字节命令，
+         *   寻址全部交给 vt2_oled_set_addr 的旧式 0xB0/0x00/0x10 三条单命令。
+         *   命令顺序严格按 Adafruit SSD1306 / U8g2 默认序列：
+         *     OFF → 时钟 → MUX → 偏移 → StartLine → ChargePump → MemoryMode(页模式)
+         *     → Segment/COM → COMpins → Contrast → PreCharge → VCOMH → Resume → Normal → ON
+         *   page addressing mode (0x20, 0x02) 是最简单、兼容性最好的模式，
+         *   也是 SH1106 默认模式，完全不依赖 0x21/0x22 范围命令。*/
+        static const uint8_t cmds[][4] = {
+            {1, 0xAE},              /* 0: Display OFF */
+            {2, 0xD5, 0x80},        /* 1: Display clock divide */
+            {2, 0xA8, 0x3F},        /* 2: Multiplex ratio: 64 (128x64) */
+            {2, 0xD3, 0x00},        /* 3: Display offset: 0 */
+            {1, 0x40},              /* 4: Display start line: 0 */
+            {2, 0x8D, 0x14},        /* 5: Charge pump enable → 下一条必须 Contrast */
+            {2, 0x81, 0xFF},        /* 6: Contrast max (紧跟 Charge Pump) */
+            {2, 0x20, 0x02},        /* 7: Memory addressing: PAGE MODE (兼容性最高) */
+            {1, 0xA1},              /* 8: Segment remap: 列镜像 (SEG127=列0) */
+            {1, 0xC8},              /* 9: COM scan direction: 倒序 (COM63=行0) */
+            {2, 0xDA, 0x12},        /* 10: COM pins: 128x64 = 0x12 (Alternative COM) */
+            {2, 0xD9, 0xF1},        /* 11: Pre-charge period */
+            {2, 0xDB, 0x40},        /* 12: VCOMH deselect: 0x40 = 0.77xVCC */
+            {1, 0xA4},              /* 13: Display resume (from 0xA5 all-on) */
+            {1, 0xA6},              /* 14: Normal display (非 0xA7 反色) */
+            {1, 0xAF},              /* 15: Display ON */
+        };
+        const int ncmds = (int)(sizeof(cmds) / sizeof(cmds[0]));
+        g_vt2_cbuf[0] = 0x00;  /* Co=0, D/C=0: 后续为命令（全局静态，不占栈）*/
+        uint32_t err_bmp = 0u;  /* bit i = 1 表示第 i 条命令失败 */
+        int first_err = -1;
+        hal_err_t first_err_ret = HAL_OK;
+        hal_err_t last_ret = HAL_OK;
+
+        for (int i = 0; i < ncmds; i++) {
+            int n = (int)cmds[i][0];
+            /* 【v2.3 · 切到新驱动：vt2_oled_tx_cmds 自动 16b 编码 + Co=1/0
+             *   不再手工拼 g_vt2_cbuf[0]=0x00 前缀，驱动层统一处理。*/
+            hal_err_t r = vt2_oled_tx_cmds(&cmds[i][1], n);
+            last_ret = r;
+            if (r != HAL_OK) {
+                err_bmp |= (1u << (i < 31 ? i : 31));
+                if (first_err < 0) { first_err = i; first_err_ret = r; }
+            }
+            /* 【v2.2.13 回退：移除每条命令 200-cycle busy-wait。
+             *   上一轮怀疑 clone 需要 BUS FREE ≥1.3μs，但实测 busy-wait 反而导致
+             *   cmd[5]=0x8D charge pump 返回 HAL_ERR_IO(-7) 且 shell_async 日志
+             *   出现 "] OK=" 字符丢失（cmds[0..21 / cmds[3..50 拼接）。改回 RP2040
+             *   SDK i2c_write_timeout_us 自带的 STOP->START 间隔处理。】
+             *
+             *   若后续仍出现某条命令 NACK，则单条命令之间用 task_sleep(1) 来
+             *   保证延时，而不是 busy-wait（busy-wait 会让 USB CDC tick 得不到
+             *   处理导致 shell_async 字符丢失）。*/
+
+            /* 每 3 条命令打印一次进度（如果有错误单独打印那条）*/
+            if ((i + 1) % 3 == 0 || i == ncmds - 1) {
+                shell_async_enter();
+                sh_puts("[VT2] cmds[");
+                shell_put_uint32((uint32_t)(i - ((i + 1) % 3 == 0 ? 2 : i % 3)));
+                sh_puts(".."); shell_put_uint32((uint32_t)i);
+                /* OK 位图语义修改：当前组内 3 条命令全部成功才 OK=1，
+                 * 不再拿"累计 err_bmp!=0"标整组失败（旧逻辑会把后面无辜组全标 0）*/
+                {
+                    uint32_t group_mask = 0u;
+                    int gstart = (i >= 2) ? (i - 2) : 0;
+                    for (int k = gstart; k <= i; k++) group_mask |= (1u << k);
+                    uint32_t group_err = err_bmp & group_mask;
+                    shell_put_uint32((uint32_t)(group_err == 0u));
+                }
+                sh_puts("  stk=");
+                shell_put_uint32((uint32_t)task_stack_used(g_current_task));
+                sh_puts("B\r\n");
+                shell_async_exit();
+                /* 每组之间短暂 yield，避免长时间占着 CPU */
+                task_sleep(5);
+            }
+        }
+        task_sleep(50);
+
+        if (first_err >= 0) {
+            shell_async_enter();
+            sh_puts("[VT2] FIRST FAIL at cmd[");
+            shell_put_uint32((uint32_t)first_err);
+            sh_puts("]="); shell_print_hex8(cmds[first_err][1]);
+            sh_puts("  ret="); shell_put_uint32((uint32_t)first_err_ret);
+            sh_puts("  err_bmp=0x"); shell_put_hex32(err_bmp);
+            sh_puts("\r\n");
+            shell_async_exit();
+        } else {
+            shell_async_enter();
+            sh_puts("[VT2] SSD1306 init OK (16 cmds)  stk=");
+            shell_put_uint32((uint32_t)task_stack_used(g_current_task));
+            sh_puts("B\r\n");
+            shell_async_exit();
+        }
+    }
+
+    /* 第一帧先发全白测试 */
+    hal_err_t r0 = HAL_OK;
+    uint32_t white_errs = 0u;
+    {
+        /* 【v2.3.4 · 写满 132 列】0x40 + 132B×0xFF，覆盖任何列映射 */
+        g_vt2_block[0] = 0x40;
+        for (int i = 1; i <= VT2_OLED_COLS; i++) g_vt2_block[i] = 0xFF;
+
+        shell_async_enter();
+        sh_puts("[VT2] white frame: start (8 pages)  stk=");
+        shell_put_uint32((uint32_t)task_stack_used(g_current_task));
+        sh_puts("B\r\n");
+        shell_async_exit();
+
+        for (uint8_t p = 0; p < 8; p++) {
+            hal_err_t r1 = vt2_oled_set_addr(p, 0);
+            if (r1 != HAL_OK) { white_errs++; r0 = r1; continue; }
+            hal_err_t r4 = vt2_oled_write_block(g_vt2_block, VT2_OLED_COLS + 1);
+            if (r4 != HAL_OK) { white_errs++; r0 = r4; }
+        }
+    }
+    {
+        shell_async_enter();
+        sh_puts("[VT2] white frame: reset_addr ret=");
+        shell_put_uint32((uint32_t)r0);
+        sh_puts("  chunk_errs="); shell_put_uint32(white_errs);
+        sh_puts("  stk=");
+        shell_put_uint32((uint32_t)task_stack_used(g_current_task));
+        sh_puts("B — screen should be ALL WHITE\r\n");
+        shell_async_exit();
+    }
 
     while (g_vtest_running) {
         uint32_t frame = g_vt2_frames;  /* 当前帧号（决定图案）*/
-        uint8_t  pat_row = 0;          /* 8 行一轮的棋盘行偏移 */
 
-        /* 5 chunks × (255 data+1 prefix) = 1280 bytes → 截断尾部多余的 256
-         *   实际写入前 1024 字节；SSD1306 128×64 bit = 1024 B，
-         *   指针 wrap 后多余字节会自然覆盖起点，不影响显示。*/
-        uint8_t chunk_byte = 0u;
-        for (uint8_t c = 0; c < 5; c++) {
-            /* 【v2.2.7】停止复查：被 vtest_stop_all 从 SLEEP 唤醒后不再发
-             * 剩余 chunk（否则 4 chunk ≈ 90ms 无法停靠，拖垮 stop 流程）*/
+        /* 【I2C 刷新优化 · 1: 按 SSD1306 页边界分块】
+         *   旧版分 5 块 (255/255/255/255/4)，第 5 块仅 4B，START/STOP 协议开销
+         *   与 256B 块相同，浪费；且块边界不与 OLED 8×128 的 8 页对齐，
+         *   部分便宜 SSD1306 clone 在跨页 STOP 后指针 wrap 偶发错位，
+         *   表现为"某些行没更新/刷新慢"。
+         *   修复：8 页 × 每页 128B = 8 个块，每块正好对应 OLED 一页。
+         *   每次事务：SET PAGE (page_addr_cmd 3B+控制前缀) + DATA (129B)
+         *   = 2 次 START/STOP/页，共 16 次事务（旧版是 5+reset_addr=6 次，
+         *   反而多了？但每页独立设页地址完全避免 clone 指针错位 bug，
+         *   对 128×64 = 1024B 总数据量来说开销可忽略：
+         *     16 次 START/STOP × 40us ≈ 640us / 帧，占 2s 周期的 0.03%。*/
+
+        /* 【v2.2.11 · OLED 自检帧：判断分辨率与硬件映射】
+         *   用户："OLED 显示真的有问题吧？"——先给 3 帧确定性诊断图案，
+         *   每一页（8 行 = 8 Page）写入完全不同的 1 字节 pattern：
+         *     · Page 0 (最顶部): 0x01 = 每 8 像素仅最顶上 1bit 亮 = 最顶一条细线
+         *     · Page 1: 0x02 = 第 2 条细线  …
+         *     · Page 7 (最底部): 0x80 = 最底一条细线
+         *   现象对应关系（用户肉眼可判断）：
+         *     · 看到 8 条等距横线贯穿整个屏幕宽度 → 128×64 屏幕、配置正确 ✓
+         *     · 只看到 4 条线（上面 4 根）、下面一半全黑 → 屏幕是 128×32，
+         *       当前的 MUX=0x3F(64) / COM=0x12 不对，需改 0x1F/0x02
+         *     · 某几 Page 不亮/雪花/乱码 → 该页 I2C 写入失败或指针错
+         *     · 完全黑屏 → 初始化(电荷泵/Display ON) 没生效 */
+        /* 【v2.3.2 · page_fill 移到静态 BSS（原栈数组）】*/
+        static uint8_t page_fill[8];
+        if (frame < 3u) {
+            /* 前 3 帧 = 自检 8 条线：每 Page 一个 bit pattern */
+            page_fill[0] = 0x01; page_fill[1] = 0x02;
+            page_fill[2] = 0x04; page_fill[3] = 0x08;
+            page_fill[4] = 0x10; page_fill[5] = 0x20;
+            page_fill[6] = 0x40; page_fill[7] = 0x80;
+        } else {
+            /* 第 4 帧起：偶数帧全白(0xFF)，奇数帧全黑(0x00)，做 2s 切换验证 */
+            uint8_t fill = (frame & 1u) ? 0x00u : 0xFFu;
+            for (int p = 0; p < 8; p++) page_fill[p] = fill;
+        }
+
+        /* 【I2C 刷新优化 · 2: 每页独立旧式寻址（SSD1306 clone/SH1106 兼容）
+         *   v2.2.14 因用户屏对 0x21/0x22 双参数命令 NACK，改回老式单参数寻址：
+         *     · SET PAGE=p     : 0xB0 + p
+         *     · SET COL LOW=0  : 0x00 + (0 & 0x0F) = 0x00
+         *     · SET COL HIGH=0 : 0x10 + (0 >> 4)  = 0x10
+         *   每页独立写地址+数据，不依赖 STOP 间指针连续性，也不依赖
+         *   0x20/0x21/0x22 扩展命令是否被识别。
+         *   帧首 col_rng 一次性设置已删除（现在每页设一次 COL=0，共 8 次）。*/
+        /* 准备页发送缓冲：g_vt2_block[0] = 0x40 (D/C=1, Co=0 → 后续全是数据)
+         *   【v2.3.4】写满 VT2_OLED_COLS=132B，覆盖任何列映射（见 set_addr 注释）。*/
+        g_vt2_block[0] = 0x40;
+
+        for (uint8_t p = 0; p < 8; p++) {
             if (!g_vtest_running) break;
-            /* 动态生成此 chunk 的 255 字节填充数据 */
-            for (uint16_t i = 1; i <= 255; i++) {
-                /* 128 列 / 8 = 16 字节 per page row；每 16 字节切换一次图案 */
-                uint8_t col_in_row = (uint8_t)((chunk_byte) & 0x0Fu);
-                (void)col_in_row;
-                uint8_t pattern;
-                if ((pat_row & 1u) != 0u) {
-                    pattern = (uint8_t)(0x55u + (uint8_t)(frame & 0xFFu));
-                } else {
-                    pattern = (uint8_t)(0xAAu ^ (uint8_t)(frame & 0xFFu));
-                }
-                block[i] = pattern;
-                chunk_byte++;
-                if ((chunk_byte & 0x0Fu) == 0u) {
-                    pat_row++;   /* 每 16 字节 = 走完一行 128 位的 8 像素 */
-                }
+
+            /* 步骤 A: 旧式寻址 — 完全复用 vt2_oled_set_addr（col=0 起）
+             *   自动 16 位编码 + Co=1/0，应用层不拼 0x80/0x00 前缀。*/
+            {
+                hal_err_t r1 = vt2_oled_set_addr(p, 0);
+                if (r1 != HAL_OK) g_vt2_errs++;
             }
-            size_t chunk_sz = (c == 4) ? (size_t)(1024u - 4u * 255u) : 255u;
-            hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus,
-                                     (uint8_t)g_vt_oled_addr,
-                                     block, chunk_sz + 1u);
-            if (r != HAL_OK) g_vt2_errs++;
-            /* 【关键 · 阻塞式 I2C 切调度验证】
-             *   hal_i2c_tx 是忙等 I2C 硬件，不主动 yield。但系统 tick
-             *   (1ms) 每到就会进 TIMER_IRQ_3 → kernel_tick_hook →
-             *   time_slice 归零 → hal_yield_trigger → PendSV 切走。
-             *   所以即使 VT2 在"疯狂发 I2C"，VT1 依然应该每 500ms
-             *   准时翻转 LED —— 这就是"时间片轮转非抢占"的正确性证明。*/
+            /* 步骤 B: 本页 132B 数据 — 完全复用 vt2_oled_write_block
+             *   g_vt2_block[1..132] = page_fill[p]（前 3 帧每页 1bit 做自检线；
+             *                              之后统一全白/全黑）*/
+            {
+                for (int i = 1; i <= VT2_OLED_COLS; i++) g_vt2_block[i] = page_fill[p];
+                hal_err_t r2 = vt2_oled_write_block(g_vt2_block, VT2_OLED_COLS + 1);
+                if (r2 != HAL_OK) g_vt2_errs++;
+            }
         }
 
         g_vt2_frames++;
-        task_sleep(2000);   /* 2s at 1kHz tick — SLEEP 队列轮转验证 */
+        /* 【I2C 刷新优化 · 3: 帧间隔保持 2000ms（vtest checklist 要求"每 2s 变化"）
+         *   若想更快刷新，改成 500 即可，下方一行是唯一要改的位置。*/
+        task_sleep(2000);   /* 2s at 1kHz tick — SLEEP 队列轮转验证；改这里加速 */
     }
     /* g_vtest_running=0 → 自挂起，等 shell task_destroy 销毁（不能 return） */
     task_suspend(g_current_task);
@@ -1619,32 +1968,75 @@ static void vt_task_ctrl(void *arg) {
     size_t sizes[VT3_NMEM] = { 16, 32, 64, 32, 96, 24, 48, 32 };  /* 总和 = 344B，永远够 */
     int    order[VT3_NMEM] = { 3,0,7,2,5,1,6,4 };
 
+    /* 【v2.2.10 修复 · 启动延迟】
+     *   VT3 创建后 shell 还在打印 "OK: vtest STARTED..." + Validation checklist
+     *   （约 500 字符）。若 VT3 立即跑 Round #1，shell_async_enter 会清掉
+     *   shell 未打完的行 → 输出交错（"free_before=7TARTED"）。
+     *   用 2000ms 错开 VT2 的 1500ms：VT2 此时已完成 I2C 初始化和首帧，
+     *   VT3 才开始 Round #1，避免两者同时争抢 async 锁导致状态损坏。*/
+    task_sleep(2000);
+
     while (g_vtest_running) {
         g_vt3_rounds++;
 
-        /* 【readline 保护】后台输出前清当前输入行，输出后恢复 mk> + 已输入内容 */
-        shell_async_enter();
-        sh_puts("[VT3] Round #"); shell_put_uint32(g_vt3_rounds); sh_crlf();
+        /* ── Phase 1: 计算（可被安全抢占，不持锁）── */
+        size_t k_used = task_kernel_stack_used();
+        size_t u_used = task_user_stack_used();
+        size_t pool   = task_total_stack_pool();
+        uint8_t t_pct = task_total_stack_used_pct();
+        int    stack_low = task_total_stack_is_low();
 
-        /* ── ① 堆压力 (alloc + 写 + 乱序 free) ─────────────────── */
+        void *p[VT3_NMEM] = {0};
+        size_t free_before = kmem_free_size();
+        size_t max_before  = kmem_max_free_block();
+        int ok = 1;
+        int fail_at = -1;
+        for (int i = 0; i < VT3_NMEM; i++) {
+            p[i] = kmalloc(sizes[i]);
+            if (!p[i]) { ok = 0; fail_at = i; break; }
+            memset(p[i], (int)(g_vt3_rounds + i + 0x33u), sizes[i]);
+        }
+        for (int i = 0; i < VT3_NMEM; i++) {
+            if (p[order[i]]) kfree(p[order[i]]);
+        }
+        size_t free_after = kmem_free_size();
+        size_t max_after  = kmem_max_free_block();
+
+        /* ── Phase 2: 原子打印（console 自旋锁，不关中断）
+         *   【v2.2.9 修复 · USB CDC FIFO 死锁根因】
+         *   旧版用 PRIMASK 关中断 + shell_async_enter/exit 包裹整段输出。
+         *   TinyUSB CDC TX FIFO（64B）满时，tud_cdc_write_char busy-wait
+         *   等 USB IN ACK 中断清 FIFO → **关中断下永远等不到** → 卡死。
+         *
+         *   修复：去掉外层 PRIMASK，只靠 hal_console_putc 的单核自旋锁
+         *   保证"每次 putc 原子"。shell_async_enter/exit 用于把
+         *   readline 的 prompt + 用户输入先清掉再恢复，防止视觉上的
+         *   行级错乱。即使中途被抢占（其他任务的 putc 会被自旋拦在外面），
+         *   整段 VT3 输出仍然是字符级连续的。*/
         {
-            void *p[VT3_NMEM] = {0};   /* 【关键 Bugfix】必须清零！kmalloc break 时 p[后面]=NULL，
-                                        * 防止 kfree(野指针) → heap 元数据破坏 → HardFault */
-            size_t free_before = kmem_free_size();
-            size_t max_before  = kmem_max_free_block();
-            int ok = 1;
-            int fail_at = -1;
-            for (int i = 0; i < VT3_NMEM; i++) {
-                p[i] = kmalloc(sizes[i]);
-                if (!p[i]) { ok = 0; fail_at = i; break; }
-                memset(p[i], (int)(g_vt3_rounds + i + 0x33u), sizes[i]);
+            shell_async_enter();
+            sh_puts("[VT3] Round #"); shell_put_uint32(g_vt3_rounds); sh_crlf();
+
+            sh_puts("[VT3]   Stack: kernel=");
+            shell_put_uint32((uint32_t)k_used);
+            sh_puts("B  user=");
+            shell_put_uint32((uint32_t)u_used);
+            sh_puts("B  total=");
+            shell_put_uint32((uint32_t)(k_used + u_used));
+            sh_puts("/");
+            shell_put_uint32((uint32_t)pool);
+            sh_puts("B (");
+            shell_put_uint32((uint32_t)t_pct);
+            sh_puts("%)");
+            if (stack_low) {
+                sh_puts("  !! STACK LOW — total exceeds ");
+                shell_put_uint32((uint32_t)OS_CFG_USER_STACK_WARN_PCT);
+                sh_puts("% !!");
             }
-            for (int i = 0; i < VT3_NMEM; i++) {
-                if (p[order[i]]) kfree(p[order[i]]);   /* NULL check + NULL 初始化 = 永远安全 */
-            }
-            size_t free_after = kmem_free_size();
-            size_t max_after  = kmem_max_free_block();
-            sh_puts("[VT3]   Heap: free_before="); shell_put_uint32(free_before);
+            sh_crlf();
+
+            sh_puts("[VT3]   Heap: free_before=");
+            shell_put_uint32(free_before);
             sh_puts("B → after="); shell_put_uint32(free_after); sh_puts("B ");
             if (ok && free_before == free_after && max_before == max_after) {
                 sh_puts("[ZERO-FRAGMENT OK]");
@@ -1663,14 +2055,16 @@ static void vt_task_ctrl(void *arg) {
                 sh_puts("]");
             }
             sh_crlf();
+            shell_async_exit();
         }
-        shell_async_exit();
 
         /* ── ② 嵌套 suspend/resume VT2（如果 VT2 还存活） ──────── */
         if (g_vt2) {
+            /* 短消息同样：只靠 shell_async 清/恢复 prompt，不再关中断 */
             shell_async_enter();
             sh_puts("[VT3]   Suspend VT2 (oled_refresh) — OLED should stop for 3s.\r\n");
             shell_async_exit();
+
             task_suspend(g_vt2);
             g_vt3_susps++;
             /* 3s 内：VT2 是 SUSPEND，OLED 不应再刷新新帧；VT1 必须继续跳 */
@@ -1679,9 +2073,11 @@ static void vt_task_ctrl(void *arg) {
              * 销毁（g_vt2=NULL）或正在销毁——绝不能再 task_resume(悬空句柄)。
              * 直接跳出循环走自挂起停靠。 */
             if (!g_vtest_running) break;
+
             shell_async_enter();
             sh_puts("[VT3]   Resume VT2 (oled_refresh) — OLED should continue.\r\n");
             shell_async_exit();
+
             task_resume(g_vt2);
             g_vt3_rsms++;
         } else {
@@ -1717,24 +2113,42 @@ static void vtest_stop_all(void) {
     if (g_vt2) task_wakeup(g_vt2);
     if (g_vt3) task_wakeup(g_vt3);
 
-    /* 等三个任务都停靠（自挂起到 SUSPEND 或句柄已空），最多 200ms */
+    /* 等三个任务都停靠（自挂起到 SUSPEND 或句柄已空），最多 500ms。
+     *
+     * 【v2.2.10 修复 · Ctrl+C 爆闪根因】
+     *   旧版用 hal_systick_delay_us(1000) 忙等 — 不让出 CPU 给调度器。
+     *   被唤醒的 VT1/VT2/VT3 根本没机会运行到 while(g_vtest_running)
+     *   检查 → 200ms 超时 → 强行 destroy 仍在运行的任务 → use-after-free
+     *   → HardFault → LED 爆闪。
+     *
+     *   修复：用 task_sleep(1) 代替忙等。task_sleep 会把 shell 放入 SLEEP
+     *   队列，PendSV 切到其他任务（VT1/VT2/VT3），它们能执行到
+     *   while(g_vtest_running) 检查 → break → task_suspend(自己) → 停靠。
+     *   shell 1ms 后被唤醒回来继续轮询。
+     *
+     *   超时从 200ms 增加到 500ms：VT2 可能卡在 I2C chunk 传输中，
+     *   5 chunks × ~20ms = ~100ms，加上调度延迟 200ms 可能不够。*/
     int parked_ok = 1;
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         int parked =
             (!g_vt1 || g_vt1->state == TASK_STATE_SUSPEND) &&
             (!g_vt2 || g_vt2->state == TASK_STATE_SUSPEND) &&
             (!g_vt3 || g_vt3->state == TASK_STATE_SUSPEND);
         if (parked) break;
-        if (i == 199) parked_ok = 0;
-        hal_systick_delay_us(1000);
+        if (i == 499) parked_ok = 0;
+        task_sleep(1);  /* 让出 CPU 给 VT 任务，让它们跑到 while 检查后自挂起 */
     }
 
     if (!parked_ok) {
-        /* 超时未停靠：VT2 可能仍卡在长 I2C 传输。不 destroy ——
-         * 强行释放仍会运行的任务 = use-after-free = HardFault。
-         * 留任务在 SUSPEND/READY，用户可再次 stop 或 kill 单个任务。 */
-        sh_puts("vtest: WARN - tasks not parked in 200ms, skip destroy (retry 'vtest stop' or 'kill <id>').\r\n");
-        return;
+        /* 超时未停靠：强制 suspend 所有未停靠的任务。
+         *   VT2 可能卡在 hal_i2c_tx（忙等 I2C 硬件）中，task_suspend
+         *   会把它从就绪/睡眠队列移除并改成 SUSPEND → 不会再被调度。
+         *   I2C 硬件会自行 timeout 释放，不会永久锁死。
+         *   强制 suspend 后可以安全 destroy，不会 use-after-free。*/
+        sh_puts("vtest: WARN - tasks not parked in 500ms, force suspend + destroy.\r\n");
+        if (g_vt1 && g_vt1->state != TASK_STATE_SUSPEND) task_suspend(g_vt1);
+        if (g_vt2 && g_vt2->state != TASK_STATE_SUSPEND) task_suspend(g_vt2);
+        if (g_vt3 && g_vt3->state != TASK_STATE_SUSPEND) task_suspend(g_vt3);
     }
 
     if (g_vt1) { task_destroy(g_vt1); g_vt1 = NULL; }
@@ -1804,6 +2218,25 @@ static int cmd_vtest(int argc, char **argv) {
         sh_puts("VT3(ctrl_pressure): rounds  = "); shell_put_uint32(g_vt3_rounds);
         sh_puts(" (suspend=");       shell_put_uint32(g_vt3_susps);
         sh_puts(" resume=");         shell_put_uint32(g_vt3_rsms);  sh_puts(")"); sh_crlf();
+        /* 【v2.2.9】栈限额统计（内核/用户分离，总量超 80% 告警） */
+        {
+            size_t k_used = task_kernel_stack_used();
+            size_t u_used = task_user_stack_used();
+            size_t pool   = task_total_stack_pool();
+            uint8_t t_pct = task_total_stack_used_pct();
+            sh_puts("Stack: kernel=");  shell_put_uint32((uint32_t)k_used);
+            sh_puts("B user=");         shell_put_uint32((uint32_t)u_used);
+            sh_puts("B total=");        shell_put_uint32((uint32_t)(k_used + u_used));
+            sh_puts("/");               shell_put_uint32((uint32_t)pool);
+            sh_puts("B (");             shell_put_uint32((uint32_t)t_pct);
+            sh_puts("%)");
+            if (task_total_stack_is_low()) {
+                sh_puts("  [LOW! >=");
+                shell_put_uint32((uint32_t)OS_CFG_USER_STACK_WARN_PCT);
+                sh_puts("%]");
+            }
+            sh_crlf();
+        }
         sh_puts("Heap free=");       shell_put_uint32(kmem_free_size());
         sh_puts("B max_block=");     shell_put_uint32(kmem_max_free_block()); sh_puts("B\r\n");
         sh_puts("Tick=");            shell_put_uint32(hal_systick_get_tick()); sh_crlf();
@@ -1852,14 +2285,27 @@ static int cmd_vtest(int argc, char **argv) {
         __asm volatile ("" ::: "memory");   /* 编译器屏障，防止任务创建后乱序 */
 
         sh_puts("vtest: Creating 3 validation tasks...\r\n");
-        sh_puts("  VT1 (led_beat)      : stack=512, weight=1 — LED flip every 500ms\r\n");
-        sh_puts("  VT2 (oled_refresh) : stack=1536, weight=1 — 1024B GDRAM every 2s via I2C");
+        sh_puts("  VT1 (led_beat)      : stack=512,  weight=1 — LED flip every 500ms\r\n");
+        sh_puts("  VT2 (oled_refresh) : stack=1536, weight=8 — 1024B GDRAM every 2s via I2C");
         sh_puts(" bus="); shell_put_uint32(bus); sh_puts(" addr=0x"); shell_print_hex8((uint8_t)addr); sh_crlf();
         sh_puts("  VT3 (ctrl_pressure): stack=2048, weight=2 — heap stress + suspend/resume VT2 every 10s\r\n");
 
         g_vt1 = task_create("vt_led",   vt_task_led,   NULL, 512, 1);
-        g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 1536, 1);  /* 768 溢出：block[256]+i2c_write_blocking SDK 调用栈+PendSV 64B+TIMER_IRQ 嵌套 → 25 轮后踩坏 heap header */
-        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 2048, 2);  /* v2.2.7: 1024 不够——vt_task_ctrl→shell_async_enter→sh_puts→hal_console_putc→putchar_raw→stdio_usb_out_chars→tud_cdc_n_write 深链路 + PendSV 64B + IRQ 嵌套，溢出即踩下方 VT2 TCB → HardFault 爆闪 */
+        /* 【v2.3.1 · 栈池溢出修复】3072 → 1536。
+         *   根因：用户栈池 = 4096B（总 8192B 对半分），VT1(512)+VT2(3072)+
+         *   VT3(2048) = 5632B > 4096B → 栈区域相互覆盖 → TCB/数据损坏 → HardFault。
+         *   VT2 实测 stack_used=348B，1536B 有 4.4 倍余量，完全足够。
+         *   1536+512+2048 = 4096B = 100% 用户栈池，刚好不溢出。
+         * 【v2.3.5 · weight 1 → 8（时间片 5ms → 40ms）】
+         *   RP2040 I2C FIFO 仅 16B，VT2 被切走时总线 stall → 肉眼逐行扫描。
+         *   400kHz 下整帧 8 页 ≈ 25ms，weight=8 的 40ms 时间片可让整帧
+         *   在一个时间片内连续跑完 → 视觉上瞬间整屏刷新。VT1/VT3 大部分
+         *   时间在 sleep，公平性不受影响（weight 只影响就绪队列时长）。*/
+        g_vt2 = task_create("vt_oled",  vt_task_oled,  NULL, 1536, 8);
+        /* v2.2.9: 保持 2048（用户要求不大范围改栈）。同上，靠 STACK_OVF_CHECK
+         *        的 4×MAGIC 提前挂起自保；配合新增的"用户栈 8KB 限额 80% 告警"
+         *        在 VT3 串口输出中明确提示栈不足，由用户决定自行增改栈大小。*/
+        g_vt3 = task_create("vt_ctrl",  vt_task_ctrl,  NULL, 2048, 2);
 
         if (!g_vt1 || !g_vt2 || !g_vt3) {
             sh_puts("vtest: task_create FAILED (heap exhausted?)\r\n");

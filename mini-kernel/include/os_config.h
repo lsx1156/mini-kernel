@@ -51,8 +51,25 @@
  *     VT3 栈紧贴 VT2 TCB，一旦深链路打印溢出即踩坏 TCB → HardFault 爆闪。
  *     v2.2.7 修复：扩到 16KB，留足余量（RP2040 256KB SRAM 充足）。 */
 #define OS_CFG_HEAP_SIZE_BYTES        (16*1024) /* 内核堆大小，0=关闭堆     */
-#define OS_CFG_IDLE_STACK_SIZE        256 /* 空闲任务栈 (字节)            */
-#define OS_CFG_DEFAULT_TASK_STACK     512 /* 默认任务栈 (字节)            */
+/* idle 栈（v2.2.8 修复：256 → 1024，v2.2.9 不再扩大，保持小范围）
+ *   idle 调 hal_usb_poll → tud_task_ext → TinyUSB 设备栈（SETUP/XFER_DONE
+ *   回调链 200-300B+）。1024B 覆盖正常 CDC 事件；Windows 极端 SET_LINE_CODING
+ *   风暴下若仍偏紧由 STACK_OVF_CHECK 的 4×MAGIC 金丝雀提前挂起，
+ *   不再盲目扩静态栈导致 RAM.bss 占用上涨。*/
+#define OS_CFG_IDLE_STACK_SIZE        1024 /* 空闲任务栈 (字节)           */
+#define OS_CFG_DEFAULT_TASK_STACK     512  /* 默认任务栈 (字节)            */
+
+/* ================================================================
+ * 4.1 用户栈限额（用户需求：统一 8KB，>80% 时由 VT3/vtest status 告警）
+ * ================================================================
+ *   · 定义：所有从 kernel 堆上 kmalloc(stack_size) 出来的**用户任务栈**
+ *     字节总和；**不**包含静态 idle 栈 g_idle_stack[OS_CFG_IDLE_STACK_SIZE]
+ *     （idle 属于内核私有任务，不计入"用户栈"限额）。
+ *   · 80% = 6553.6 → 实际用 (used*100 >= pool*80) 无浮点判断。
+ *   · VT3 每轮压力测试前会打印当前 pool 用量；超过 80% 显示 "STACK LOW!"
+ *     红色告警。用户可通过 kill 不使用的任务或自行调低各任务 stack_size 释放。*/
+#define OS_CFG_USER_STACK_POOL_BYTES  (8*1024) /* 用户栈总限额 8KB             */
+#define OS_CFG_USER_STACK_WARN_PCT    80      /* 告警阈值 (%)                */
 
 /* ================================================================
  * 5. 调度与时间基准

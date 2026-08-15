@@ -130,29 +130,43 @@ const hal_systick_ops_t hal_systick_ops = {
  * 2. 调试串口（UART0 + USB CDC via stdio_usb）
  * ================================================================ */
 
-/* 控制台锁：保护多任务并发调用 putchar，避免输出交织。
- * 实现方式：PRIMASK 关中断（Cortex-M0+ 单核，足够）。 */
-static inline uint32_t _console_lock(void) {
-    return save_and_disable_interrupts();
-}
-static inline void _console_unlock(uint32_t primask) {
-    restore_interrupts(primask);
-}
+/* _usb_force_poll 前置声明：hal_usb_poll 在文件后面用到。*/
+static inline void _usb_force_poll(void);
 
 static void hal_console_init_impl(uint32_t baudrate) {
     (void)baudrate;
-    /* stdio_init_all 同时初始化 UART0（115200-8N1）和 USB CDC，
-     * 与 SDK 的 usb_print_test 完全一致。后续 putchar 会遍历所有
-     * 已注册的 stdio 后端。 */
     stdio_init_all();
 }
 
+/* 控制台输出：PRIMASK 保护 putchar_raw + 每 32 字符 yield 让 idle 刷新 USB FIFO。
+ *
+ * 【为什么需要 PRIMASK】putchar_raw 内部 Pico SDK stdio 状态不可重入，
+ *   如果执行中被 TIMER_IRQ 打断、中断里又调 putc → 状态混乱 → HardFault。
+ *
+ * 【为什么需要定期 yield】CDC TX FIFO = 64B。shell 连续打印超过 64 字符时，
+ *   如果不切到 idle 任务，hal_usb_poll 不会被调用 → FIFO 满 → 丢字符 → 截断。
+ *   每 32 字符触发一次 PendSV yield，idle 任务获得 CPU 后调 hal_usb_poll
+ *   刷新 TX FIFO，然后 shell 被调度回来继续打印。
+ *
+ * 【为什么不在 putc 里直接调 _usb_force_poll】_usb_force_poll 内部调
+ *   dcd_int_handler / tud_task_ext，这些函数与 USB IRQ handler 重入时
+ *   会导致 TinyUSB 内部状态混乱 → HardFault。idle 任务里的 hal_usb_poll
+ *   是安全的设计上下文，不应该从其他任务直接调用。*/
 static int hal_console_putc_impl(char c) {
-    /* 使用 putchar（= stdio_putchar），与可工作的 usb_print_test 一致。
-     * 临界区防止 heartbeat + mem + shell 多任务输出交织。 */
-    uint32_t primask = _console_lock();
+    static uint8_t s_yield_counter = 0;
+
+    /* 每 32 字符让出 CPU，让 idle 任务调 hal_usb_poll 刷新 FIFO */
+    if (++s_yield_counter >= 32) {
+        s_yield_counter = 0;
+        hal_yield_trigger();
+    }
+
+    /* 关中断写入 1 字符（防止与 IRQ 里的 putc 重入）*/
+    uint32_t pm;
+    __asm volatile ("mrs %0, primask" : "=r" (pm) :: "memory");
+    __asm volatile ("cpsid i" ::: "memory");
     int ret = (putchar_raw((unsigned char)c) == (unsigned char)c) ? 1 : 0;
-    _console_unlock(primask);
+    __asm volatile ("msr primask, %0" :: "r" (pm) : "memory");
     return ret;
 }
 
@@ -558,31 +572,43 @@ static hal_err_t hal_i2c_init_impl(uint32_t bus_id, uint32_t hz) {
     i2c_inst_t *i2c = (bus_id == 0) ? i2c0 : i2c1;
     if (i2c == NULL) return HAL_ERR_INVAL;
     i2c_init(i2c, hz);
+
+    /* Pico SDK 的 i2c_init 不会自动配置 GPIO 引脚功能。
+     * 必须手动把 SDA/SCL 引脚切换到 I2C 功能 (GPIO_FUNC_I2C)。*/
+    uint8_t sda_pin = (bus_id == 0) ? 4 : 6;   /* I2C0: GP4/GP5, I2C1: GP6/GP7 */
+    uint8_t scl_pin = (bus_id == 0) ? 5 : 7;
+    gpio_set_function(sda_pin, GPIO_FUNC_I2C);
+    gpio_set_function(scl_pin, GPIO_FUNC_I2C);
+
     return HAL_OK;
 }
 
 static hal_err_t hal_i2c_master_tx_impl(uint32_t bus_id, uint8_t addr, const uint8_t *buf, size_t len) {
     i2c_inst_t *i2c = (bus_id == 0) ? i2c0 : i2c1;
     if (i2c == NULL) return HAL_ERR_INVAL;
-    int ret = i2c_write_blocking(i2c, addr, buf, len, false);
-    return (ret == len) ? HAL_OK : HAL_ERR_IO;
+    /* 【超时保护】i2c_write_blocking 在总线挂死（SCL 被拉低）时会永久阻塞，
+     *   导致 VT2 卡死、无法打印诊断。改用 timeout 版本：100kHz 下
+     *   单字节 ~90us，1024B GDRAM ≈ 92ms，命令帧 <5ms。给 200ms 总超时
+     *   足够覆盖最大数据帧，同时防止永久卡死。*/
+    int ret = i2c_write_timeout_us(i2c, addr, buf, len, false, 200000u);
+    return (ret == (int)len) ? HAL_OK : HAL_ERR_IO;
 }
 
 static hal_err_t hal_i2c_master_rx_impl(uint32_t bus_id, uint8_t addr, uint8_t *buf, size_t len) {
     i2c_inst_t *i2c = (bus_id == 0) ? i2c0 : i2c1;
     if (i2c == NULL) return HAL_ERR_INVAL;
-    int ret = i2c_read_blocking(i2c, addr, buf, len, false);
-    return (ret == len) ? HAL_OK : HAL_ERR_IO;
+    int ret = i2c_read_timeout_us(i2c, addr, buf, len, false, 200000u);
+    return (ret == (int)len) ? HAL_OK : HAL_ERR_IO;
 }
 
 static hal_err_t hal_i2c_mem_read_impl(uint32_t bus_id, uint8_t addr, uint16_t mem_addr, uint8_t *buf, size_t len) {
     i2c_inst_t *i2c = (bus_id == 0) ? i2c0 : i2c1;
     if (i2c == NULL) return HAL_ERR_INVAL;
     uint8_t reg[2] = { (uint8_t)(mem_addr >> 8), (uint8_t)mem_addr };
-    int ret = i2c_write_blocking(i2c, addr, reg, 2, true);
+    int ret = i2c_write_timeout_us(i2c, addr, reg, 2, true, 50000u);
     if (ret != 2) return HAL_ERR_IO;
-    ret = i2c_read_blocking(i2c, addr, buf, len, false);
-    return (ret == len) ? HAL_OK : HAL_ERR_IO;
+    ret = i2c_read_timeout_us(i2c, addr, buf, len, false, 200000u);
+    return (ret == (int)len) ? HAL_OK : HAL_ERR_IO;
 }
 
 static hal_err_t hal_i2c_mem_write_impl(uint32_t bus_id, uint8_t addr, uint16_t mem_addr, const uint8_t *buf, size_t len) {
@@ -595,9 +621,9 @@ static hal_err_t hal_i2c_mem_write_impl(uint32_t bus_id, uint8_t addr, uint16_t 
     tx[0] = (uint8_t)(mem_addr >> 8);
     tx[1] = (uint8_t)mem_addr;
     memcpy(&tx[2], buf, len);
-    int ret = i2c_write_blocking(i2c, addr, tx, len + 2, false);
+    int ret = i2c_write_timeout_us(i2c, addr, tx, len + 2, false, 200000u);
     kfree(tx);
-    return (ret == len + 2) ? HAL_OK : HAL_ERR_IO;
+    return (ret == (int)(len + 2)) ? HAL_OK : HAL_ERR_IO;
 }
 
 const hal_i2c_ops_t hal_i2c_ops = {

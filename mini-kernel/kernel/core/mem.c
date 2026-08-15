@@ -130,7 +130,7 @@ static void _kfree_internal(void *ptr) {
 
     SET_FREE(block);
 
-    /* 尝试与后向块合并。
+    /* ── ① 尝试与后向块合并（高地址方向，紧邻 block 之后） ──
      *
      *   【关键修复 · 双重计数根因】
      *   旧版合并时只更新 block->size，但未把 next 从空闲链表移除，
@@ -151,9 +151,50 @@ static void _kfree_internal(void *ptr) {
         block->size = GET_SIZE(block) + GET_SIZE(next);
     }
 
-    /* 尝试与前向块合并（需遍历空闲链表找前驱，简化：不做前向合并） */
+    /* ── ② 【v2.2.9 新增】尝试与前向块合并（低地址方向，紧邻 block 之前）
+     *
+     *   旧版缺陷：只做后向合并，两个物理连续的空闲块 A（低）+ B（高）
+     *   若先 free A 再 free B，后向合并能成功（B 吸收 A 后面的？不——
+     *   free A 时 A 的 next 是已分配块，不合并；free B 时 B 的 prev 是 A
+     *   但代码只看"next 物理块"，prev 是空闲的完全忽略 → A、B 永远
+     *   在空闲链表中以两个独立节点存在，总空闲字节够但 max_block
+     *   始终上不去 → VT3 多轮循环 + shell/fatfs 交叉 alloc/free 后
+     *   sizes[4]=96 这种中等请求失败。
+     *
+     *   修复：遍历空闲链表，找"物理上刚好在 block 正前方"的那块
+     *   （phys_prev + phys_prev->size == block），找到就把 phys_prev
+     *   从链表移除 + size 并入 block（注意：合并后"新 block"其实是
+     *   phys_prev，因为它的地址更低，后面再统一插入链表头时用
+     *   phys_prev 代替 block）。 */
+    {
+        heap_block_t *phys_prev = NULL;  /* 物理上紧邻 block 的前一个空闲块 */
+        heap_block_t *pp_prev   = NULL;  /* phys_prev 在空闲链表中的前驱 */
+        heap_block_t *curr      = g_free_list;
+        heap_block_t *prev      = NULL;
+        while (curr) {
+            heap_block_t *phys_curr_end = (heap_block_t *)((uint8_t *)curr + GET_SIZE(curr));
+            if (phys_curr_end == block) {
+                phys_prev = curr;
+                pp_prev   = prev;
+                break;   /* 找到了，物理相邻且 prev 的结尾就是 block 的开头 */
+            }
+            prev = curr;
+            curr = curr->next;
+        }
+        if (phys_prev) {
+            /* 从空闲链表移除 phys_prev（它的 size 会被并入 block 前向） */
+            if (pp_prev) {
+                pp_prev->next = phys_prev->next;
+            } else {
+                g_free_list = phys_prev->next;
+            }
+            /* 合并：phys_prev（低地址）吸收 block（高地址）*/
+            phys_prev->size = GET_SIZE(phys_prev) + GET_SIZE(block);
+            block = phys_prev;   /* 后续"插入链表头"的主角换成更低地址的合并头 */
+        }
+    }
 
-    /* 插入空闲链表头 */
+    /* ③ 合并完成后，新 block 插入空闲链表头 */
     block->next = g_free_list;
     g_free_list = block;
 }
@@ -170,17 +211,32 @@ void kfree(void *ptr) {
 }
 
 size_t kmem_free_size(void) {
+    /* 【v2.2.9 修复 · 线程安全】
+     *   旧版无 PRIMASK 保护遍历 g_free_list。若被 TIMER_IRQ → PendSV 抢占
+     *   且其他任务在此期间调用 kmalloc/kfree 修改了链表，恢复后 b->next
+     *   可能指向已合并/已分配的块 → 读取垃圾 size/next → HardFault。
+     *
+     *   VT3 的 kmem_free_size / kmem_max_free_block 与 VT2 的 hal_i2c_mem_write
+     *   (内部 kmalloc/kfree) 并发时正是这个场景。 */
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
+    __asm volatile ("cpsid i" ::: "memory");
     size_t total = 0;
     for (heap_block_t *b = g_free_list; b; b = b->next) {
         total += GET_SIZE(b);
     }
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
     return total;
 }
 
 size_t kmem_max_free_block(void) {
+    uint32_t __pmask;
+    __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
+    __asm volatile ("cpsid i" ::: "memory");
     size_t max = 0;
     for (heap_block_t *b = g_free_list; b; b = b->next) {
         if (GET_SIZE(b) > max) max = GET_SIZE(b);
     }
+    __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
     return max;
 }

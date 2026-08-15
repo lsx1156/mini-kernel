@@ -17,6 +17,17 @@ tcb_t *g_task_pool[OS_CFG_MAX_TASKS] = {0};
 uint8_t g_task_bitmap = 0;
 static uint32_t g_next_task_id = 1;
 
+/* 【v2.2.9 · 用户栈限额统计】
+ *   · g_user_stack_used_bytes  只统计**用户任务**（id > 2）的栈字节；
+ *     内核任务 idle(id=0, 静态栈) / boot_setup(id=1) / shell(id=2) 不计入。
+ *   · g_kernel_stack_used_bytes 统计内核任务（id 1~2）的动态栈字节；
+ *     idle 栈是静态数组 g_idle_stack，不经过 kmalloc，不计入任何统计。
+ *   · 用户需求：「内核占 8KB」= 内核任务栈配额；
+ *     「用户可使用栈自行更替」= 用户任务栈可自行调整；
+ *     「总占用量超 80%」= 用户栈 + 内核栈 总和超 80% 时 VT3 告警。*/
+size_t g_user_stack_used_bytes = 0;
+size_t g_kernel_stack_used_bytes = 0;
+
 /* 空闲任务栈 */
 static uint8_t g_idle_stack[OS_CFG_IDLE_STACK_SIZE] __attribute__((aligned(8)));
 
@@ -87,6 +98,16 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
         task_free_slot(slot);
         return NULL;
     }
+    /* 【v2.2.11 · 栈残留清零】
+     *   kmalloc 不保证返回的内存是 0（若上一次 free 后没被擦写，残留
+     *   旧任务的栈非 0 字节）。task_stack_used() 从 MAGIC 上方第一字节
+     *   向上扫第一个非 0 估算栈深度；若有残留，直接命中 bot → used=size
+     *   → 诊断恒 100% 满，完全失去参考价值。
+     *   清零范围：MAGIC 区(最低 16B)之上到 stack_size。MAGIC 稍后由
+     *   task_stack_init() 填 0xDEADBEEF，所以此处 0 之后会被覆盖，
+     *   不影响金丝雀。memset 对大栈（最多 8KB）耗时可接受：
+     *   RP2040 @ 125MHz 每字节 1 周期 ≈ 64μs / 8KB。*/
+    memset(stack, 0, stack_size);
 
     /* 分配 TCB 结构（从内核堆） */
     tcb_t *task = (tcb_t *)kmalloc(sizeof(tcb_t));
@@ -99,10 +120,19 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
     memset(task, 0, sizeof(tcb_t));
     task->stack_base = (uint8_t *)stack + stack_size;
     task->stack_size = stack_size;
+    /* 【v2.2.9 修复 · id 必须在栈统计前赋值！
+     *   旧 bug：task->id = g_next_task_id++ 在统计之后，判断时 id 还是 0
+     *   （刚 memset 清零）→ 所有任务都走 kernel 分支 → user=0B 永远不变。
+     *   修复：先从 g_next_task_id 拿到 id，用它做分类判断，再写回 task->id。*/
+    task->id = g_next_task_id++;
+    if (task->id <= 2) {
+        g_kernel_stack_used_bytes += stack_size;
+    } else {
+        g_user_stack_used_bytes += stack_size;
+    }
     task->priority = priority;
     task->weight = (priority > 0) ? priority : 1;
     task->state = TASK_STATE_READY;
-    task->id = g_next_task_id++;
     if (name) {
         strncpy(task->name, name, sizeof(task->name) - 1);
     } else {
@@ -165,6 +195,14 @@ void task_destroy(tcb_t *task) {
     /* 释放栈与 TCB（kfree 内部有关中断保护） */
     if (task->stack_base) {
         uint8_t *stack_base = (uint8_t *)task->stack_base - task->stack_size;
+        /* 【v2.2.9 · 栈限额：destroy 时按 id 区分扣减】*/
+        size_t *p_counter = (task->id <= 2) ?
+            &g_kernel_stack_used_bytes : &g_user_stack_used_bytes;
+        if (*p_counter >= task->stack_size) {
+            *p_counter -= task->stack_size;
+        } else {
+            *p_counter = 0;
+        }
         kfree(stack_base);
     }
     kfree(task);

@@ -17,6 +17,26 @@ static tcb_t g_sleep_head = { .next = &g_sleep_head, .prev = &g_sleep_head };
  * ================================================================ */
 /* 内部版本：在调用方已持有临界区时使用（如 task.c、中断上下文） */
 void _sched_ready_enqueue(tcb_t *task) {
+    /* 【v2.2.9 · 防御性检查 · 防重复入队（快速判定版）】
+     *
+     *   v2.2.9 first patch 的 bug：用 _sched_list_contains 做链表遍历
+     *   判定"是否已在队列中"。当 TCB 被 memset 清零后 next/prev=NULL 时
+     *   没问题；但如果 RAM 初值被 bootloader/复位前残留污染（例如 soft reset
+     *   不写零 bss），task->next/prev 恰好 == &g_ready_head（非 NULL）→
+     *   遍历 → 逻辑误判"已在队列中" → return 不做入队 → 就绪队列永远空
+     *   → sched_pick_next 永远返回 idle → LED 疯狂 tight loop，表现为
+     *   "启动即爆闪"。
+     *
+     *   修复思路：只做快速判定 —— next==NULL && prev==NULL 视为"不在任何
+     *   队列"，允许入队；否则认为"已在队列中"，直接跳过。
+     *     · 正常契约下严格成立（remove 时强制置 NULL，memset 初始化也是 0）
+     *     · RAM 残留污染场景下 next/prev 非 NULL 时也不会错误地"再串到
+     *       另一个链表"，最多是**偶发一次调度**被延后一个时间片，
+     *       后果远小于链表环导致的全局崩溃。
+     */
+    if (task->next != NULL || task->prev != NULL) {
+        return;
+    }
     /* 尾插 */
     task->next = &g_ready_head;
     task->prev = g_ready_head.prev;
@@ -79,6 +99,12 @@ tcb_t *sched_ready_pick_next(void) {
  * ================================================================ */
 /* 内部版本：在调用方已持有临界区或处于中断上下文时使用 */
 void _sched_sleep_enqueue(tcb_t *task) {
+    /* 【v2.2.9 · 防御性检查 · 防双队列同驻（快速判定版）】
+     *   同 _sched_ready_enqueue：next/prev 非 NULL 视为已在队列 → return。
+     *   移除链表遍历，避免 RAM 初值残留导致"永远不入队"的启动死锁。*/
+    if (task->next != NULL || task->prev != NULL) {
+        return;
+    }
     /* 按剩余 tick 排序（小在前），O(n) 够用，任务数 ≤ 16 */
     tcb_t *pos = g_sleep_head.next;
     while (pos != &g_sleep_head && pos->ticks_to_sleep <= task->ticks_to_sleep) {
@@ -179,6 +205,25 @@ void sched_start(void) {
     }
 }
 
+/* PendSV 安全上下文用的 hex 打印（单字节 hal_console_putc） */
+static inline void _pendsv_puthex32(uint32_t v) {
+    const char hex[] = "0123456789ABCDEF";
+    for (int i = 28; i >= 0; i -= 4) {
+        hal_console_putc(hex[(v >> i) & 0xF]);
+    }
+}
+static inline void _pendsv_puts(const char *s) {
+    while (*s) hal_console_putc(*s++);
+}
+static inline void _pendsv_putu32(uint32_t v) {
+    /* 最多 10 位十进制，用小栈上缓冲反向打印，避免用 sprintf */
+    char buf[11];
+    int n = 0;
+    if (v == 0) buf[n++] = '0';
+    else while (v > 0) { buf[n++] = '0' + (char)(v % 10); v /= 10; }
+    while (n > 0) hal_console_putc(buf[--n]);
+}
+
 /* ================================================================
  * 上下文切换入口（由 PendSV_Handler 调用，old_sp 是 push r4-r11 后的 PSP）
  *   · 保存当前任务 SP，选下一个就绪任务，返回新任务 SP
@@ -204,6 +249,18 @@ uint32_t *sched_do_switch(uint32_t *old_sp) {
      *    自行管理队列归属，这里不能覆盖。 */
     if (from) {
         from->sp = old_sp;
+
+        /* 【v2.2.11 · OVF 最小化处理】
+         *   之前在这里打印 400+ 字节诊断（逐个 putc），可能在 PendSV 上下文
+         *   里触发 TinyUSB 的状态机推进，间接造成调用链复杂化。
+         *   新策略：不在 PendSV 里打印，只把 from->state 设 SUSPEND 避免
+         *   它继续运行（SUSPEND 后下面的 RUNNING 判断不会重新入队）。
+         *   标志位 stack_overflow 保留为 1，用户通过 `ps` 命令查询时能看到
+         *   "OVF=Y"。这样任务静默挂起，不打印 → 不触发额外嵌套 → 不会爆闪。*/
+        if (from->stack_overflow) {
+            from->state = TASK_STATE_SUSPEND;   /* 下面的 RUNNING 判断就不进了 */
+        }
+
         if (from->state == TASK_STATE_RUNNING) {
             from->state = TASK_STATE_READY;
             if (from != &g_idle_task) {

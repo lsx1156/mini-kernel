@@ -1,6 +1,6 @@
 # Mini Kernel Code Wiki
 
-> **版本**: v2.2.7 STABLE | **目标平台**: RP2040 (Cortex-M0+) | **文档生成**: 2026-08-15
+> **版本**: v2.2.8 STABLE | **目标平台**: RP2040 (Cortex-M0+) | **文档生成**: 2026-08-15
 
 ---
 
@@ -907,6 +907,46 @@ len=0xFF 表示数组结束
 - 栈预算必须按最深调用链 + PendSV 64B + IRQ 嵌套计算，"差一点够"就是"溢出"；
 - 堆利用率逼近 100% 时，任何栈溢出都直接踩坏相邻 TCB/堆元数据——留余量是稳定性的一部分。
 
+### 9.9 idle 栈溢出 + HardFault 现场转储（v2.2.8 修复）
+
+**现象**：v2.2.7 修复后（堆 16KB、VT 栈加大）`vtest start` 仍在 Round #1 打印中途爆闪——**崩溃位置与修复前完全一致**，且堆账目精确吻合（16KB − 8552B 分配明细 = 7832B ✓）、VT 栈金丝雀未触发。证明根因与堆余量无关。
+
+**真凶：idle 任务栈 256B 撑不起 TinyUSB 深调用链**
+
+```
+idle_task_entry (256B 静态栈 g_idle_stack，位于 .bss)
+  └→ hal_usb_poll
+       └→ _usb_force_poll
+            ├→ dcd_int_handler(0)      ← TinyUSB DCD，处理 bus reset/SETUP/XFER
+            └→ tud_task_ext(0,0)       ← TinyUSB 设备任务
+                 └→ usbd_control_setup → class control_xfer_cb   ← 栈深 200~300B+
+```
+
+平时 tud_task 无积压事件时链路浅（~150B），256B 勉强。**vtest 期间 VT3 大量打印 → CDC IN 传输完成事件积压**，而 shell 在 `task_sleep(1)` 打盹、VT 全睡时，深事件由 idle 处理 → 越过 256B → **写穿 g_idle_stack，踩坏 .bss 相邻的 g_task_pool / g_current_task / TinyUSB 缓冲 → 调度器崩溃 → HardFault 爆闪**。
+
+这同时解释了：崩点总在打印高峰（USB 流量峰值）、与堆余量无关（idle 栈不在堆上）、v2.2.7 金丝雀没报（检查代码明确排除了 idle）。
+
+| 编号 | 修复 | 代码位置 | 说明 |
+|------|------|---------|------|
+| 9.9.1 | **idle 栈 256 → 1024** | [os_config.h#L54-L60](file:///e:/ppCD/project/mini-kernel/include/os_config.h#L54-L60) | 覆盖 TinyUSB 最深回调链 + PendSV 64B + IRQ 嵌套 |
+| 9.9.2 | **金丝雀覆盖 idle** | [kernel.c#L329](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L329) | 去掉 `!= &g_idle_task` 排除——idle 跑最深 USB 链路，恰恰最需要检查 |
+| 9.9.3 | **HardFault 现场转储** | [kernel.c#L357-L429](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L357-L429) + [context_switch.S#L298-L309](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L298-L309) | handler 先存 PSP/MSP，再调 C dump：UART0 直写寄存器（不依赖 SDK/USB，二次 fault 概率最低）输出出错任务的 PC/LR/xPSR/R0/R12 + CFSR/HFSR/BFAR + 任务名。查看：USB-TTL 接 GPIO0(TX)，115200-8N1 |
+
+**HardFault dump 输出示例**（接 UART0 后崩溃即可看到）：
+```
+!!! HardFault !!!
+MSP=0x20041F98  PSP=0x20001234  CFSR=0x00008200  HFSR=0x40000000  BFAR=0x00000000
+Fault PC=0x10001ABC  LR=0x10003421  xPSR=0x61000000  R0=0x00000000  R12=0xDEADBEEF
+task='vt_ctrl'
+```
+PC 对照 `objdump -d mini_kernel.elf` 反汇编即可精确定位崩溃指令。
+
+**设计教训**：
+- "空闲任务很闲所以栈可以小"是错觉——idle 承担 USB 轮询职责时，它的最坏栈深 = USB 协议栈最深深度的；任何承担驱动职责的任务，栈预算都要按协议栈最坏情况算；
+- 静态数组栈溢出踩的是 .bss 邻居，症状（调度器乱/USB 乱/随机崩）与被踩变量相关而非溢出者本身——定位极难，预防成本（多给 768B）远低于排查成本；
+- 排障时"崩溃位置不变 + 相关资源余量翻倍仍崩"是排除该资源假设的强信号，应及时换方向；
+- HardFault 只有闪灯等于黑盒——现场转储（PC/LR/CFSR/任务名）是把"不可复现分析"变成"一眼定位"的关键基建。
+
 ---
 
 ## 10. 关键数据结构
@@ -1082,7 +1122,7 @@ cmake --build build --target usb_print_test
 |----|------|------|
 | `OS_CFG_MAX_TASKS` | 16 | 最大任务数（含 idle）|
 | `OS_CFG_HEAP_SIZE_BYTES` | 16384 | 内核堆大小（v2.2.7：8K→16K，支撑 vtest 三任务；裁剪可调小）|
-| `OS_CFG_IDLE_STACK_SIZE` | 256 | 空闲任务栈 |
+| `OS_CFG_IDLE_STACK_SIZE` | 1024 | 空闲任务栈（v2.2.8：256→1024，idle 跑 TinyUSB 深链路）|
 | `OS_CFG_DEFAULT_TASK_STACK` | 512 | 默认任务栈 |
 | `OS_CFG_TICK_HZ` | 1000 | 系统滴答频率 (1ms) |
 | `OS_CFG_TIME_SLICE_TICKS` | 5 | 默认时间片 (5ms) |

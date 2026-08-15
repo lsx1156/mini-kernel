@@ -279,8 +279,17 @@ SVC_Handler:
  *   此处不碰任何 APB 寄存器，**只写 SIO_OUT_SET/CLR**（0xD0000014/18，
  *   AHB-Lite 单周期端口，任何情况下都不会触发总线错误）。
  *
+ * 【v2.2.8 · 现场转储】进入 handler 先保存 PSP/MSP 到 kernel.c 的
+ *   g_fault_psp/g_fault_msp，再 bl hardfault_dump_c（C 函数，跑 MSP，
+ *   UART0 寄存器直写输出 PC/LR/xPSR/CFSR/HFSR/BFAR/任务名）。
+ *   dump 不返回值、之后进入原 5Hz 闪灯死循环，故 bl 覆盖 LR 无影响
+ *   （仍 push {lr} 保持框架严谨）。
+ *
  * 节奏：100ms/100ms 快闪（5Hz）死循环。
  * ================================================================ */
+.extern hardfault_dump_c
+.extern g_fault_psp
+.extern g_fault_msp
 .global isr_hardfault
 .global HardFault_Handler
 .type   isr_hardfault,    %function
@@ -288,6 +297,17 @@ SVC_Handler:
 .thumb_func
 isr_hardfault:
 HardFault_Handler:
+    /* --- v2.2.8: 保存异常现场指针供 C dump 读取 --- */
+    mrs     r0, psp
+    ldr     r1, =g_fault_psp
+    str     r0, [r1]
+    mrs     r0, msp
+    ldr     r1, =g_fault_msp
+    str     r0, [r1]
+    /* 注意：M0+ push/pop 仅支持低寄存器（不含 lr），且 dump 后进入
+     * 死循环永不返回，无需保存 EXC_RETURN —— 直接 bl。 */
+    bl      hardfault_dump_c
+
     ldr     r0, =0xD0000000         /* SIO base (AHB-Lite, 安全) */
     movs    r1, #1
     lsls    r1, r1, #25             /* r1 = GPIO25 mask */
