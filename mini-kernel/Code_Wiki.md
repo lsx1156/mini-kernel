@@ -821,7 +821,7 @@ len=0xFF 表示数组结束
 | 9.2.3 | **boot_setup task_suspend 后不再复活** | [kernel.c#L193-L194](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L193-L194) | 旧版 suspend+sleep 组合导致 SUSPEND→SLEEP→被 tick 唤醒→再次执行 demo_app_init→重复创建任务→TCB 池指针覆盖→悬空 TCB→ps 乱码→LED 爆闪。修复：suspend 后 while(1) 空转等 PendSV |
 | 9.2.4 | **ALARM3 而非 ALARM0** | [hal_port.c#L67-L69](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L67-L69) | 不覆盖 SDK alarm_pool handler → USB 枚举正常完成 → 不出现 COM 口完全不识别 |
 | 9.2.5 | **stdio_init_all 在 MSP+开中断后调用** | [kernel.c#L270-L275](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L270-L275) | USB CTRL IRQ 注册 + 枚举依赖正确上下文，在 PSP 任务中调用会导致 USB 不枚举 |
-| 9.2.6 | **PICO_STDIO_USB_STDOUT_TIMEOUT_US=0** | [CMakeLists.txt#L159](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt#L159) | CDC FIFO 满不阻塞 60s/字符 → 不阻塞在 banner 打印 → sched_start 能及时执行 |
+| 9.2.6 | **PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000（1s 半阻塞）** | [CMakeLists.txt#L159](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt#L159) | CDC FIFO 满时边 pump tud_task 边等主机读走最多 1s（半阻塞，不丢开机输出），超时才丢；未连接立即丢弃不卡启动。配套 v2.4.3 开机日志缓存回放（见 §15）保证错过实时输出也能补看完整开机日志 |
 | 9.2.7 | **PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1** | [CMakeLists.txt#L151](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt#L151) | 兼容 PuTTY 等不拉 DTR 的终端 → 不会丢弃所有输出 |
 | 9.2.8 | **删除 5s USB 枚举忙等** | [kernel.c#L289-L291](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L289-L291) | 50M nop 循环 ≈ 5s 完全浪费 CPU；USB 枚举由中断驱动，不需要忙等，启动时间从 10s+ → <500ms |
 
@@ -1207,6 +1207,67 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
   3. 链接错误 multiple definition → 通常是 startup_rp2040.S 被错误链接（已 EXCLUDE）
   4. UF2 文件体积：~195KB 为正常完整基础版
 ```
+
+---
+
+## 15. v2.4 超频 / 多核 / 开机日志回放
+
+> 本版目标：默认单核 + 125MHz，通过 `ovclk` 指令把**频率（预设档或任意 MHz）与多核标志**固化到独立 Flash Config 区，冷启动应用；未固化 / 损坏 / 极限档则安全回退。
+
+### 15.1 固化配置 `config_store`（[config_store.c](file:///e:/ppCD/project/mini-kernel/kernel/core/config_store.c)）
+
+* 独立 Flash Config 区（4KB 扇区，见 `flash_layout.h`），`config_data_t` 固定 20B：
+  `magic('MK2C') + version(2) + clock_mhz(16bit) + multi_core + reserved[7] + crc32(前16字节)`。
+* `config_read`：魔数/版本/CRC 任一不符 → 返回默认（单核 + 125MHz），绝不动硬件。
+* `config_apply`（`sched_start` 前调用）：**>250MHz 极限频率冷启动不自动应用**（保持 125MHz），
+  保证系统始终可进 shell 恢复；config 区保留供 `ovclk reset` 清除或改回安全档。
+* 注意：v2 把 v1 的 `clock_tier`(档位号) 改为 `clock_mhz`(任意 MHz)，旧固化配置因版本不符自动失效。
+
+### 15.2 超频 `sysclk`（[hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c) `sysclk_apply_mhz`）
+
+* 档位表：125/250/375/500MHz（均为 125 整数倍 → clk_peri 可精确整数分频回 125MHz）。
+* 任意 MHz（100~500）：`sysclk_nearest_achievable_mhz` 用 `check_sys_clock_khz` 就近锁定可达频率。
+* 自动匹配项：
+  * SYS PLL → `set_sys_clock_khz`（不触碰 pll_usb，USB 恒 48MHz）
+  * **XIP flash 分频（SSI baudr）**：钳 ≤62.5MHz，且**升频先加分频再切 PLL**（v2.4.2 崩溃根因：
+    切到 375MHz 瞬间 flash 时钟 = 375/旧分频 ≈187MHz → XIP 取指损坏）
+  * CLK_PERI 整数分频钳 ≤133MHz
+  * vreg 升压分档：>250MHz→1.25V / >125MHz→1.20V / 其余 1.10V
+  * **切换全程关中断**（`save_and_disable_interrupts`），避免 tick 在过渡频率下抢占二次崩溃
+* clk_peri 变更后 `uart_set_baudrate(uart0, 115200)` 按新时钟重算（UART 小数分频），TTL 保持精确 115200。
+* HardFault 转储前也先按当前 clk_peri 重设 UART0 波特率 → 切换中途崩溃的 dump 仍可读。
+
+### 15.3 命令 `ovclk`（[shell_ovclk.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell_ovclk.c)）
+
+| 子命令 | 作用 |
+|-------|------|
+| `list` | 列出预设档 |
+| `set <tier\|MHz>` | 设置待固化频率（仅 RAM） |
+| `try <tier\|MHz>` | 运行时临时切换（不固化，reboot 恢复） |
+| `mcore <0\|1>` | 设置待固化多核标志 |
+| `get` | 当前主频 + 已固化频率/多核 |
+| `save` | 写入 Flash Config 区 |
+| `unsave`/`reset` | 擦除固化区 → 恢复 125MHz 单核 |
+
+### 15.4 命令 `mcore`（[shell_mcore.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell_mcore.c)）
+
+多核调度脚手架：`status` 看 core0/core1 当前任务 + core1 tick 计数；`demo` 显式启动 core1 并在其上创建心跳任务；`stop` 销毁。boot 阶段不自动启动 core1（诊断中）。
+
+### 15.5 命令 `reboot`（[shell.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c)）
+
+写 AIRCR.SYSRESETREQ 软复位；复位前清 USB D+ 上拉（PULLUP_EN=0）让主机重新枚举，复位后 Windows 重新识别 COM 口，并重现完整开机画面 + 应用固化配置。
+
+### 15.6 开机日志缓存回放（[hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c)）
+
+* 启动阶段（`sched_start` 之后到 `_boot_setup_task` 末尾 `hal_bootlog_end()`）`hal_console_putc` 输出同步捕获进 2KB RAM 缓冲。
+* `hal_usb_poll` 解析 CDC `SET_CONTROL_LINE_STATE(0x21/0x22)` 的 **DTR 上升沿**（= 用户刚打开终端）→ 回放完整开机日志。
+* 配合 `PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000`（1s 半阻塞）→ 迟开终端也能看到完整开机画面。
+
+### 15.7 已知限制（超频稳定性）
+
+* RP2040 标称 133MHz；250MHz 需 1.20V、375/500MHz 需 1.25V 且属极限档，**冷启动默认不自动应用**。
+* 任意非 125 整数倍频率（如 270/300）→ clk_peri 被整数分频到 ≤133MHz（如 90/100MHz），TTL UART 波特率已由 `uart_set_baudrate` 自动匹配；USB 不受影响（独立 48MHz）。
+* core1 启动仍可能引发内存损坏（诊断中），用 `mcore demo` 显式验证。
 
 ---
 

@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.4.0 🔬 探索` — 🟡 **超频档位 + 多核固化**（v2.4）：默认单核 + 125MHz，通过 `ovclk` 指令设置档位/多核并固化到独立 Flash Config 区，冷启动应用；未固化/损坏则安全回退单核 + 原始频率。多核调度器为脚手架（标志已持久化，`config_mcore_apply` 钩子预留）。
+> **当前版本**：`2.4.3 🔬 探索` — 🟡 **超频 + 多核 + 开机日志回放**（v2.4）：默认单核 + 125MHz；通过 `ovclk` 指令把**频率（预设档 125/250/375/500 或任意 100~500MHz）与多核标志**固化到独立 Flash Config 区，冷启动应用；未固化/损坏/超 250MHz 极限档则安全回退单核 + 125MHz。多核调度器为脚手架（`mcore demo` 显式启动 core1，boot 不自动启动）。附：XIP flash 分频时序修复、TTL 波特率随 clk_peri 自动重算、开机日志缓存回放（迟开终端也能看到完整开机画面）。
 >
 > **v2.2 大版本亮点**
 >
@@ -96,7 +96,7 @@ project/
 | **v2.2.7**         | ✅ Released | 🟢 **0.96" I2C OLED 底层驱动重构 + 调度权重可调**：① 底层驱动抽离——命令/数据统一走 16 位 I2C 编码（Co 控制字节），`set_addr` 改旧式寻址 + 列偏移，`write_block` 数据块写入，与网上通用 0.96 驱动写法对齐，解决花屏/寻址错位。② 驱动缓冲全部从任务栈移出到 BSS 静态区，消除 GCC nested function trampoline 与栈帧指针错乱导致的 HardFault。③ I2C 事务失败自动重试 + `hal_i2c_init` 外设复位重试，解决 VT3 suspend/resume 打断白帧刷新导致 page 1~7 全挂。④ I2C 时钟 100kHz → 400kHz，刷新提速 4 倍。⑤ VT2 权重 1 → 8（时间片 5ms → 40ms），整帧 25ms 在一个时间片内跑完 → 肉眼瞬间整屏切换（消除逐行扫描）。⑥ `help` 新增"调度说明"：weight=时间片倍数、非抢占、无优先级。⚠️ 曾标注已知问题：应用层轮询连续 >30 次 HardFault 崩溃风险 → **已在 v2.3.6 根治**。 |
 | **v2.3.6**         | ✅ **当前稳定**（HEAD） | 🟢 **根治 >30 次轮询崩溃（I2C 单事务原子性）**：**根因**——VT3 每 10s 对 VT2 做 `task_suspend/resume`，若 VT2 恰在 `i2c_write_timeout_us` 中途被挂起 3s，SDK 的 200ms 超时是"调用起点算起的绝对截止"，恢复后立即判超时 → `HAL_ERR_IO` → 反复 `reinit`（`i2c_init` 复位外设）→ 累积约 30 轮后 I2C 外设状态/堆被反复复位打乱 → HardFault；同时表现为"屏幕刷新错误随轮询递增"。**修复**——用 PRIMASK 临界区包住 VT2 的"单次 I2C 事务"（`vt2_oled_tx_cmds` / `vt2_oled_write_block` 内的 `hal_i2c_tx`），使 PendSV 上下文切换无法打断一次 START..STOP 事务（400kHz 下单次约 6B~133B，最多 ~3ms 关中断）；VT3 的 suspend 在 VT2 完成本次事务、重新开中断后才生效，VT2 永不带着过期截止指针被挂起。 |
 | v2.3               | 📋 规划      | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示                                                                                                                                                                                                                                                |
-| **v2.4.0**         | 🔬 探索（HEAD） | 🟡 **超频档位 + 多核固化**：默认单核 + 125MHz；`ovclk list/set/mcore/get/save/unsave` 指令设置档位（125/150/200/250/270/300MHz，后两档隐藏）与多核标志，固化到 MSC 尾部新划的独立 **Flash Config 区**（4KB，魔数+版本+CRC32 保护）；冷启动 `config_apply()` 在 `sched_start` 前应用，未固化/损坏安全回退单核 + 125MHz。超频切换 SYS PLL + CLK\_PERI 钳回 125MHz + SSI/XIP 分频缩放 + vreg 升压。多核调度器为脚手架（标志持久化 + `config_mcore_apply` 弱钩子，实装待 v3.5）。                                                                                                                                                                                                                                                |
+| **v2.4.3**         | 🔬 探索（HEAD） | 🟡 **超频 + 多核固化 + 开机日志回放**：默认单核 + 125MHz；`ovclk list/set/try/mcore/get/save/unsave|reset` 指令设置**预设档（125/250/375/500MHz）或任意 100~500MHz**与多核标志，固化到独立 **Flash Config 区**（4KB，魔数+版本+CRC32 保护，config_store v2 存 MHz 而非档位号）；冷启动 `config_apply()` 在 `sched_start` 前应用，未固化/损坏安全回退单核 + 125MHz，**>250MHz 极限档固化后冷启动不自动应用**（保证可进 shell 恢复）。超频自动匹配：SYS PLL 就近锁定可达频率 + CLK\_PERI 整数分频(≤133MHz) + XIP flash 分频钳≤62.5MHz（修升频时序：先加分频再切 PLL）+ vreg 分档升压 + 切换全程关中断；clk\_peri 变更后按新时钟重算 UART0 波特率（小数分频，TTL 保持 115200）。**开机日志缓存回放**：启动阶段控制台输出同步捕获进 RAM，CDC DTR 上升沿（终端打开）时回放完整开机日志 + USB 半阻塞输出（stdio timeout 1s）。多核调度器为脚手架（`mcore demo` 显式启动 core1，boot 不自动启动）。 |
 | v3.0               | 🗓️ 规划     | VFS 抽象层 + 多分区 + SD Card (SPI1)                                                                                                                                                                                                                                                         |
 | v3.5               | 🗓️ 规划     | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植                                                                                                                                                                                                                                               |
 
@@ -785,6 +785,58 @@ factory_reset confirm        # 真正执行：擦 Bootscript A/B + 末尾 64KB
 clear | cls                 # 清屏 + 光标左上角（VT100）
 led on | off | toggle       # 控制 GPIO25 LED
 ```
+
+### man 9: 超频 / 多核 / 重启（v2.4 新增）
+
+#### ovclk — 超频频率 + 多核标志固化
+
+默认 **单核 + 125MHz**。`ovclk` 把频率与多核标志固化到独立 Flash Config 区，冷启动应用；未固化 / CRC 损坏安全回退单核 + 125MHz。
+
+```
+ovclk list                    # 列出预设档（125/250/375/500MHz）
+ovclk set <tier|MHz>          # 设置待固化频率（仅 RAM，不实时改时钟）
+                              #   tier: 0=125 1=250 2=375 3=500；MHz: 任意 100~500
+ovclk try <tier|MHz>          # 运行时临时切换（不固化，reboot 后恢复固化值/125MHz）
+ovclk mcore <0|1>             # 设置待固化多核标志（0=单核 1=双核）
+ovclk get                     # 查看当前实际主频 + 已固化频率/多核
+ovclk save                    # 把待固化频率+多核写入 Flash（掉电保留）
+ovclk unsave | reset          # 擦除固化区 → 下次启动恢复 单核 + 125MHz
+```
+
+**安全保护**：
+* 固化的是 **>250MHz 极限频率**（270/300/375/500 等）时，**冷启动不自动应用**（保持 125MHz），保证系统始终可进 shell 恢复；config 区保留，可用 `ovclk set <安全频率>` + `save` 改回或 `ovclk reset` 清除。
+* 任意频率由 `sysclk_apply_mhz` 自动匹配：SYS PLL 就近锁定可达频率、CLK_PERI 整数分频(≤133MHz)、XIP flash 分频钳≤62.5MHz、vreg 分档升压、切换全程关中断；切完后按新 clk_peri 重算 UART0 波特率（TTL 仍 115200）。
+
+**使用示例**：
+```
+mk> ovclk list                # 看档位
+mk> ovclk try 250             # 临时试 250MHz（USB 控制台保持正常）
+mk> ovclk set 250             # 固化 250MHz
+mk> ovclk save                # 写入 Flash
+mk> reboot                    # 重启后冷启动应用
+```
+
+#### mcore — 多核调度测试（脚手架）
+
+```
+mcore status                  # 查看 core0/core1 当前任务 + core1 计数/tick
+mcore demo                    # 显式启动 core1 + 在其上创建心跳任务
+mcore stop                    # 销毁 core1 心跳任务
+```
+
+**说明**：boot 阶段**不自动启动** core1（当前 core1 启动仍可能引发内存损坏，诊断中）；用 `mcore demo` 显式启动验证多核调度。
+
+#### reboot — 软复位
+
+```
+reboot                        # 软复位系统，重新执行完整启动流程（重现开机画面 + 应用固化配置）
+```
+
+**说明**：通过写 AIRCR.SYSRESETREQ 触发系统复位；复位前断开 USB D+ 上拉让主机重新枚举，复位后 Windows 会重新识别 COM 口。
+
+#### 开机日志回放（无需命令，自动）
+
+启动阶段控制台输出会缓存进 RAM；之后**每次打开终端（CDC DTR 上升沿）自动回放完整开机日志**。因此即使错过实时开机画面，打开 PuTTY 也能看到完整 banner。
 
 ***
 
