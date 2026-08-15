@@ -1,8 +1,13 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.2.7 · 2026-08
+> **当前版本**：v2.3.6 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
+>
+> 🟢 **v2.3.6 更新：根治 >30 次轮询崩溃（I2C 单事务原子性）**
+> · **根因**：VT3 每 10s 对 VT2 做 `task_suspend/resume`，若 VT2 恰在 `i2c_write_timeout_us` 中途被挂起 3s，SDK 的 200ms 超时是"调用起点算起的绝对截止"，恢复后立即判超时 → `HAL_ERR_IO` → 反复 `reinit` 复位外设，累积约 30 轮后触发 HardFault
+> · **修复**：用 PRIMASK 临界区包住"单次 I2C 事务"（`VT2` 的 `set_addr`/`write_block`），使 PendSV 上下文切换无法打断一次 START..STOP 事务，VT2 永不带着过期截止指针被挂起（400kHz 下单次最多约 3ms 关中断）
+> · 该修复同时消除"屏幕刷新错误随轮询次数递增"的现象
 >
 > 🟢 **v2.2.7 更新：OLED 底层驱动重构 + 调度权重可调**
 > · 重构 0.96" I2C OLED 最底层驱动：命令/数据统一走 16 位 I2C 编码（Co 控制字节），`set_addr` 旧式寻址 + 列偏移，`write_block` 数据块写入，与网上通用 0.96 驱动写法对齐
@@ -12,7 +17,7 @@
 > · VT2 权重 1 → 8（时间片 5ms → 40ms），整帧在一个时间片内连续跑完，肉眼看瞬间整屏刷新（消除逐行扫描）
 > · `help` 新增"调度说明"：解释 weight=时间片倍数、非抢占、无优先级
 >
-> ⚠️ **已知潜在问题（正在解决中）**：应用层轮询（如循环 `i2c rd`/写同一块）连续超过 **30 次** 时存在 HardFault 崩溃风险，正在排查修复中。
+> ✅ **已知问题状态**：~~应用层轮询连续超过 30 次 HardFault 崩溃风险~~ → **v2.3.6 已修复**（I2C 单事务原子性）
 > · 使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
 
 ---

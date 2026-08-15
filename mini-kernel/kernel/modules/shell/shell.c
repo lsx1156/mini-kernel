@@ -1615,8 +1615,23 @@ static hal_err_t vt2_oled_tx_cmds(const uint8_t *cmds, int ncmds)
         g_vt2_txbuf[2 * i + 1] = cmds[i];
     }
     for (int retry = 0; retry < 3; retry++) {
-        hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
-                                 g_vt2_txbuf, (size_t)(2 * ncmds));
+        hal_err_t r;
+        /* 【v2.3.6 · 单事务原子性修复 —— 根治 >30 轮轮询崩溃】
+         *  VT3 每 10s 对 VT2 做 task_suspend/resume。若 VT2 恰好在
+         *  hal_i2c_tx(→i2c_write_timeout_us) 的中途被挂起 3s，SDK 的
+         *  超时是"调用起点算起的 200ms 绝对截止"，挂起期间截止已过，
+         *  恢复后立即判超时 → HAL_ERR_IO → 触发 reinit 复位外设。
+         *  每轮这样累积，约 30 轮后外设状态/堆被反复复位打乱 → HardFault。
+         *  修复：用 PRIMASK 临界区包住"单次 I2C 事务"，使 PendSV 上下文
+         *  切换无法打断一次 6~133B 的 START..STOP 事务（400kHz 下最多
+         *  ~3ms 关中断，可接受）。VT3 的 suspend 在 VT2 完成本次事务、
+         *  重新开中断后才生效，VT2 永远不会带着过期截止指针被挂起。*/
+        uint32_t __pmask;
+        __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
+        __asm volatile ("cpsid i" ::: "memory");
+        r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
+                       g_vt2_txbuf, (size_t)(2 * ncmds));
+        __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
         if (r == HAL_OK) return HAL_OK;
         vt2_i2c_reinit();   /* 外设可能被 suspend 打坏，硬复位再试 */
         task_sleep(2);
@@ -1644,8 +1659,16 @@ static hal_err_t vt2_oled_write_block(const uint8_t *block, int block_len)
 {
     if (block_len <= 0) return HAL_OK;
     for (int retry = 0; retry < 3; retry++) {
-        hal_err_t r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
-                                 block, (size_t)block_len);
+        hal_err_t r;
+        /* 【v2.3.6 · 单事务原子性】同 vt2_oled_tx_cmds：PRIMASK 临界区防止
+         *  VT3 的 suspend 在 i2c_write_timeout_us 中途打断，避免 200ms 绝对
+         *  截止在 3s 挂起期间过期 → 恢复即超时 → 累积 reinit → HardFault。*/
+        uint32_t __pmask;
+        __asm volatile ("mrs %0, primask" : "=r" (__pmask) :: "memory");
+        __asm volatile ("cpsid i" ::: "memory");
+        r = hal_i2c_tx((uint32_t)g_vt_oled_bus, (uint8_t)g_vt_oled_addr,
+                       block, (size_t)block_len);
+        __asm volatile ("msr primask, %0" :: "r" (__pmask) : "memory");
         if (r == HAL_OK) return HAL_OK;
         vt2_i2c_reinit();   /* 同 vt2_oled_tx_cmds 的恢复策略 */
         task_sleep(2);
