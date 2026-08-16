@@ -1,16 +1,20 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.5 · 2026-08
+> **当前版本**：v2.7.1 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
 >
 > 📖 **指令说明书（Shell 命令手册）**：[指令说明书.md](./指令说明书.md)
 >
-> 🟢 **v2.5 更新：两版本分离（内核库纯净化）**
-> · **mini-kernel** 改为**可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU
-> · **rp2040demo** 为独立目标工程，编译 `rp2040_port` 移植层并产出 `.uf2` 固件
-> · 两版本各自有独立 `os_config.h`；RP2040 专属功能（超频/多核/MSC/FatFs/bootscript/vtest 等）用总开关 `OS_CFG_PORT_RP2040` 隔离，纯库编译为空
-> · 新增**指令说明书**：完整收录全部 Shell 命令（基础 + RP2040 专属）
+> 🟢 **v2.7.1 更新：三部分分离 + 时钟树说明**
+> · **mini-kernel** —— 可移植纯静态库（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU
+> · **rp2040demo** —— RP2040 Demo 目标工程（`rp2040_port` 移植层 + 展示任务），**自此版起作为 Demo 版完整体截止，不再更新**
+> · **rp2040system** —— RP2040 系统工程：与 demo **完全同命令集**，但**无展示任务**（`OS_CFG_SHOW_DEMO=0`，去掉 OLED FPS / 呼吸 LED / GP15 PWM）
+> · 新增 **RP2040 时钟树说明**（见下）：超频只改 `clk_sys`，PWM/节拍等周期功能不受影响
+>
+> 🟢 **v2.5 更新：两版本分离（内核库纯净化）**（历史）
+> · mini-kernel 改为可移植纯静态库；rp2040demo 独立编译 `rp2040_port` 并产出 `.uf2`
+> · 两版本各自有独立 `os_config.h`；RP2040 专属功能用总开关 `OS_CFG_PORT_RP2040` 隔离
 >
 > 🟢 **v2.3.6 更新：根治 >30 次轮询崩溃（I2C 单事务原子性）**
 > · **根因**：VT3 每 10s 对 VT2 做 `task_suspend/resume`，若 VT2 恰在 `i2c_write_timeout_us` 中途被挂起 3s，SDK 的 200ms 超时是"调用起点算起的绝对截止"，恢复后立即判超时 → `HAL_ERR_IO` → 反复 `reinit` 复位外设，累积约 30 轮后触发 HardFault
@@ -61,11 +65,12 @@ project/                          ← 本仓库根目录（单仓 · monorepo）
 │   ├── README.md                 详细文档（特性表/架构/移植指南）
 │   └── CMakeLists.txt            纯静态库构建（导出 kernel_core / shell_module）
 │
-└── rp2040demo/                   🛠️ 【RP2040 目标工程】——真正烧录到 RP2040 的示例固件
+└── rp2040demo/                   🛠️ 【RP2040 Demo 目标工程】——真正烧录到 RP2040 的示例固件
     │                               （通过 add_subdirectory(../mini-kernel) 引用内核库 + Pico SDK）
+    │                               ⚠️ v2.7.1 起作为 Demo 完整体截止，不再更新
     ├── src/main.c                应用入口（main() → kernel_main()）
-    ├── os_config.h               本工程专属裁剪配置（RP2040 功能全开）
-    ├── rp2040_port/              🔌 RP2040 移植层（全部 RP2040 专属代码）
+    ├── os_config.h               本工程专属裁剪配置（RP2040 功能全开 + OS_CFG_SHOW_DEMO=1）
+    ├── rp2040_port/              🔌 RP2040 移植层（全部 RP2040 专属代码，**demo 与 system 共享**）
     │   ├── hal_port.c             HAL 实现 + USB/Timer/GPIO/Flash 驱动
     │   ├── context_switch.S       Cortex-M0+ SVC + PendSV 上下文切换
     │   ├── msc_usb.c / msc_blockdev.c   USB Composite(CDC+MSC) + 块设备
@@ -74,7 +79,15 @@ project/                          ← 本仓库根目录（单仓 · monorepo）
     │   ├── shell/                 bootscript.c / shell_fs.c / shell_mcore.c / shell_ovclk.c
     │   └── demo/demo_app.c        演示任务（LED/心跳/vtest 等）
     ├── CMakeLists.txt
-    └── build.bat                 Windows 一键构建（产出 .uf2 固件）
+    └── build.bat                 Windows 一键构建（产出 rp2040demo.uf2）
+
+└── rp2040system/                 🛠️ 【RP2040 系统工程】——无展示版本
+    │                               （复用 rp2040demo/rp2040_port，os_config.h OS_CFG_SHOW_DEMO=0）
+    │                               · 与 demo 完全同命令集，仅去掉 OLED FPS/呼吸 LED/GP15 PWM 展示
+    ├── src/main.c                应用入口（与 demo 相同）
+    ├── os_config.h               本工程专属裁剪配置（OS_CFG_SHOW_DEMO=0）
+    ├── CMakeLists.txt
+    └── build.bat                 Windows 一键构建（产出 rp2040system.uf2）
 ```
 
 ---
@@ -98,13 +111,31 @@ cd rp2040demo
 
 | 版本 | 状态 | 关键词 |
 |---|---|---|
-| v2.5 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **两版本分离（内核库纯净化）**：mini-kernel 改为可移植纯静态库；rp2040demo 独立编译 `rp2040_port`；`OS_CFG_PORT_RP2040` 总开关隔离；新增指令说明书 |
+| v2.7.1 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示）；多核 idle 栈修复、FPS 修正、GP15 精确台阶 PWM |
+| v2.7 | ✅ 已发布历史 | 🟢 展示/稳定性验证：OLED FPS 动画 + 呼吸 LED + GP15 PWM（show 任务） |
+| v2.5 | ✅ 已发布历史 | 🟢 两版本分离（内核库纯净化）：mini-kernel 可移植纯静态库；rp2040demo 独立编译 `rp2040_port`；`OS_CFG_PORT_RP2040` 总开关隔离；新增指令说明书 |
 | v2.4 | ✅ 已发布历史 | 🟢 超频档位/任意 MHz + 多核基础 + 固化配置 + 开机日志回放 |
 | v2.3.x | ✅ 已发布历史 | 🟢 OLED 底层驱动重构 + I2C 单事务原子性（根治 >30 次轮询崩溃）+ 权重刷屏提速 + help 调度说明 |
 | v2.2.x | ✅ 已发布历史 | 🟢 调度系统完全正常 / 三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / mkfs 实现 / ALARM3 tick 修复 |
 | v2.3+ | 📅 规划中 | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp / mv） |
 | v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |
 | v3.5 | 📅 远期规划 | RP2350 多核（SMP）+ RISC-V（CH32V/bl702）移植 |
+
+---
+
+## ⏱️ RP2040 时钟树（超频对功能的影响）
+
+RP2040 不同外设吃**不同时钟源**，超频（`ovclk`）只改 CPU 计算速度，**周期类功能不受影响**：
+
+| 外设 / 功能 | 时钟源 | 超频到 250MHz 时的行为 |
+|---|---|---|
+| CPU 指令执行、渲染算术 | `clk_sys` | ✅ 变快（约 2 倍） |
+| PWM 载波频率（GP25/GP15）、I2C/SPI/UART 波特率 | `clk_peri` | 不变 —— 超频代码把 `clk_peri` 钳回 125MHz |
+| 内核 tick、`task_sleep`、呼吸灯/心跳/台阶间隔 | `clk_ref`（= XOSC 12MHz，固定） | 不变 —— `clk_ref` 固定，不随 `clk_sys` 变 |
+| USB | `pll_usb`（48MHz，独立） | 不变 |
+
+> **结论**：超频后 PWM 载波、呼吸灯闪烁、GP15 台阶间隔、心跳周期**都不会变短**，只有纯计算更快。
+> 详见 [指令说明书 §〇 时钟树](./指令说明书.md#〇rp2040-时钟树超频相关先看这里)。
 
 ---
 
@@ -116,6 +147,7 @@ cd rp2040demo
 | 📖 完整详细主文档（必看）| [mini-kernel/README.md](./mini-kernel/README.md) |
 | 🧩 纯库裁剪宏总开关 | [mini-kernel/include/os_config.h](./mini-kernel/include/os_config.h) |
 | 🧩 rp2040demo 裁剪宏 | [rp2040demo/os_config.h](./rp2040demo/os_config.h) |
+| 🧩 rp2040system 裁剪宏（无展示） | [rp2040system/os_config.h](./rp2040system/os_config.h) |
 | 🧠 内核主入口 | [mini-kernel/kernel/core/kernel.c](./mini-kernel/kernel/core/kernel.c) |
 | 🔄 调度器（非抢占 FIFO + 时间片） | [mini-kernel/kernel/core/sched.c](./mini-kernel/kernel/core/sched.c) |
 | 🔀 Cortex-M0+ 上下文切换（SVC+PendSV） | [rp2040demo/rp2040_port/context_switch.S](./rp2040demo/rp2040_port/context_switch.S) |
@@ -123,6 +155,7 @@ cd rp2040demo
 | 🐚 Shell 文件系统目录命令（ls/cd/pwd/mkdir） | [rp2040demo/rp2040_port/shell/shell_fs.c](./rp2040demo/rp2040_port/shell/shell_fs.c) |
 | ⚡ 超频/多核命令 | [rp2040demo/rp2040_port/shell/shell_ovclk.c](./rp2040demo/rp2040_port/shell/shell_ovclk.c) |
 | 🛠️ 一键构建脚本（RP2040 演示固件） | [rp2040demo/build.bat](./rp2040demo/build.bat) |
+| 🛠️ 一键构建脚本（RP2040 系统固件，无展示） | [rp2040system/build.bat](./rp2040system/build.bat) |
 | 🛠️ 纯内核库构建脚本 | [mini-kernel/build.bat](./mini-kernel/build.bat) |
 
 ---

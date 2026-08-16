@@ -2455,10 +2455,11 @@ static void task_shell(void *arg) {
     /* v2.6 ④ 注册 ipc（双核共享内存 IPC：FIFO + 2x16KB 乒乓，Core1 SRAM worker） */
     shell_ipc_register();
 #endif
-#if OS_CFG_DEMO_APP
+#if OS_CFG_DEMO_APP && OS_CFG_SHOW_DEMO
     /* v2.7 ⑤ 注册 show（展示/稳定性验证：OLED FPS + 呼吸 LED + GP15 PWM）。
      * 符号由 rp2040demo exe 的 demo_show.c 提供（demo 版 OS_CFG_DEMO_APP=1；
-     * 纯内核库编译 =0 时此调用与实现同时消失，链接自洽）。 */
+     * 纯内核库编译 =0 时此调用与实现同时消失，链接自洽）。RP2040 系统版
+     * OS_CFG_SHOW_DEMO=0 → 不注册 show 命令（无展示）。 */
     shell_show_register();
 #endif
 

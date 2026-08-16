@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.5.0 🧩 两版本分离` — ✅ **mini-kernel 改为可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU；RP2040 专属代码全部移入 **rp2040demo/rp2040_port** 由目标工程编译。两版本各自有独立 `os_config.h`，用总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 专属功能。
+> **当前版本**：`2.7.1 🧩 三部分分离` — ✅ **mini-kernel 改为可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU；RP2040 专属代码全部移入 **rp2040demo/rp2040_port** 由目标工程编译。RP2040 目标工程分 **rp2040demo**（带展示）与 **rp2040system**（无展示，`OS_CFG_SHOW_DEMO=0`），各自有独立 `os_config.h`，用总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 专属功能。
 >
 > 📖 **指令说明书（完整 Shell 命令手册）**：[指令说明书.md](../指令说明书.md)
 >
@@ -41,9 +41,10 @@
 
 ## 📦 仓库结构（project/）
 
-**重要**：本仓库 `project/` 目录下包含两个完全独立的部分，**不要混淆**：
+**重要**：本仓库 `project/` 目录下包含三个完全独立的部分，**不要混淆**：
 - **mini-kernel/** = **可移植纯内核库**（v2.5 起）。只含平台无关的调度核心 + 基础 Shell，**不含任何 RP2040 文件**，编译产出 `kernel_core.a` / `shell_module.a` 静态库，供任意 MCU 目标工程链接。
-- **rp2040demo/** = **RP2040 目标工程**。编译 `rp2040_port` 移植层（hal_port / context_switch / msc_usb / config_store / sysclk / diskio / bootscript / shell_fs / mcore / ovclk / demo_app）+ `src/main.c`，结合 Pico SDK 产出可烧录的 `.uf2` 固件。
+- **rp2040demo/** = **RP2040 Demo 目标工程**。编译 `rp2040_port` 移植层（hal_port / context_switch / msc_usb / config_store / sysclk / diskio / bootscript / shell_fs / mcore / ovclk / demo_app）+ `src/main.c`，结合 Pico SDK 产出可烧录的 `.uf2` 固件。**带展示任务**（OLED FPS + 呼吸 LED + GP15 PWM）。v2.7.1 起作为 Demo 完整体截止。
+- **rp2040system/** = **RP2040 系统工程**。复用 `rp2040demo/rp2040_port`，`os_config.h` 置 `OS_CFG_SHOW_DEMO=0`，**无展示任务**，其余命令与功能与 demo 完全一致。
 
 ```
 project/
@@ -58,20 +59,26 @@ project/
 │   ├── README.md         本文件
 │   └── CMakeLists.txt    纯静态库构建（导出 kernel_core / shell_module）
 │
-└── rp2040demo/          🛠️ 【RP2040 目标工程】——真正烧录到 RP2040 的示例固件
-    ├── src/main.c        应用入口（main() → kernel_main()）
-    ├── os_config.h       本工程专属裁剪配置（RP2040 功能全开）
-    ├── rp2040_port/      🔌 RP2040 移植层（全部 RP2040 专属代码）
-    │   ├── hal_port.c/h              HAL 统一接口实现（USB/Timer/GPIO/Flash）
-    │   ├── context_switch.S          PendSV/SVC 上下文切换（含栈帧修复）
-    │   ├── msc_blockdev.c/h          USB MSC 与 FatFs 共享 512B 扇区后端
-    │   ├── msc_usb.c                 Composite USB 描述符 + SCSI 回调
-    │   ├── include/hal/              config_store.h / sysclk.h / flash_layout.h
-    │   ├── kernel/                   config_store.c / diskio.c / FatFs 配置
-    │   ├── shell/                    bootscript.c / shell_fs.c / shell_mcore.c / shell_ovclk.c
-    │   └── demo/demo_app.c           演示任务（LED/心跳/vtest/任务控制）
-    ├── CMakeLists.txt    add_subdirectory(../mini-kernel) + 编译 rp2040_port + 链接 Pico SDK
-    └── build.bat         Windows 一键构建（产物 = rp2040demo.uf2）
+├── rp2040demo/          🛠️ 【RP2040 Demo 目标工程】——带展示（v2.7.1 起截止）
+│   ├── src/main.c        应用入口（main() → kernel_main()）
+│   ├── os_config.h       本工程专属裁剪配置（RP2040 功能全开 + OS_CFG_SHOW_DEMO=1）
+│   ├── rp2040_port/      🔌 RP2040 移植层（全部 RP2040 专属代码，demo 与 system 共享）
+│   │   ├── hal_port.c/h              HAL 统一接口实现（USB/Timer/GPIO/Flash）
+│   │   ├── context_switch.S          PendSV/SVC 上下文切换（含栈帧修复）
+│   │   ├── msc_blockdev.c/h          USB MSC 与 FatFs 共享 512B 扇区后端
+│   │   ├── msc_usb.c                 Composite USB 描述符 + SCSI 回调
+│   │   ├── include/hal/              config_store.h / sysclk.h / flash_layout.h
+│   │   ├── kernel/                   config_store.c / diskio.c / FatFs 配置
+│   │   ├── shell/                    bootscript.c / shell_fs.c / shell_mcore.c / shell_ovclk.c
+│   │   └── demo/                     demo_app.c / demo_show.c（展示）
+│   ├── CMakeLists.txt    add_subdirectory(../mini-kernel) + 编译 rp2040_port + 链接 Pico SDK
+│   └── build.bat         Windows 一键构建（产物 = rp2040demo.uf2）
+│
+└── rp2040system/        🛠️ 【RP2040 系统工程】——无展示
+    ├── src/main.c        应用入口（与 demo 相同）
+    ├── os_config.h       本工程专属裁剪配置（OS_CFG_SHOW_DEMO=0，复用 rp2040demo/rp2040_port）
+    ├── CMakeLists.txt    引用 ../rp2040demo/rp2040_port，不编译 demo_show.c
+    └── build.bat         Windows 一键构建（产物 = rp2040system.uf2）
 ```
 
 ### 🔑 关系说明
@@ -79,9 +86,10 @@ project/
 | 项目               | 角色                                       | 输出                                                                             |
 | ---------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
 | **mini-kernel/** | 可移植纯内核库（v2.5）                           | 静态库 `libkernel_core.a / libshell_module.a`（平台无关） |
-| **rp2040demo/**  | RP2040 目标工程（消费 mini-kernel 库 + rp2040_port + Pico SDK） | **`rp2040demo.uf2`** — 实际烧录固件 |
+| **rp2040demo/**  | RP2040 Demo 目标工程（消费 mini-kernel 库 + rp2040_port + Pico SDK，**带展示**） | **`rp2040demo.uf2`** — 展示固件 |
+| **rp2040system/** | RP2040 系统工程（复用 rp2040_port，**无展示**，命令集与 demo 一致） | **`rp2040system.uf2`** — 系统固件 |
 
-> **v2.5 分离说明**：所有 RP2040 专属代码已从 mini-kernel 移入 `rp2040demo/rp2040_port`。mini-kernel 保持平台无关，可移植到其它 MCU；RP2040 专属功能（超频/多核/MSC/FatFs/bootscript/vtest 等）全部由目标工程编译，用总开关 `OS_CFG_PORT_RP2040` 控制。
+> **v2.5 分离说明**：所有 RP2040 专属代码已从 mini-kernel 移入 `rp2040demo/rp2040_port`。mini-kernel 保持平台无关，可移植到其它 MCU；RP2040 专属功能（超频/多核/MSC/FatFs/bootscript/vtest 等）全部由目标工程编译，用总开关 `OS_CFG_PORT_RP2040` 控制。v2.7.1 起，RP2040 目标工程分带展示（demo）与不带展示（system）两版，后者 `OS_CFG_SHOW_DEMO=0`。
 
 ***
 
@@ -89,7 +97,8 @@ project/
 
 | 版本                 | 状态         | 关键里程碑                                                                                                                                                                                                                                                                                  |
 | ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **v2.5.0**         | ✅ **当前稳定**（HEAD） | 🧩 **两版本分离（内核库纯净化）**：mini-kernel 改为可移植纯静态库（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK；RP2040 专属代码全部移入 `rp2040demo/rp2040_port` 由目标工程编译；两版本各自独立 `os_config.h`，总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 功能；新增指令说明书 |
+| **v2.7.1**         | ✅ **当前稳定**（HEAD） | 🧩 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示，`OS_CFG_SHOW_DEMO=0`）。多核 idle 栈修复、FPS 计数修正、GP15 精确台阶 PWM |
+| **v2.5.0**         | ✅ 已发布 | 🧩 **两版本分离（内核库纯净化）**：mini-kernel 改为可移植纯静态库（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK；RP2040 专属代码全部移入 `rp2040demo/rp2040_port` 由目标工程编译；两版本各自独立 `os_config.h`，总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 功能；新增指令说明书 |
 | **v2.4.3**         | ✅ 已发布 | 🟡 **超频 + 多核固化 + 开机日志回放**：默认单核 + 125MHz；`ovclk list/set/try/mcore/get/save/unsave|reset` 指令固化频率 + 多核标志到独立 Flash Config 区，冷启动应用；未固化/损坏/超 250MHz 极限档安全回退单核 + 125MHz |
 | **v0.1.0**         | ✅ Released | 基础内核（调度/堆/上下文）+ Shell/GPIO/I2C/UART/SPI 外设服务（RP2040 首发验证）                                                                                                                                                                                                                              |
 | **v0.2.0-beta**    | ✅ Archived | **指令固化机制** (`!`/`save`/`unsave`/`list`/`boot exec`) + hal\_flash + `factory_reset` + 开机自动回放                                                                                                                                                                                            |

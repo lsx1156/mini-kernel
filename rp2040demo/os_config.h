@@ -38,6 +38,7 @@
 #define OS_CFG_FATFS                  1   /* Elm FatFs（FAT16，MSC U 盘 + 本机文件目录命令）*/
 #define OS_CFG_LOADER                 0   /* 用户程序加载器（需 VFS=1）    */
 #define OS_CFG_DEMO_APP               1   /* 启动演示应用（4 个演示任务）  */
+#define OS_CFG_SHOW_DEMO              1   /* RP2040 Demo 版：展示任务（OLED FPS + 呼吸 LED + GP15 PWM）。RP2040 系统版置 0 */
 
 /* ================================================================
  * 3.5 平台专属功能裁剪（RP2040 目标工程启用）

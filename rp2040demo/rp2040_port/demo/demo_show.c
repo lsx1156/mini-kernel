@@ -48,7 +48,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#if OS_CFG_DEMO_APP && OS_CFG_PERIPH_SERVICE
+#if OS_CFG_DEMO_APP && OS_CFG_PERIPH_SERVICE && OS_CFG_SHOW_DEMO
 
 /* ================================================================
  * 配置常量

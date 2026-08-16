@@ -375,9 +375,10 @@ void demo_app_init(void) {
     }
 #endif
 
-#if OS_CFG_PERIPH_SERVICE
+#if OS_CFG_PERIPH_SERVICE && OS_CFG_SHOW_DEMO
     /* v2.7 展示/稳定性验证：config 开（默认）→ 创建 show 任务
-     *   （OLED FPS 动画 + LED 呼吸灯 + GP15 PWM；'show off' 固化删除）。 */
+     *   （OLED FPS 动画 + LED 呼吸灯 + GP15 PWM；'show off' 固化删除）。
+     *   RP2040 系统版 OS_CFG_SHOW_DEMO=0 → 不创建任何展示任务，其余指令一致。 */
     demo_show_boot_start();
 #endif
 
