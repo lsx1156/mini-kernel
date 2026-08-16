@@ -374,10 +374,18 @@ static void oled_display_off(void)
 }
 
 /* ================================================================
- * 呼吸 PWM（LED GP25 + 输出 GP15）
- *   tri = 0..255 三角波；level = tri² 占满 0..62499（视觉近似正弦呼吸）
+ * 呼吸 PWM：LED GP25 平滑呼吸；GP15 独立精确台阶梯度（电机测试）
+ *   LED  ：tri = 0..255 三角波；level = tri² 占满 0..62499（正弦近似呼吸）
+ *   GP15 ：每级停留 GP15_STEP_HOLD_MS，占空比 0→100% 步进 10% 循环，
+ *          level = (WRAP+1)*percent/100 → 每个台阶占空比精确（电机阶梯电压）
  * ================================================================ */
 static uint32_t s_breath_step = 0;
+
+/* GP15 台阶状态机参数（电机测试用，可调） */
+#define GP15_STEP_COUNT    11u   /* 0,10,20,...,100 共 11 级 */
+#define GP15_STEP_HOLD_MS  500u  /* 每级停留毫秒 */
+static uint8_t  s_gp15_step = 0;
+static uint32_t s_gp15_next_tick = 0;
 
 static void breath_pwm_start(void)
 {
@@ -391,16 +399,35 @@ static void breath_pwm_start(void)
     pwm_init(sliceL, &cfg, true);
     pwm_init(sliceP, &cfg, true);
     s_breath_step = 0;
+    s_gp15_step = 0;
+    s_gp15_next_tick = 0;
 }
 
-static void breath_pwm_update(void)      /* 每帧调用一次（~40fps → 周期 ~6.4s 慢呼吸） */
+/* GP15 独立精确台阶：0→10%→…→100% 循环，每级停留 HOLD_MS。
+ * 用 (WRAP+1) 作占空比基准：level=percent/100*(WRAP+1)，
+ * percent=100 → level=WRAP+1 → 100% 恒高，台阶间占空比精确。 */
+static void gp15_pwm_step_update(void)
+{
+    uint32_t now = hal_systick_get_tick();
+    if ((int32_t)(now - s_gp15_next_tick) >= 0) {
+        s_gp15_next_tick = now + GP15_STEP_HOLD_MS;
+        if (++s_gp15_step >= GP15_STEP_COUNT) s_gp15_step = 0;
+    }
+    uint32_t percent = s_gp15_step * 10u;                 /* 0..100 */
+    uint32_t level = (uint32_t)(((uint64_t)(SHOW_PWM_WRAP + 1u) * percent) / 100u);
+    pwm_set_chan_level(pwm_gpio_to_slice_num(SHOW_PWM_PIN),
+                       pwm_gpio_to_channel(SHOW_PWM_PIN), (uint16_t)level);
+}
+
+static void breath_pwm_update(void)      /* 每帧调用一次（~40fps → LED 周期 ~6.4s 慢呼吸） */
 {
     s_breath_step++;
     uint32_t t = s_breath_step & 0xFFu;
     uint32_t tri = (t < 128u) ? t : (255u - t);
     uint32_t level = (tri * tri * (SHOW_PWM_WRAP + 1u)) >> 16;   /* tri²≤65025，不溢出 */
     pwm_set_chan_level(pwm_gpio_to_slice_num(SHOW_LED_PIN), pwm_gpio_to_channel(SHOW_LED_PIN), (uint16_t)level);
-    pwm_set_chan_level(pwm_gpio_to_slice_num(SHOW_PWM_PIN), pwm_gpio_to_channel(SHOW_PWM_PIN), (uint16_t)level);
+    /* GP15 独立：精确台阶梯度（电机测试），与 LED 呼吸解耦 */
+    gp15_pwm_step_update();
 }
 
 static void breath_pwm_stop(void)

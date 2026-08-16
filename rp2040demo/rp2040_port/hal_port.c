@@ -80,7 +80,7 @@ extern void kernel_tick_hook(void);
  * ✅ 修复：内核 tick 改用 ALARM0 + TIMER_IRQ_0。SDK 默认 pool 用 ALARM3，
  *   我们与它零冲突（不覆盖任何已注册 handler）。
  * ================================================================ */
-volatile uint32_t g_tick_count = 0;
+volatile uint32_t g_tick_count[OS_CFG_CORE_COUNT] = {0,0}; /* 每核独立 tick 计数 */
 volatile uint32_t g_tick_interval_us = 1000u; /* 默认 1ms @ 1000Hz */
 volatile uint32_t g_core1_tick_count = 0;      /* 诊断：core1 实际产生多少次 tick */
 
@@ -107,7 +107,7 @@ void systick_irq_handler(void) {
      * 正确做法：直接写 ktick_bit() 到 INTR（写 1 清除对应位）。 */
     timer_hw->intr = ktick_bit();                     /* 清本核 ALARM 中断 (W1C) */
     timer_hw->alarm[ktick_alarm_idx()] = timer_hw->timerawl + g_tick_interval_us;
-    g_tick_count++;
+    g_tick_count[hal_core_id()]++;                    /* 只计本核 tick */
     if (hal_core_id() == 1) g_core1_tick_count++;      /* 诊断：core1 tick 计数 */
     kernel_tick_hook();                                /* 推进本核调度器 */
 }
@@ -143,7 +143,7 @@ static void hal_systick_init_impl(uint32_t tick_hz) {
 }
 
 static uint32_t hal_systick_get_tick_impl(void) {
-    return g_tick_count;
+    return g_tick_count[hal_core_id()];   /* 返回本核 tick（core1 任务用 core1 计数 → FPS 正确） */
 }
 
 static void hal_systick_delay_us_impl(uint32_t us) {
