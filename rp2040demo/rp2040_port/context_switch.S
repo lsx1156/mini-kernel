@@ -290,6 +290,7 @@ SVC_Handler:
 .extern hardfault_dump_c
 .extern g_fault_psp
 .extern g_fault_msp
+.extern g_fault_lr
 .global isr_hardfault
 .global HardFault_Handler
 .type   isr_hardfault,    %function
@@ -304,6 +305,16 @@ HardFault_Handler:
     mrs     r0, msp
     ldr     r1, =g_fault_msp
     str     r0, [r1]
+    /* 【v2.7.1-fix】保存 EXC_RETURN（LR）用于区分 fault 来源：
+     *   bit2=0 → 在 Handler 模式内 fault（真实故障帧在 MSP 上，PSP 是被打断
+     *   任务的旧栈帧）；bit2=1 → 在 Thread 模式 fault（真实故障帧在 PSP 上）。
+     *   必须在 bl hardfault_dump_c 之前保存，否则 bl 覆盖 LR。
+     *   M0+ 16-bit `mov` 不能用高寄存器（lr/r14）作源，改用
+     *   push {lr}; pop {r3} 转到低寄存器再存。 */
+    push    {lr}
+    pop     {r3}
+    ldr     r1, =g_fault_lr
+    str     r3, [r1]
     /* 注意：M0+ push/pop 仅支持低寄存器（不含 lr），且 dump 后进入
      * 死循环永不返回，无需保存 EXC_RETURN —— 直接 bl。 */
     bl      hardfault_dump_c

@@ -12,6 +12,11 @@
 > · **rp2040system** —— RP2040 系统工程：与 demo **完全同命令集**，但**无展示任务**（`OS_CFG_SHOW_DEMO=0`，去掉 OLED FPS / 呼吸 LED / GP15 PWM）
 > · 新增 **RP2040 时钟树说明**（见下）：超频只改 `clk_sys`，PWM/节拍等周期功能不受影响
 >
+> 🟡 **v2.7.1-fix：修复运行时超频崩溃 + USB 稳定性**
+> · **根因**：超频切换（`sysclk_apply_mhz`）里新增的"关中断 50ms `busy_wait`"本意是等 core1 的 show 任务暂停，却让 core0 整整 50ms 不服务 USB → 主机判定超时 reset/重枚举 → 中断恢复后 `USBCTRL_IRQ` 处理被破坏的端点状态 → 二次崩（误报"idle PC=0"，实为 ISR 崩溃，`xPSR=0` 露馅）。
+> · **修复**：移除该 busy-wait，只置跨核暂停标志后立即切换（flash 分频/`clk_peri` 已提前钳制，show 栈已 4096，I2C 超时/重初兜底）；shell 任务栈 2048→4096（吸收 `ovclk` 深调用链）；故障转储升级为按 `EXC_RETURN` 区分 Handler/Thread，ISR 崩溃时打印真实 MSP 帧 PC。
+> · **效果**：`ovclk try 250` 运行时切换不再崩；125/250MHz 稳定可用（含运行时切换），仅 375/500MHz 极限档不稳定（见下已知限制）。
+>
 > 🟢 **v2.5 更新：两版本分离（内核库纯净化）**（历史）
 > · mini-kernel 改为可移植纯静态库；rp2040demo 独立编译 `rp2040_port` 并产出 `.uf2`
 > · 两版本各自有独立 `os_config.h`；RP2040 专属功能用总开关 `OS_CFG_PORT_RP2040` 隔离
@@ -111,7 +116,7 @@ cd rp2040demo
 
 | 版本 | 状态 | 关键词 |
 |---|---|---|
-| v2.7.1 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示）；多核 idle 栈修复、FPS 修正、GP15 精确台阶 PWM。⚠️ **demo 已知限制**：>250MHz 超频不稳定 + USB CDC 失效，demo 不再修复，后续可能在 system 修 |
+| v2.7.1 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示）；多核 idle 栈修复、FPS 修正、GP15 精确台阶 PWM。🟡 **v2.7.1-fix**：移除超频切换的 USB 阻塞 busy-wait + shell 栈 4096 + 故障转储升级，修复 `ovclk try 250` 运行时崩溃。⚠️ **demo 已知限制**：>250MHz 超频不稳定 + USB CDC 失效，demo 不再修复，后续可能在 system 修 |
 | v2.7 | ✅ 已发布历史 | 🟢 展示/稳定性验证：OLED FPS 动画 + 呼吸 LED + GP15 PWM（show 任务） |
 | v2.5 | ✅ 已发布历史 | 🟢 两版本分离（内核库纯净化）：mini-kernel 可移植纯静态库；rp2040demo 独立编译 `rp2040_port`；`OS_CFG_PORT_RP2040` 总开关隔离；新增指令说明书 |
 | v2.4 | ✅ 已发布历史 | 🟢 超频档位/任意 MHz + 多核基础 + 固化配置 + 开机日志回放 |
@@ -140,7 +145,8 @@ RP2040 不同外设吃**不同时钟源**，超频（`ovclk`）只改 CPU 计算
 > ⚠️ **rp2040demo 版已知限制（v2.7.1 标注，不再修复）**
 > **超频到 250MHz 以上（375/500MHz）时系统会不稳定**，且 **USB CDC 控制界面会失效**（`ovclk try 3/4` 或固化 375/500 档后 USB 串口断开）。
 > · 原因：高主频下 XIP flash 分频 ≥62.5MHz 有取指风险 + USB 时钟/中断时序在高频下不稳定。
-> · **本版（rp2040demo）不再修复此问题**，作为 Demo 完整体截止。
+> · 稳定可用档位：**125 / 250MHz**（`ovclk try 250` 运行时切换在 v2.7.1-fix 后不再崩）；375/500MHz 仅作极限测试，可能 USB 失效。
+> · **本版（rp2040demo）不再修复 375/500 问题**，作为 Demo 完整体截止。
 > · **后续可能在 rp2040system 版修复 USB 不稳定的问题**；届时请以 system 版为准。
 
 ---

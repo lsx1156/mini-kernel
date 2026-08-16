@@ -203,9 +203,13 @@ if(OS_CFG_DEFINES)
 endif()
 
 # USB CDC 关键定义
+# 【v2.7.1 修复】PICO_STDIO_USB_STDOUT_TIMEOUT_US 从 1000000 改回 0：
+#   值为 1s 半阻塞时，USB 未打开（无 DTR）→ CDC TX FIFO 满 → putchar_raw 在
+#   PRIMASK 关中断下忙等 1s → 禁掉 USB/systick 中断 → USB 无法推进 → 系统卡死。
+#   0 = 满则丢不阻塞；开机画面由 bootlog 缓存回放兜底。
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
-    PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
     PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=3
 )
 

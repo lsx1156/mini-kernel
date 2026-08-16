@@ -69,7 +69,10 @@ extern const char *k_version(void);
                                      *   且无任何报错。16 足够 I2C/SPI/UART 长命令。 */
 #define SHELL_PROMPT_STR      "mk> "
 #define SHELL_TASK_NAME       "shell"
-#define SHELL_TASK_STACK      2048  /* cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动调用 + 中断栈帧，768 会溢出破坏 g_task_pool */
+#define SHELL_TASK_STACK      4096  /* cmd_i2c fill/rd 用 256B 局部缓冲 + I2C 驱动调用 + 中断栈帧，768 会溢出破坏 g_task_pool。
+                                     * 【v2.7.1-fix】2048→4096：`ovclk try/set` 在 shell 任务里跑 sysclk_apply_mhz →
+                                     * set_sys_clock_khz → SDK pll_init/clock_configure/vreg_set_voltage 深调用链，
+                                     * 2048 实测在超频链路上偶发击穿 → 破坏堆上相邻任务栈/TinyUSB 状态 → idle PC=0。 */
 #define SHELL_TASK_WEIGHT     1
 
 /* ================================================================

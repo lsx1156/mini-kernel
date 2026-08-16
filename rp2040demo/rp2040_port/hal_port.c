@@ -55,6 +55,10 @@ extern void tud_task_ext(uint32_t timeout_ms, int in_isr);
  * 比抓 SETUP 包快照可靠：正常运行时 USB IRQ 会在轮询前先把
  * SET_CONTROL_LINE_STATE 处理掉。 */
 extern uint8_t tud_cdc_n_get_line_state(uint8_t itf);
+/* v2.7.1：中断正常（INTE!=0）时 shell 输入走 TinyUSB 标准接收，不再 bypass EP1
+ * （避免与 USBCTRL_IRQ 中断竞争同一单缓冲端点描述符 → USB 失效）。 */
+extern uint32_t tud_cdc_n_available(uint8_t itf);
+extern uint32_t tud_cdc_n_read(uint8_t itf, void *buffer, uint32_t bufsize);
 
 /* 【v2.6.4】启动期 FIFO/PSM 快照（实现见 rp2040_port/ipc/shmem_ipc.c，
  * 输出走 UART0/TTL——诊断专用，不依赖 USB/TinyUSB 状态） */
@@ -585,19 +589,32 @@ static inline void _usb_force_poll(void) {
         _snapshot_setup_if_pending();
         dcd_int_handler(0);
         s_dcd_handler_called++;
+        /* 【v2.7.1 关键修复】EP1 绕过只在 INTE==0（中断失效）时兜底搬运。
+         * 之前无条件调用 _ep1_out_drain_all()，即使 INTE!=0 也直接操作 EP1 OUT
+         * 端点描述符（读数据 + 清 AVAIL），与 USBCTRL_IRQ 中断（dcd_rp2040_irq）
+         * 竞争同一个单缓冲端点 → 描述符状态损坏 → USB 控制器异常 → 电脑无法识别。
+         * 中断正常时 EP1 由 TinyUSB 中断独占处理，轮询不再触碰。 */
+        _ep1_out_drain_all();
     }
-    /* INTE!=0：硬件中断正常驱动硬件事件；轮询只推进 TinyUSB 软件状态机 + EP1 旁路 */
+    /* INTE!=0：硬件中断正常驱动硬件事件；轮询只推进 TinyUSB 软件状态机 */
     tud_task_ext(0, 0);
-    _ep1_out_drain_all();
 }
 
 static int hal_console_getc_impl(char *c) {
     _usb_force_poll();
-    /* 直接从私有 ring buffer 取字节，不碰 getchar_timeout_us / tud_cdc_read ——
-     * 这两个 API 都依赖 TinyUSB 内部接收软件层，已经被 INTE=0 关死。
-     *
-     * 【并发保护】tail 读位置和 ring 内容必须在同一临界区读取，
-     *   防止 _ep1_out_drain_one 并发写入导致读到不一致状态。 */
+    /* 【v2.7.1 关键修复】中断正常（INTE!=0）时用 TinyUSB 标准接收（tud_cdc_n_*
+     * 内部由 dcd_rp2040_irq 中断把 EP1 数据搬进 TU FIFO），不再从私有 ring 读。
+     * 之前 shell 输入依赖 _ep1_out_drain_all() 绕过 EP1，与中断竞争破坏端点状态。
+     * 仅当 INTE==0（中断失效）才退回私有 ring（bypass 兜底）。 */
+    if (*(volatile uint32_t *)USB_INTE_REG != 0u) {
+        if (tud_cdc_n_available(0)) {
+            uint8_t b;
+            if (tud_cdc_n_read(0, &b, 1) == 1u) { *c = (char)b; return 1; }
+        }
+        return 0;
+    }
+    /* INTE==0（中断失效）：直接用私有 ring buffer，不碰 getchar/tud_cdc_read
+     * （这两个 API 依赖 TinyUSB 内部接收软件层，已被 INTE=0 关死）。 */
     uint32_t primask = save_and_disable_interrupts();
     if (s_rx_head == s_rx_tail) {
         restore_interrupts(primask);
@@ -1052,6 +1069,12 @@ static uint32_t sysclk_nearest_achievable_mhz(uint32_t want) {
     return 0u;
 }
 
+/* 【v2.7.1】超频切换进行中标志（跨核可见）。
+ * sysclk_apply_mhz 切换时钟时，core1 的 systick/show 任务不受 core0 的
+ * PRIMASK 关中断保护；通知 core1 的 show 任务在切换期间自我暂停，避免
+ * core1 在过渡频率下运行破坏共享 RAM → core0 idle 崩 / USB 失效。 */
+volatile uint32_t g_oc_switching = 0;
+
 bool sysclk_apply_mhz(uint32_t mhz) {
     if (mhz < SYSCLK_MHZ_MIN || mhz > SYSCLK_MHZ_MAX) return false;
 
@@ -1068,6 +1091,15 @@ bool sysclk_apply_mhz(uint32_t mhz) {
      * 这里把"升压 + flash 分频 + PLL 切换 + clk_peri"整个临界区关中断，
      * 保证切换原子性（耗时几百 µs，丢一两个 tick 无碍，USB 短暂停顿可恢复）。 */
     uint32_t irq_save = save_and_disable_interrupts();
+
+    /* 【v2.7.1-fix】通知 core1 show 任务在切换期间暂停（核心切换只保护 core0 中断）。
+     * 不能在这里 busy_wait 等 show —— save_and_disable_interrupts() 已把 core0
+     * 全部中断屏蔽，若 busy_wait 50ms，USB 就 50ms 不被服务 → 主机判定设备超时
+     * 发起 reset/重新枚举 → 中断恢复后 USB IRQ 处理一个被破坏的端点状态 → 二次崩。
+     * 正确做法：只置标志（show 在帧边界自检暂停），随后立即执行切换。切换窗口仅
+     * 几百 µs，flash 分频已提前放大 + clk_peri 已钳制，show 即使恰在 I2C 中也会
+     * 由 I2C 超时/重初恢复；show 栈已是 4096，不再溢出破坏共享 RAM。 */
+    g_oc_switching = 1;
 
     /* 高主频先升压，保证 PLL/核心时序余量。
      * 375/500MHz 属极限档，一律用最高 1.25V。 */
@@ -1101,6 +1133,7 @@ bool sysclk_apply_mhz(uint32_t mhz) {
     if (!set_sys_clock_khz(target * 1000u, true)) {
         set_sys_clock_khz(SYSCLK_MHZ_DEFAULT * 1000u, true);
         ssi_hw->baudr = (SYSCLK_MHZ_DEFAULT + SYSCLK_FLASH_MAX_MHZ - 1u) / SYSCLK_FLASH_MAX_MHZ;
+        g_oc_switching = 0;                /* 恢复 core1 show 任务 */
         restore_interrupts(irq_save);
         return false;
     }
@@ -1128,6 +1161,7 @@ bool sysclk_apply_mhz(uint32_t mhz) {
      * clock_get_hz(clk_peri)），把 TTL 调试口精确恢复到 115200。 */
     uart_set_baudrate(uart0, 115200);
 
+    g_oc_switching = 0;                /* 恢复 core1 show 任务 */
     restore_interrupts(irq_save);
     return true;
 }
@@ -1240,6 +1274,7 @@ void hal_diag_put_u32(uint32_t v) {
  * ================================================================ */
 volatile uint32_t g_fault_psp = 0;
 volatile uint32_t g_fault_msp = 0;
+volatile uint32_t g_fault_lr  = 0;   /* 【v2.7.1-fix】EXC_RETURN，区分 fault 来源（Handler/Thread） */
 
 #define FAULT_SRAM_LO    0x20000000u
 #define FAULT_SRAM_HI    0x20042000u   /* RP2040 264KB SRAM 上界 */
@@ -1274,18 +1309,24 @@ void hardfault_dump_c(void) {
     _fault_puts("  CFSR="); _fault_puthex32(cfsr);
     _fault_puts("  HFSR="); _fault_puthex32(hfsr);
     _fault_puts("  BFAR="); _fault_puthex32(bfar);
+    _fault_puts("  EXC_RET="); _fault_puthex32(g_fault_lr);
 
-    /* PSP 指向被打断任务的硬件栈帧底：
-     * [0]r0 [1]r1 [2]r2 [3]r3 [4]r12 [5]lr [6]pc [7]xpsr */
-    if (g_fault_psp >= FAULT_SRAM_LO && g_fault_psp < FAULT_SRAM_HI) {
-        volatile uint32_t *f = (volatile uint32_t *)g_fault_psp;
+    /* 【v2.7.1-fix】用 EXC_RETURN 选真实故障帧：
+     *   bit2=0 → Handler 模式内 fault，真实帧在 MSP（PSP 是被打断任务的旧帧，
+     *            PC/xPSR 是垃圾 → 之前误判为"idle PC=0"）；
+     *   bit2=1 → Thread 模式 fault，真实帧在 PSP。 */
+    uint32_t fp = ((g_fault_lr & 0x4u) == 0u) ? g_fault_msp : g_fault_psp;
+    /* 硬件栈帧：[0]r0 [1]r1 [2]r2 [3]r3 [4]r12 [5]lr [6]pc [7]xpsr */
+    if (fp >= FAULT_SRAM_LO && fp < FAULT_SRAM_HI) {
+        volatile uint32_t *f = (volatile uint32_t *)fp;
         _fault_puts("\r\nFault PC=");  _fault_puthex32(f[6]);
         _fault_puts("  LR=");          _fault_puthex32(f[5]);
         _fault_puts("  xPSR=");        _fault_puthex32(f[7]);
         _fault_puts("  R0=");          _fault_puthex32(f[0]);
         _fault_puts("  R12=");         _fault_puthex32(f[4]);
+        _fault_puts(((g_fault_lr & 0x4u) == 0u) ? "  [in ISR]" : "  [in task]");
     } else {
-        _fault_puts("\r\nPSP invalid (fault in Handler mode?)");
+        _fault_puts("\r\nframe invalid (fault in Handler mode, PSP only)");
     }
 
     /* 出错任务名（指针先做 SRAM 范围校验，防二次 fault） */

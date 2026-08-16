@@ -19,7 +19,7 @@
 >
 > 架构 4 层垂直分层：**应用 → 系统调用 → 内核核心 → HAL 移植层**，核心代码 100% 跨平台复用。
 
-> **当前版本**：`2.7.1 🧩 三部分分离` — ✅ **mini-kernel 改为可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU；RP2040 专属代码全部移入 **rp2040demo/rp2040_port** 由目标工程编译。RP2040 目标工程分 **rp2040demo**（带展示）与 **rp2040system**（无展示，`OS_CFG_SHOW_DEMO=0`），各自有独立 `os_config.h`，用总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 专属功能。
+> **当前版本**：`2.7.1-fix 🧩 三部分分离 + 运行时超频崩溃修复` — ✅ **mini-kernel 改为可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU；RP2040 专属代码全部移入 **rp2040demo/rp2040_port** 由目标工程编译。RP2040 目标工程分 **rp2040demo**（带展示）与 **rp2040system**（无展示，`OS_CFG_SHOW_DEMO=0`），各自有独立 `os_config.h`，用总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 专属功能。🟡 **v2.7.1-fix**：移除超频切换期间"关中断 50ms busy_wait"（阻塞 USB → 主机超时 reset → USB IRQ 二次崩），shell 栈 2048→4096，故障转储升级（按 EXC_RETURN 打印真实 MSP 帧 PC），`ovclk try 250` 运行时切换不再崩。
 >
 > 📖 **指令说明书（完整 Shell 命令手册）**：[指令说明书.md](../指令说明书.md)
 >
@@ -97,7 +97,7 @@ project/
 
 | 版本                 | 状态         | 关键里程碑                                                                                                                                                                                                                                                                                  |
 | ------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **v2.7.1**         | ✅ **当前稳定**（HEAD） | 🧩 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示，`OS_CFG_SHOW_DEMO=0`）。多核 idle 栈修复、FPS 计数修正、GP15 精确台阶 PWM。⚠️ **demo 已知限制**：>250MHz 超频不稳定 + USB CDC 失效，demo 不再修复，后续可能在 system 修 |
+| **v2.7.1**         | ✅ **当前稳定**（HEAD） | 🧩 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示，`OS_CFG_SHOW_DEMO=0`）。多核 idle 栈修复、FPS 计数修正、GP15 精确台阶 PWM。🟡 **v2.7.1-fix**：移除超频切换的 USB 阻塞 busy-wait + shell 栈 4096 + 故障转储升级，修复 `ovclk try 250` 运行时崩溃。⚠️ **demo 已知限制**：>250MHz 超频不稳定 + USB CDC 失效，demo 不再修复，后续可能在 system 修 |
 | **v2.5.0**         | ✅ 已发布 | 🧩 **两版本分离（内核库纯净化）**：mini-kernel 改为可移植纯静态库（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK；RP2040 专属代码全部移入 `rp2040demo/rp2040_port` 由目标工程编译；两版本各自独立 `os_config.h`，总开关 `OS_CFG_PORT_RP2040` 隔离 RP2040 功能；新增指令说明书 |
 | **v2.4.3**         | ✅ 已发布 | 🟡 **超频 + 多核固化 + 开机日志回放**：默认单核 + 125MHz；`ovclk list/set/try/mcore/get/save/unsave|reset` 指令固化频率 + 多核标志到独立 Flash Config 区，冷启动应用；未固化/损坏/超 250MHz 极限档安全回退单核 + 125MHz |
 | **v0.1.0**         | ✅ Released | 基础内核（调度/堆/上下文）+ Shell/GPIO/I2C/UART/SPI 外设服务（RP2040 首发验证）                                                                                                                                                                                                                              |

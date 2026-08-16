@@ -205,9 +205,14 @@ if(OS_CFG_DEFINES)
 endif()
 
 # USB CDC 关键定义
+# 【v2.7.1 修复】PICO_STDIO_USB_STDOUT_TIMEOUT_US 从 1000000 改回 0：
+#   值为 1s 半阻塞时，USB 未打开（无 DTR、主机不读）→ TinyUSB CDC TX FIFO 满 →
+#   putchar_raw 在 hal_console_putc 的 PRIMASK 关中断下忙等 1s → 期间禁掉
+#   USBCTRL_IRQ/systick 全部中断 → USB 无法推进 → 系统卡死（"不打开 USB 就崩溃"）。
+#   0 = 满则丢不阻塞；完整开机画面由 bootlog 缓存回放（hal_bootlog_*）兜底。
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
-    PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
     PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=3
 )
 

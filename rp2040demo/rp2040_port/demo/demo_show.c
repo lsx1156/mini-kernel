@@ -48,6 +48,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 【v2.7.1】超频切换进行中标志（定义于 hal_port.c，跨核可见）。
+ * show 任务在 core1，超频切换只保护 core0 中断，此标志通知 show 暂停。 */
+extern volatile uint32_t g_oc_switching;
+
 #if OS_CFG_DEMO_APP && OS_CFG_PERIPH_SERVICE && OS_CFG_SHOW_DEMO
 
 /* ================================================================
@@ -469,6 +473,12 @@ static void task_show(void *arg)
     for (;;) {
         if (g_show_state == 2) break;    /* stop 请求 */
 
+        /* 【v2.7.1】超频切换期间暂停（volatile 跨核可见）。
+         * sysclk_apply_mhz 切换时钟时只保护 core0 中断，core1 不受保护；
+         * 检测到 g_oc_switching 则自我暂停，避免在 clk_sys 过渡频率下
+         * 运行 I2C/渲染破坏共享 RAM。 */
+        while (g_oc_switching) task_sleep(5);
+
         /* —— 渲染 —— */
         fb_clr();
         uint32_t scene = (hal_systick_get_tick() - g_start_tick) / SHOW_SCENE_MS;
@@ -540,8 +550,11 @@ static void show_task_spawn(void)
      * 取 2048。1024 实测溢出 → r5 恢复成 g_tick_interval_us(1000) →
      * blx r5 跳 ROM 0x3E8 → HardFault（flash76 板上实测）。
      * v2.7.1：绑定到 core1（task_create_on core=1），OLED 刷屏在核1跑，
-     * 把重负载 I2C/渲染从 core0 卸荷。core1 由 boot_setup 开机自动启动。 */
-    g_show_task = task_create_on("show", task_show, NULL, 2048, 2, 1);
+     * 把重负载 I2C/渲染从 core0 卸荷。core1 由 boot_setup 开机自动启动。
+     * v2.7.1-fix：栈 2048→4096。show 在 core1 持续 I2C 传输，若 I2C 深链路
+     * 偶发溢出会破坏共享 RAM（含 TinyUSB 状态 / idle 栈）→ USB 失效、
+     * core0 idle PC=0 HardFault。取 4096 消除该越界源。 */
+    g_show_task = task_create_on("show", task_show, NULL, 4096, 2, 1);
 }
 
 /* demo_app_init 调用（调度器启动前）：config 决定是否自动运行 */
