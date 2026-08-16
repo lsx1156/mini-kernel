@@ -2,7 +2,7 @@
 
 > **版本**: v2.5.0 STABLE | **目标平台**: RP2040 (Cortex-M0+) | **文档生成**: 2026-08-16
 >
-> **v2.5 两版本分离（重要）**：mini-kernel 已改为**可移植纯内核库**（`kernel_core.a` / `shell_module.a`），RP2040 专属文件全部移入 **`rp2040demo/rp2040_port/`**。本 Wiki 中所有提到 `mini-kernel/port/rp2040/` 的路径，在 v2.5 起一律对应 `rp2040demo/rp2040_port/`（如 `hal_port.c`、`context_switch.S`、`msc_usb.c`、`config_store.c`、`sysclk` 等均已在移入目录下）。
+> **v2.5 两版本分离（重要）**：mini-kernel 已改为**可移植纯内核库**（`kernel_core.a` / `shell_module.a`），RP2040 专属文件全部移入 **`rp2040demo/rp2040_port/`**。本 Wiki 中所有 RP2040 相关文件链接（`hal_port.c`、`context_switch.S`、`msc_usb.c`、`config_store.c`、`sysclk`、`flash_layout.h`、`bootscript.c` 等）均已更新为 `rp2040demo/rp2040_port/` 下的新路径。
 
 ---
 
@@ -416,7 +416,7 @@ typedef struct {
 
 ### 5.2 RP2040 移植层 (hal_port.c)
 
-**文件位置**: [hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c)
+**文件位置**: [hal_port.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c)
 
 #### 5.2.1 SysTick 定时器 (ALARM3 + TIMER_IRQ_3)
 
@@ -480,7 +480,7 @@ typedef struct {
 
 ### 5.3 上下文切换 (context_switch.S)
 
-**文件位置**: [context_switch.S](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S)
+**文件位置**: [context_switch.S](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S)
 
 #### 5.3.1 栈帧布局（★ 必须严格匹配）
 
@@ -703,7 +703,7 @@ Shell 任务 (task_stack=2048B, weight=1)
 
 - **Interface 0**: CDC ACM（虚拟串口）
 - **Interface 1**: MSC SCSI（可移动磁盘）
-- **描述符**: [msc_usb.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/msc_usb.c) 提供 Composite 描述符，覆盖 SDK 单 CDC 默认描述符
+- **描述符**: [msc_usb.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/msc_usb.c) 提供 Composite 描述符，覆盖 SDK 单 CDC 默认描述符
 
 #### 7.2.2 FatFs 关键配置
 
@@ -727,7 +727,7 @@ Shell 任务 (task_stack=2048B, weight=1)
 
 ### 7.3 Bootscript 固化命令
 
-**文件位置**: [bootscript.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/bootscript.c) / [bootscript.h](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/bootscript.h)
+**文件位置**: [bootscript.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/shell/bootscript.c) / [bootscript.h](file:///e:/ppCD/project/rp2040demo/rp2040_port/shell/bootscript.h)
 
 #### 7.3.1 Flash 双备份结构
 
@@ -752,7 +752,7 @@ len=0xFF 表示数组结束
 
 ## 8. Flash 分区布局
 
-**文件位置**: [flash_layout.h](file:///e:/ppCD/project/mini-kernel/include/hal/flash_layout.h)
+**文件位置**: [flash_layout.h](file:///e:/ppCD/project/rp2040demo/rp2040_port/include/hal/flash_layout.h)
 
 ```
 2 MiB (0x00200000) ───────────────────────────────────────────────┐
@@ -812,7 +812,7 @@ len=0xFF 表示数组结束
 | 9.2.1 | **冷初始化全程关中断 (cpsid i)** | [kernel.c#L210](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L210) | USBCTRL_IRQ / SDK alarm 在 kmem/task 数据结构未初始化时触发 → 静默数据损坏 → 稍后 HardFault |
 | 9.2.2 | **Boot_setup 任务化** | [kernel.c#L256](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L256) | 热初始化（打印/Shell/FatFs）在调度器运行后执行，核心状态已稳定 |
 | 9.2.3 | **boot_setup task_suspend 后不再复活** | [kernel.c#L193-L194](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L193-L194) | 旧版 suspend+sleep 组合导致 SUSPEND→SLEEP→被 tick 唤醒→再次执行 demo_app_init→重复创建任务→TCB 池指针覆盖→悬空 TCB→ps 乱码→LED 爆闪。修复：suspend 后 while(1) 空转等 PendSV |
-| 9.2.4 | **ALARM3 而非 ALARM0** | [hal_port.c#L67-L69](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L67-L69) | 不覆盖 SDK alarm_pool handler → USB 枚举正常完成 → 不出现 COM 口完全不识别 |
+| 9.2.4 | **ALARM3 而非 ALARM0** | [hal_port.c#L67-L69](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L67-L69) | 不覆盖 SDK alarm_pool handler → USB 枚举正常完成 → 不出现 COM 口完全不识别 |
 | 9.2.5 | **stdio_init_all 在 MSP+开中断后调用** | [kernel.c#L270-L275](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L270-L275) | USB CTRL IRQ 注册 + 枚举依赖正确上下文，在 PSP 任务中调用会导致 USB 不枚举 |
 | 9.2.6 | **PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000（1s 半阻塞）** | [CMakeLists.txt#L159](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt#L159) | CDC FIFO 满时边 pump tud_task 边等主机读走最多 1s（半阻塞，不丢开机输出），超时才丢；未连接立即丢弃不卡启动。配套 v2.4.3 开机日志缓存回放（见 §15）保证错过实时输出也能补看完整开机日志 |
 | 9.2.7 | **PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1** | [CMakeLists.txt#L151](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt#L151) | 兼容 PuTTY 等不拉 DTR 的终端 → 不会丢弃所有输出 |
@@ -826,7 +826,7 @@ len=0xFF 表示数组结束
 | 9.3.2 | **idle 永不入就绪队列** | [task.c#L61-L67](file:///e:/ppCD/project/mini-kernel/kernel/core/task.c#L61-L67) | idle 是空队列兜底；若入队则被 pick_next 选为 RUNNING 移除后丧失兜底语义 |
 | 9.3.3 | **sched_do_switch 仅 RUNNING 时 READY** | [sched.c#L205-L213](file:///e:/ppCD/project/mini-kernel/kernel/core/sched.c#L205-L213) | SLEEP/SUSPEND 状态不被覆盖，否则 task_sleep 无效 → 任务 tight loop → LED 爆闪 |
 | 9.3.4 | **idle 绝对不调用 task_sleep** | [task.c#L288-L313](file:///e:/ppCD/project/mini-kernel/kernel/core/task.c#L288-L313) | 所有用户任务都睡眠时 idle 兜底；若 idle 也睡则无任何就绪任务 → 调度器永久锁死 |
-| 9.3.5 | **PendSV 优先级最低 (SHPR3[22]=0xFF)** | [hal_port.c#L108](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L108) | 不抢占 TIMER_IRQ_3 tick 中断，避免调度器重入 + 队列损坏 |
+| 9.3.5 | **PendSV 优先级最低 (SHPR3[22]=0xFF)** | [hal_port.c#L108](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L108) | 不抢占 TIMER_IRQ_3 tick 中断，避免调度器重入 + 队列损坏 |
 | 9.3.6 | **tick_hook 不跳过 idle** | [kernel.c#L316-L328](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L316-L328) | 旧版若 current=idle 则跳过 tick 递减 → idle time_slice 永远不归零 → 其他任务永远抢不到 CPU → 表现同卡死 |
 | 9.3.7 | **task_destroy 禁止销毁自身** | [task.c#L134](file:///e:/ppCD/project/mini-kernel/kernel/core/task.c#L134) | TCB/栈释放后调度器仍访问 → use-after-free → 链表随机崩溃 |
 | 9.3.8 | **task_destroy 从对应队列移除** | [task.c#L147-L160](file:///e:/ppCD/project/mini-kernel/kernel/core/task.c#L147-L160) | 旧版只从就绪队列移除，SLEEP 任务仍在睡眠队列 → sched_sleep_tick 递减已释放内存 → 归零时把悬空 TCB 入就绪队列 → 链表损坏 |
@@ -835,31 +835,31 @@ len=0xFF 表示数组结束
 
 | 编号 | 机制 | 代码位置 | 防止的卡死场景 |
 |------|------|---------|--------------|
-| 9.4.1 | **栈帧总大小 64B** | [context_switch.S#L72-L73](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L72-L73) | r4-r11 (32B) + 硬件栈帧 (32B) = 64B，缺一不可 |
-| 9.4.2 | **task->sp 指向 r4-r11 起始** | [context_switch.S#L95-L96](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L95-L96) | PendSV pop r4-r11 时从正确位置读；to->sp + 32 = 硬件栈帧位置 |
-| 9.4.3 | **PC Thumb LSB 强制 1** | [context_switch.S#L79-L81](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L79-L81) | Cortex-M 无 ARM 状态，LSB=0 → INVSTATE → HardFault |
-| 9.4.4 | **LR = 0（noreturn 守卫）** | [context_switch.S#L85-L90](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L85-L90) | 任务意外返回时 LR=0 → 取指错 → HardFault（5Hz 快闪，非 Lockup）|
-| 9.4.5 | **xPSR T-bit = 1** | [context_switch.S#L92-L93](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L92-L93) | 异常返回后进入 Thumb 模式 |
-| 9.4.6 | **SVC PSP 偏移 +32（不是 +64）** | [context_switch.S#L263-L265](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L263-L265) | SVC 异常帧压 MSP 不影响 PSP；正确偏移 = 只跳 r4-r11 区域 |
-| 9.4.7 | **PendSV 先存 EXC_RETURN 到 r4** | [context_switch.S#L188-L189](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L188-L189) | `bl sched_do_switch` 覆盖 LR，不保存则异常返回用错误 LR → PC 乱飞 |
-| 9.4.8 | **先恢复高 r8-r11，再恢复低 r4-r7，最后设 LR** | [context_switch.S#L192-L206](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L192-L206) | 在覆盖 r4 之前必须先把 EXC_RETURN 从 r4 搬到 LR，顺序错一个就 HardFault |
-| 9.4.9 | **r4-r11 完整保存/恢复（8 个 callee-saved）** | [context_switch.S#L165-L178](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L165-L178) | 旧版漏保存 → 任务切回时 r4-r11=别人的垃圾值 → 随机崩溃/死循环 |
-| 9.4.10 | **AAPCS 兼容：hal_context_init 保存/恢复 r4** | [context_switch.S#L44/L98](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L44) | 旧版用 r4 作 scratch 不保存 → 覆盖调用者 g_idle_task 指针 → idle.sp=0 → HardFault |
-| 9.4.11 | **向量命名用 isr_xxx (SDK 名) + .thumb_func** | [context_switch.S#L157-L163](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L157-L163) | 旧 .set 别名不传递 Thumb LSB → 向量表 bit0=0 → INVSTATE → HardFault 向量也 LSB=0 → **双 Fault Lockup（LED 全灭）** |
-| 9.4.12 | **HardFault 只写 SIO_OUT_SET/CLR** | [context_switch.S#L291-L303](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L291-L303) | 不碰 IO_BANK0/PADS_BANK0 等 APB 寄存器，避免 HardFault 阶段再总线错 → Lockup |
-| 9.4.13 | **Invalid IRQ = HardFault 同处理** | [context_switch.S#L356-L361](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L356-L361) | 替换 SDK 默认 `bkpt #0`（bkpt 嵌套 HardFault 会 Lockup）|
+| 9.4.1 | **栈帧总大小 64B** | [context_switch.S#L72-L73](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L72-L73) | r4-r11 (32B) + 硬件栈帧 (32B) = 64B，缺一不可 |
+| 9.4.2 | **task->sp 指向 r4-r11 起始** | [context_switch.S#L95-L96](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L95-L96) | PendSV pop r4-r11 时从正确位置读；to->sp + 32 = 硬件栈帧位置 |
+| 9.4.3 | **PC Thumb LSB 强制 1** | [context_switch.S#L79-L81](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L79-L81) | Cortex-M 无 ARM 状态，LSB=0 → INVSTATE → HardFault |
+| 9.4.4 | **LR = 0（noreturn 守卫）** | [context_switch.S#L85-L90](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L85-L90) | 任务意外返回时 LR=0 → 取指错 → HardFault（5Hz 快闪，非 Lockup）|
+| 9.4.5 | **xPSR T-bit = 1** | [context_switch.S#L92-L93](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L92-L93) | 异常返回后进入 Thumb 模式 |
+| 9.4.6 | **SVC PSP 偏移 +32（不是 +64）** | [context_switch.S#L263-L265](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L263-L265) | SVC 异常帧压 MSP 不影响 PSP；正确偏移 = 只跳 r4-r11 区域 |
+| 9.4.7 | **PendSV 先存 EXC_RETURN 到 r4** | [context_switch.S#L188-L189](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L188-L189) | `bl sched_do_switch` 覆盖 LR，不保存则异常返回用错误 LR → PC 乱飞 |
+| 9.4.8 | **先恢复高 r8-r11，再恢复低 r4-r7，最后设 LR** | [context_switch.S#L192-L206](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L192-L206) | 在覆盖 r4 之前必须先把 EXC_RETURN 从 r4 搬到 LR，顺序错一个就 HardFault |
+| 9.4.9 | **r4-r11 完整保存/恢复（8 个 callee-saved）** | [context_switch.S#L165-L178](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L165-L178) | 旧版漏保存 → 任务切回时 r4-r11=别人的垃圾值 → 随机崩溃/死循环 |
+| 9.4.10 | **AAPCS 兼容：hal_context_init 保存/恢复 r4** | [context_switch.S#L44/L98](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L44) | 旧版用 r4 作 scratch 不保存 → 覆盖调用者 g_idle_task 指针 → idle.sp=0 → HardFault |
+| 9.4.11 | **向量命名用 isr_xxx (SDK 名) + .thumb_func** | [context_switch.S#L157-L163](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L157-L163) | 旧 .set 别名不传递 Thumb LSB → 向量表 bit0=0 → INVSTATE → HardFault 向量也 LSB=0 → **双 Fault Lockup（LED 全灭）** |
+| 9.4.12 | **HardFault 只写 SIO_OUT_SET/CLR** | [context_switch.S#L291-L303](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L291-L303) | 不碰 IO_BANK0/PADS_BANK0 等 APB 寄存器，避免 HardFault 阶段再总线错 → Lockup |
+| 9.4.13 | **Invalid IRQ = HardFault 同处理** | [context_switch.S#L356-L361](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L356-L361) | 替换 SDK 默认 `bkpt #0`（bkpt 嵌套 HardFault 会 Lockup）|
 
 ### 9.5 USB 接收链路防卡死（三层兜底）
 
 | 编号 | 机制 | 代码位置 | 防止的卡死场景 |
 |------|------|---------|--------------|
-| 9.5.1 | **条件式 INTE 恢复：仅 INTE==0 才干预** | [hal_port.c#L354-L372](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L354-L372) | 不覆盖 TinyUSB 自身正常管理的 INTE 值，避免竞争；只有 dcd_int_disable() 被抢占未配对恢复时才兜底 |
-| 9.5.2 | **安全掩码 0x0001F010，不含 SOF** | [hal_port.c#L387-L407](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L387-L407) | 只含 TinyUSB 有 ack 代码的位：避免 SOF 占满 CPU 死循环 + 避免 EP_STALL_NAK/ERROR 等未处理位触发 `Unhandled IRQ` PANIC（v2.4.3-fix 修正旧 0x0009004D 位号错误） |
-| 9.5.3 | **SETUP/Control Request 必须同步处理** | [hal_port.c#L293-L310](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L293-L310) | PuTTY 打开串口时 Windows 发 SET_LINE_CODING + SET_CONTROL_LINE_STATE → 若不应答则 CDC 不就绪 → **绝不向 EP1 OUT 发任何数据包** → Shell 输入永远空 |
-| 9.5.4 | **绕过 TinyUSB 接收层，直接读 EP1 OUT 硬件端点** | [hal_port.c#L234-L289](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L234-L289) | 终极兜底：即使 TinyUSB 内部状态机完全异常，也能从 DPRAM → 私有 ring buffer 取字节 |
-| 9.5.5 | **私有 ring buffer 128B + 临界区保护** | [hal_port.c#L221-L289](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L221-L289) | 生产者 (EP1 drain) 和消费者 (getc) 多任务下 head/tail 不原子 → 关中断保护，防止数据丢失 |
+| 9.5.1 | **条件式 INTE 恢复：仅 INTE==0 才干预** | [hal_port.c#L354-L372](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L354-L372) | 不覆盖 TinyUSB 自身正常管理的 INTE 值，避免竞争；只有 dcd_int_disable() 被抢占未配对恢复时才兜底 |
+| 9.5.2 | **安全掩码 0x0001F010，不含 SOF** | [hal_port.c#L387-L407](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L387-L407) | 只含 TinyUSB 有 ack 代码的位：避免 SOF 占满 CPU 死循环 + 避免 EP_STALL_NAK/ERROR 等未处理位触发 `Unhandled IRQ` PANIC（v2.4.3-fix 修正旧 0x0009004D 位号错误） |
+| 9.5.3 | **SETUP/Control Request 必须同步处理** | [hal_port.c#L293-L310](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L293-L310) | PuTTY 打开串口时 Windows 发 SET_LINE_CODING + SET_CONTROL_LINE_STATE → 若不应答则 CDC 不就绪 → **绝不向 EP1 OUT 发任何数据包** → Shell 输入永远空 |
+| 9.5.4 | **绕过 TinyUSB 接收层，直接读 EP1 OUT 硬件端点** | [hal_port.c#L234-L289](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L234-L289) | 终极兜底：即使 TinyUSB 内部状态机完全异常，也能从 DPRAM → 私有 ring buffer 取字节 |
+| 9.5.5 | **私有 ring buffer 128B + 临界区保护** | [hal_port.c#L221-L289](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L221-L289) | 生产者 (EP1 drain) 和消费者 (getc) 多任务下 head/tail 不原子 → 关中断保护，防止数据丢失 |
 | 9.5.6 | **idle 任务每 1ms 调 hal_usb_poll()** | [task.c#L302-L309](file:///e:/ppCD/project/mini-kernel/kernel/core/task.c#L302-L309) | 所有用户任务睡眠时，idle 独占 CPU 驱动 USB 状态机，不丢 CDC OUT 包 |
-| 9.5.7 | **NVIC ISER bit21 同步兜底** | [hal_port.c#L369-L371](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L369-L371) | dcd_int_enable 可能因抢占未设置 NVIC 位，手动写 ISER.21=1 确保 USBCTRL_IRQ 能被 NVIC 响应 |
+| 9.5.7 | **NVIC ISER bit21 同步兜底** | [hal_port.c#L369-L371](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L369-L371) | dcd_int_enable 可能因抢占未设置 NVIC 位，手动写 ISER.21=1 确保 USBCTRL_IRQ 能被 NVIC 响应 |
 
 ### 9.6 内存防卡死
 
@@ -873,7 +873,7 @@ len=0xFF 表示数组结束
 
 | 编号 | 机制 | 代码位置 | 防止的卡死场景 |
 |------|------|---------|--------------|
-| 9.7.1 | **hal_console_getc_impl 内含 usb_poll** | [hal_port.c#L413-L429](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L413-L429) | Shell 等待输入的每一步都在驱动 USB 状态机，不出现"开中断但不 poll → USB 死锁" |
+| 9.7.1 | **hal_console_getc_impl 内含 usb_poll** | [hal_port.c#L413-L429](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c#L413-L429) | Shell 等待输入的每一步都在驱动 USB 状态机，不出现"开中断但不 poll → USB 死锁" |
 | 9.7.2 | **SHELL_MAX_ARGS=16 + 溢出警告** | [shell.c#L55-L58](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell.c#L55-L58) | 旧版 10 → 静默截断 `i2c cmds 0 0x3C + 8 字节` 等长命令 → 参数丢失 → I2C 命令异常 |
 | 9.7.3 | **自动跳过前缀提示符 mk> / shell> / >** | Shell 解析逻辑 | 防止复制粘贴命令时把 `mk> ` 当作第一个参数，导致 "Unknown command 'mk>'" |
 
@@ -923,7 +923,7 @@ idle_task_entry (256B 静态栈 g_idle_stack，位于 .bss)
 |------|------|---------|------|
 | 9.9.1 | **idle 栈 256 → 1024** | [os_config.h#L54-L60](file:///e:/ppCD/project/mini-kernel/include/os_config.h#L54-L60) | 覆盖 TinyUSB 最深回调链 + PendSV 64B + IRQ 嵌套 |
 | 9.9.2 | **金丝雀覆盖 idle** | [kernel.c#L329](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L329) | 去掉 `!= &g_idle_task` 排除——idle 跑最深 USB 链路，恰恰最需要检查 |
-| 9.9.3 | **HardFault 现场转储** | [kernel.c#L357-L429](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L357-L429) + [context_switch.S#L298-L309](file:///e:/ppCD/project/mini-kernel/port/rp2040/context_switch.S#L298-L309) | handler 先存 PSP/MSP，再调 C dump：UART0 直写寄存器（不依赖 SDK/USB，二次 fault 概率最低）输出出错任务的 PC/LR/xPSR/R0/R12 + CFSR/HFSR/BFAR + 任务名。查看：USB-TTL 接 GPIO0(TX)，115200-8N1 |
+| 9.9.3 | **HardFault 现场转储** | [kernel.c#L357-L429](file:///e:/ppCD/project/mini-kernel/kernel/core/kernel.c#L357-L429) + [context_switch.S#L298-L309](file:///e:/ppCD/project/rp2040demo/rp2040_port/context_switch.S#L298-L309) | handler 先存 PSP/MSP，再调 C dump：UART0 直写寄存器（不依赖 SDK/USB，二次 fault 概率最低）输出出错任务的 PC/LR/xPSR/R0/R12 + CFSR/HFSR/BFAR + 任务名。查看：USB-TTL 接 GPIO0(TX)，115200-8N1 |
 
 **HardFault dump 输出示例**（接 UART0 后崩溃即可看到）：
 ```
@@ -1207,7 +1207,7 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
 
 > 本版目标：默认单核 + 125MHz，通过 `ovclk` 指令把**频率（预设档或任意 MHz）与多核标志**固化到独立 Flash Config 区，冷启动应用；未固化 / 损坏 / 极限档则安全回退。
 
-### 15.1 固化配置 `config_store`（[config_store.c](file:///e:/ppCD/project/mini-kernel/kernel/core/config_store.c)）
+### 15.1 固化配置 `config_store`（[config_store.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/kernel/config_store.c)）
 
 * 独立 Flash Config 区（4KB 扇区，见 `flash_layout.h`），`config_data_t` 固定 20B：
   `magic('MK2C') + version(2) + clock_mhz(16bit) + multi_core + reserved[7] + crc32(前16字节)`。
@@ -1216,7 +1216,7 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
   保证系统始终可进 shell 恢复；config 区保留供 `ovclk reset` 清除或改回安全档。
 * 注意：v2 把 v1 的 `clock_tier`(档位号) 改为 `clock_mhz`(任意 MHz)，旧固化配置因版本不符自动失效。
 
-### 15.2 超频 `sysclk`（[hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c) `sysclk_apply_mhz`）
+### 15.2 超频 `sysclk`（[hal_port.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c) `sysclk_apply_mhz`）
 
 * 档位表：125/250/375/500MHz（均为 125 整数倍 → clk_peri 可精确整数分频回 125MHz）。
 * 任意 MHz（100~500）：`sysclk_nearest_achievable_mhz` 用 `check_sys_clock_khz` 就近锁定可达频率。
@@ -1230,7 +1230,7 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
 * clk_peri 变更后 `uart_set_baudrate(uart0, 115200)` 按新时钟重算（UART 小数分频），TTL 保持精确 115200。
 * HardFault 转储前也先按当前 clk_peri 重设 UART0 波特率 → 切换中途崩溃的 dump 仍可读。
 
-### 15.3 命令 `ovclk`（[shell_ovclk.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell_ovclk.c)）
+### 15.3 命令 `ovclk`（[shell_ovclk.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/shell/shell_ovclk.c)）
 
 | 子命令 | 作用 |
 |-------|------|
@@ -1242,7 +1242,7 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
 | `save` | 写入 Flash Config 区 |
 | `unsave`/`reset` | 擦除固化区 → 恢复 125MHz 单核 |
 
-### 15.4 命令 `mcore`（[shell_mcore.c](file:///e:/ppCD/project/mini-kernel/kernel/modules/shell/shell_mcore.c)）
+### 15.4 命令 `mcore`（[shell_mcore.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/shell/shell_mcore.c)）
 
 多核调度脚手架：`status` 看 core0/core1 当前任务 + core1 tick 计数；`demo` 显式启动 core1 并在其上创建心跳任务；`stop` 销毁。boot 阶段不自动启动 core1（诊断中）。
 
@@ -1250,7 +1250,7 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
 
 写 AIRCR.SYSRESETREQ 软复位；复位前清 USB D+ 上拉（PULLUP_EN=0）让主机重新枚举，复位后 Windows 重新识别 COM 口，并重现完整开机画面 + 应用固化配置。
 
-### 15.6 开机日志缓存回放（[hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c)）
+### 15.6 开机日志缓存回放（[hal_port.c](file:///e:/ppCD/project/rp2040demo/rp2040_port/hal_port.c)）
 
 * 启动阶段（`sched_start` 之后到 `_boot_setup_task` 末尾 `hal_bootlog_end()`）`hal_console_putc` 输出同步捕获进 2KB RAM 缓冲。
 * `hal_usb_poll` 解析 CDC `SET_CONTROL_LINE_STATE(0x21/0x22)` 的 **DTR 上升沿**（= 用户刚打开终端）→ 记录就绪时刻。
