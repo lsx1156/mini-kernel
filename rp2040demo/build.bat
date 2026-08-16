@@ -90,6 +90,17 @@ if errorlevel 1 goto FAIL
 :after_build
 
 REM -------- Artifact check --------
+REM Self-heal: UF2 is a POST_BUILD step of the link. If the UF2 was moved
+REM away (e.g. cut-paste onto RPI-RP2 to flash), ninja reports "no work to
+REM do" and never regenerates it. Delete the ELF to force a relink.
+if not exist "%UF2%" (
+    if exist "%BUILD_DIR%\rp2040demo" (
+        >> "%LOG%" echo NOTE: UF2 missing but ELF up-to-date - forcing relink to regenerate UF2
+        del /q "%BUILD_DIR%\rp2040demo"
+        call :RUN_CMAKE_BUILD
+        if errorlevel 1 goto FAIL
+    )
+)
 if not exist "%UF2%" (
     >> "%LOG%" echo ERROR: UF2 missing - %UF2%
     goto FAIL
