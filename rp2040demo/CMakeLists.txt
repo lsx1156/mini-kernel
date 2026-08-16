@@ -80,6 +80,9 @@ file(GLOB RP2040_PORT_SRCS
     ${RP2040_PORT_DIR}/shell/shell_fs.c
     ${RP2040_PORT_DIR}/shell/shell_mcore.c
     ${RP2040_PORT_DIR}/shell/shell_ovclk.c
+    ${RP2040_PORT_DIR}/ipc/shmem_ipc.c
+    ${RP2040_PORT_DIR}/ipc/core1_worker.c
+    ${RP2040_PORT_DIR}/ipc/shell_ipc.c
 )
 # 【v2.5.1 关键修复】demo_app.c 不进静态库、直接编进可执行目标：
 #   kernel.c 对 demo_app_init 只有 weak 引用 —— weak 引用不会从静态库拉取
@@ -272,6 +275,11 @@ endif()
 # Pico SDK USB/UART 双 stdio + UF2 输出
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
+
+# 【v2.6】自定义 linker 脚本：RAM 条带区 256K→128K，bank1/2/3 别名区
+#   划给 Core1 镜像（0x21019000）与 IPC 共享乒乓缓冲（0x21028000/0x21038000）。
+#   见 memmap_ipc.ld 头注释与 rp2040_port/ipc/shmem_ipc.h。
+pico_set_linker_script(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/memmap_ipc.ld)
 
 # 强制 GCC 链接驱动选择 thumb/v6-m/nofp multilib 路径
 target_link_options(${PROJECT_NAME} PRIVATE

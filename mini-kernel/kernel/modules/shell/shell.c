@@ -2451,6 +2451,10 @@ static void task_shell(void *arg) {
     /* v2.4 ③ 注册 mcore（多核调度测试）命令（RP2040 专属，内核库裁剪关闭时不编译） */
     shell_mcore_register();
 #endif
+#if OS_CFG_IPC
+    /* v2.6 ④ 注册 ipc（双核共享内存 IPC：FIFO + 2x16KB 乒乓，Core1 SRAM worker） */
+    shell_ipc_register();
+#endif
 
 #if OS_CFG_FATFS
     /* v2.2 ② 挂载 FatFs（空片时会自动 f_mkfs FAT16）
