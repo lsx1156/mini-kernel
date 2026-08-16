@@ -499,7 +499,12 @@ static void show_task_spawn(void)
 {
     if (s_orphan) { task_destroy(s_orphan); s_orphan = NULL; }
     if (g_show_task) return;
-    g_show_task = task_create("show", task_show, NULL, 1024, 2);
+    /* 2048 = shell 同级：I2C 驱动调用链深（SDK i2c_write_blocking_internal
+     * 栈帧 ~100B + timeout 检查器 + hal 层），shell.c 注释明确警告
+     * "768 会溢出"，VT2 用 1536；show 渲染局部（px/py 各 64B）更深，
+     * 取 2048。1024 实测溢出 → r5 恢复成 g_tick_interval_us(1000) →
+     * blx r5 跳 ROM 0x3E8 → HardFault（flash76 板上实测）。 */
+    g_show_task = task_create("show", task_show, NULL, 2048, 2);
 }
 
 /* demo_app_init 调用（调度器启动前）：config 决定是否自动运行 */
