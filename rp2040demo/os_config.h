@@ -69,7 +69,11 @@
 #define OS_CFG_MAX_QUEUE              8   /* 最大消息队列数               */
 #define OS_CFG_MAX_TIMERS             4   /* 最大软件定时器数             */
 #define OS_CFG_HEAP_SIZE_BYTES        (16*1024) /* 内核堆大小（任务栈+TCB+kmalloc） */
-#define OS_CFG_IDLE_STACK_SIZE        1024 /* 空闲任务栈 (字节)           */
+#define OS_CFG_IDLE_STACK_SIZE        2048 /* 空闲任务栈 (字节)。v2.7.1: 原 1024B
+                                            * 不足以支撑 idle 里 hal_usb_poll 深栈
+                                            * (dcd_int_handler/tud_task_ext ~2KB)，
+                                            * 长打印(ovclk 等)频繁 yield→idle 时
+                                            * 溢出→idle PC=0 HardFault。 */
 #define OS_CFG_DEFAULT_TASK_STACK     512  /* 默认任务栈 (字节)            */
 
 /* ================================================================
