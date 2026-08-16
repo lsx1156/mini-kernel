@@ -32,10 +32,6 @@ extern const char *k_version(void);
 void demo_app_init(void);
 /* shell_start 由 shell.c 提供（OS_CFG_SHELL=1 时创建交互 shell 任务）*/
 extern void shell_start(void);
-/* fatfs_init_and_mount 由 fatfs_api.h 提供（v2.2，首次启动自动格式化 FAT16）*/
-#if OS_CFG_FATFS
-#include "fatfs_api.h"
-#endif
 
 #if OS_CFG_DEMO_APP
 
@@ -382,34 +378,14 @@ void demo_app_init(void) {
      *   Shell 模式：输入命令 → 同步执行 → 打印结果 → 等待下一条命令。
      *   注意 (v0.2)：shell_start() 内部在创建交互式 shell 任务之前，会先
      *   同步调用 bootscript_run_all()，跑完所有 save/! 固化的命令，再进
-     *   交互模式。LED / I2C 的回放结果都在那个大 banner 里体现。 */
+     *   交互模式。LED / I2C 的回放结果都在那个大 banner 里体现。
+     *
+     * 【v2.5.1-fix · 启动日志交错】shell_start() 必须是本函数最后一句输出
+     *   之后的调用：task_create(shell) 之后 shell 任务与本任务（boot_setup）
+     *   并发，任何 demo_puts 都会与 shell 任务的 [FS]/banner 输出发生字符级
+     *   交错。FatFs 挂载 + MSC 状态提示由 shell 任务统一负责（task_shell 内
+     *   fatfs_init_and_mount + [FS ] 打印），此处不再重复初始化与打印。 */
     shell_start();
-    demo_puts("[BOOT  ] Shell ready. Connect USB CDC COMx and type 'help' or 'gpio help'.\r\n\r\n");
-
-    /* ── v2.2: FatFs + USB MSC 初始化（在 bootscript_run_all 跑完 + shell 就绪后）
-     *   初始化顺序很关键：
-     *     1. shell_start() → 已经向命令表注册了 msc/ls/cd/... 扩展命令
-     *     2. fatfs_init_and_mount() → 检测空片自动 f_mkfs FAT16 + 挂载
-     *     3. 首启动完成后 ejected=true（Shell 独占写模式，防止主机 USB 竞争写）
-     *   用户若想电脑看见 U 盘盘符，显式执行 `msc mount` 即可。
-     * ─────────────────────────────────────────────────────────────────── */
-#if OS_CFG_FATFS
-    {
-        FRESULT fr = fatfs_init_and_mount();
-        if (fr == FR_OK) {
-            if (fatfs_mkfs_done_this_boot()) {
-                demo_puts("[BOOT  ] MSC: Blank flash → auto-f_mkfs FAT16 (1012KiB data partition).\r\n");
-            }
-            demo_puts("[BOOT  ] MSC: FatFs mounted OK. Mode = SHELL-EXCLUSIVE (ejected=true).\r\n");
-            demo_puts("[BOOT  ] MSC: To expose drive to host PC, run:  msc mount\r\n");
-            demo_puts("[BOOT  ] MSC: Shell commands (mkdir/rm/cat) work now; no `msc eject` needed.\r\n\r\n");
-        } else {
-            demo_puts("[BOOT  ] MSC: FatFs mount SKIPPED (code=");
-            demo_put_uint32((uint32_t)fr);
-            demo_puts("). Run `msc status` then `msc mount` or `msc format`.\r\n\r\n");
-        }
-    }
-#endif
 }
 
 #else /* !OS_CFG_DEMO_APP —— 关闭 demo 时的空桩，保证链接无未定义符号 */

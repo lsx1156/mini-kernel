@@ -80,8 +80,12 @@ file(GLOB RP2040_PORT_SRCS
     ${RP2040_PORT_DIR}/shell/shell_fs.c
     ${RP2040_PORT_DIR}/shell/shell_mcore.c
     ${RP2040_PORT_DIR}/shell/shell_ovclk.c
-    ${RP2040_PORT_DIR}/demo/demo_app.c
 )
+# 【v2.5.1 关键修复】demo_app.c 不进静态库、直接编进可执行目标：
+#   kernel.c 对 demo_app_init 只有 weak 引用 —— weak 引用不会从静态库拉取
+#   归档成员，demo_app.o 会被链接器丢弃，连带 shell.o（仅 demo_app.o 强引用
+#   shell_start）也被丢弃 → 固件里根本没有 shell 任务 → USB/TTL 全部无法输入。
+#   编进 exe 后 demo_app_init 强定义存在，并强引用 shell_start 拉入 shell_module。
 add_library(rp2040_port STATIC ${RP2040_PORT_SRCS})
 
 # 移植层公共 include（内核头 + 移植层自身头 + SDK 头）
@@ -189,6 +193,7 @@ endif()
 # ================================================================
 add_executable(${PROJECT_NAME}
     src/main.c
+    ${RP2040_PORT_DIR}/demo/demo_app.c   # v2.5.1：直接编进 exe（见上方 rp2040_port 库注释）
 )
 target_compile_options(${PROJECT_NAME} PRIVATE ${DEMO_COMMON_FLAGS})
 if(OS_CFG_DEFINES)
@@ -215,6 +220,7 @@ if(TARGET tinyusb_device_common)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}          # v2.5.1：本工程 os_config.h 必须最前（防被纯库配置遮蔽）
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${MINIK_ROOT}/include
     ${MINIK_ROOT}/include/hal
@@ -229,11 +235,20 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 # ================================================================
 # 7. 链接内核库 + 移植层 + SDK
+#    【v2.5.1-fix】四个静态库相互循环引用（shell→port→fatfs→port、
+#    port→kernel_core→port），单遍扫描必断链。用 LINK_GROUP RESCAN
+#    （-Wl,--start-group ... --end-group）让链接器循环重扫到收敛：
+#      shell.c → shell_fs_register(rp2040_port) → f_opendir(fatfs_module)
+#      kernel.c → config_apply(rp2040_port) → sysclk(config_store)
+#      hal_port.c → kmalloc(kernel_core)
 # ================================================================
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    "-Wl,--start-group"
     rp2040_port
     kernel_core
     shell_module
+    fatfs_module
+    "-Wl,--end-group"
     pico_stdlib
     hardware_uart
     hardware_timer
@@ -246,8 +261,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_pll
     hardware_clocks
 )
-if(fatfs_module)
-    target_link_libraries(${PROJECT_NAME} PRIVATE fatfs_module)
+# FatFs：demo_app.c（exe 编译单元）需要 ff.h（shim 目录）
+if(TARGET fatfs_module)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        "${FATFS_SHIM_DIR}"
+        "${FATFS_SDK_SRC}"
+    )
 endif()
 
 # Pico SDK USB/UART 双 stdio + UF2 输出

@@ -85,8 +85,15 @@ message(STATUS "OS Config Defines: ${OS_CFG_DEFINES}")
 
 # ================================================================
 # 3. 目录结构（纯内核库：仅包含平台无关的核心与基础模块）
+#    【v2.5.1 关键修复】OS_CONFIG_DIR 放在最前：
+#    被 add_subdirectory 引用时（如 rp2040demo），OS_CONFIG_HEADER 指向目标工程
+#    的 os_config.h；若不放在 ${MINIK_ROOT}/include 之前，kernel.c / shell.c 的
+#    #include "os_config.h" 会命中本库自带的纯库配置（PORT_RP2040=0 等），
+#    出现 "OS_CFG_xxx redefined" 警告 + RP2040 输入路径/命令被静默裁剪。
 # ================================================================
+get_filename_component(OS_CONFIG_DIR "${OS_CONFIG_HEADER}" DIRECTORY)
 set(INCLUDE_DIRS
+    ${OS_CONFIG_DIR}
     ${MINIK_ROOT}/include
     ${MINIK_ROOT}/include/hal
     ${MINIK_ROOT}/kernel/core
