@@ -28,8 +28,12 @@ static uint32_t g_next_task_id = 1;
 size_t g_user_stack_used_bytes = 0;
 size_t g_kernel_stack_used_bytes = 0;
 
-/* 空闲任务栈 */
-static uint8_t g_idle_stack[OS_CFG_IDLE_STACK_SIZE] __attribute__((aligned(8)));
+/* 空闲任务栈：每核独立一份（v2.7.1 修复）。
+ * 之前只有一维数组，core0/core1 的 idle 都指向同一份栈。core1 未启用时
+ * 无碍；开机自动启动 core1 后，两核 idle 并发共享 1KB → core0 idle 的
+ * hal_usb_poll（深栈 ~2KB）溢出击穿 core1 idle 栈帧 → 返回地址变 0 →
+ * idle 任务 PC=0 HardFault。改为 [OS_CFG_CORE_COUNT][] 每核独立。 */
+static uint8_t g_idle_stack[OS_CFG_CORE_COUNT][OS_CFG_IDLE_STACK_SIZE] __attribute__((aligned(8)));
 
 /* ================================================================
  * 内部辅助函数
@@ -58,7 +62,7 @@ void task_module_init(void) {
     for (uint32_t c = 0; c < OS_CFG_CORE_COUNT; c++) {
         tcb_t *idle = &g_idle_task_table[c];
         memset(idle, 0, sizeof(tcb_t));
-        idle->stack_base = g_idle_stack + OS_CFG_IDLE_STACK_SIZE;
+        idle->stack_base = g_idle_stack[c] + OS_CFG_IDLE_STACK_SIZE;
         idle->stack_size = OS_CFG_IDLE_STACK_SIZE;
         idle->priority = 0;
         idle->weight = 1;
