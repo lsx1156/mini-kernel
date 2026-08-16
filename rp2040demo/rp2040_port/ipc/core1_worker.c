@@ -2,8 +2,8 @@
  * @file    core1_worker.c
  * @brief   v2.6 Core1 worker —— 裸循环 WFE 事件驱动，SRAM 镜像执行
  *
- * 【铁律】整个编译单元链接进 .core1_text（VMA=0x21019000，LMA=Flash），
- * 由 ipc_start() 拷入 bank1 别名区后执行。因此严禁：
+ * 【铁律】整个编译单元链接进 .core1_text（VMA=0x20019000，LMA=Flash），
+ * 由 ipc_start() 拷入条带 RAM CORE1 区后执行。因此严禁：
  *   · 任何 libc 调用（memcpy/printf → 引入 Flash 符号，XIP 争用 + 镜像外跳转）
  *   · 除法/取模（M0+ 无硬件除法 → __aeabi_uidiv 在 Flash）
  *   · 中断（不开 NVIC，纯 WFE 事件驱动；入口先 cpsid i）
@@ -15,10 +15,12 @@
  */
 #include "shmem_ipc.h"
 
-/* SIO FIFO 直接寄存器（不引 SDK 头，保持镜像自包含） */
+/* SIO FIFO 直接寄存器（不引 SDK 头，保持镜像自包含）
+ * 【v2.6.6 根因修复】偏移 0x40/0x44 → 0x54/0x58（原值是 GPIO_HI_OE/
+ * OE_SET，读恒 0；真 FIFO 见 shmem_ipc.c 同步注释） */
 #define W_SIO_BASE  0xD0000000u
-#define W_FIFO_WR   (*(volatile uint32_t *)(W_SIO_BASE + 0x40u))
-#define W_FIFO_RD   (*(volatile uint32_t *)(W_SIO_BASE + 0x44u))
+#define W_FIFO_WR   (*(volatile uint32_t *)(W_SIO_BASE + 0x54u))
+#define W_FIFO_RD   (*(volatile uint32_t *)(W_SIO_BASE + 0x58u))
 #define W_FIFO_ST   (*(volatile uint32_t *)(W_SIO_BASE + 0x50u))
 #define W_ST_VLD    1u
 

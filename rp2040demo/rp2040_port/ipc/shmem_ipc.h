@@ -7,7 +7,7 @@
  *     ├─ 传感器采集 → 写 IN[n]（16KB 乒乓）
  *     ├─ FIFO push「帧就绪」→ SEV 唤醒 Core1
  *     ├─ 等 FIFO「帧完成」→ 读 OUT[n] 做安全判定
- *   Core1（裸循环，SRAM 镜像 @0x21019000，不开中断）
+ *   Core1（裸循环，SRAM 镜像 @0x20019000，不开中断）
  *     └─ WFE 等通知 → 读 IN[n] → 运算 → 写 OUT[n] → FIFO 应答
  *
  * 防撕裂：缓冲「所有权」随 FIFO 消息在两核间转移 ——
@@ -27,12 +27,14 @@
 
 /* ================================================================
  * 1. 内存映射（数值与 memmap_ipc.ld 严格对应，改一处必须同步另一处）
+ *    【v2.6.1】IPC 区全部使用常规条带地址（RAM 96k 之外的保留区），
+ *    不再使用 bank 别名（0x2101xxxx）——实测别名写会打爆内核 .data。
  * ================================================================ */
-#define IPC_CTRL_BASE    0x21018000u  /* bank1 别名：ctrl 控制块 4KB 页 */
-#define IPC_CORE1_BASE   0x21019000u  /* bank1 别名：Core1 镜像 28KB（linker CORE1 区）*/
+#define IPC_CTRL_BASE    0x20018000u  /* ctrl 控制块 4KB（RAM region 之外，裸地址） */
+#define IPC_CORE1_BASE   0x20019000u  /* Core1 镜像 28KB（linker CORE1 region） */
 
-#define IPC_IN_ADDR(n)   (0x21028000u + (uint32_t)((n) & 1u) * 0x4000u)  /* bank2: IN-A/IN-B */
-#define IPC_OUT_ADDR(n)  (0x21038000u + (uint32_t)((n) & 1u) * 0x4000u)  /* bank3: OUT-A/OUT-B */
+#define IPC_IN_ADDR(n)   (0x20020000u + (uint32_t)((n) & 1u) * 0x4000u)  /* IN-A/IN-B 各 16KB */
+#define IPC_OUT_ADDR(n)  (0x20028000u + (uint32_t)((n) & 1u) * 0x4000u)  /* OUT-A/OUT-B 各 16KB */
 
 #define IPC_BUF_BYTES    16384u       /* 单缓冲 16KB */
 #define IPC_BUF_WORDS    (IPC_BUF_BYTES / 4u)
@@ -40,8 +42,14 @@
 #define IPC_IN(n)        ((volatile uint32_t *)IPC_IN_ADDR(n))
 #define IPC_OUT(n)       ((volatile uint32_t *)IPC_OUT_ADDR(n))
 
+/* 【v2.6.6】诊断输出总开关（TTL/UART0）：
+ *   1 = 启动 SNAP 快照 + ipc_start 全程分阶段日志（排障用）
+ *   0 = 正常运行只保留故障路径输出（STUCK/TIMEOUT/VERIFY FAIL）
+ * 主动诊断命令 `ipc fifo` 的探针输出不受此开关影响 */
+#define IPC_VERBOSE_DIAG 0
+
 /* ================================================================
- * 2. ctrl 控制块（0x21018000，所有字段单字 —— 原子，无需自旋锁）
+ * 2. ctrl 控制块（0x20018000，所有字段单字 —— 原子，无需自旋锁）
  * ================================================================ */
 #define IPC_MAGIC        0x31435049u  /* 'IPC1' */
 #define IPC_STATE_UNINIT 0u
@@ -102,6 +110,8 @@ int      ipc_start(void);         /* 镜像拷贝 + 拉起 Core1 → RUNNING（�
 int      ipc_stop(void);          /* multicore_reset_core1 → READY */
 int      ipc_is_running(void);
 volatile ipc_ctrl_t *ipc_ctrl(void);
+void     ipc_fifo_probe(void);    /* 【v2.6.3】SIO FIFO 深度探针（诊断推手） */
+void     ipc_boot_snap(const char *tag); /* 【v2.6.4】启动期 FIFO/PSM 快照（TTL 输出） */
 
 /* 分步帧 API（传感器路径推荐：begin → 直接写 IPC_IN(n) → commit → wait） */
 uint32_t ipc_frame_new(void);                        /* ++frame_ctr，返回 fid */

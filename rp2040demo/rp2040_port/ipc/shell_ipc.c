@@ -59,6 +59,14 @@ static int cmd_ipc(int argc, char **argv, shell_ctx_t *ctx) {
         return 0;
     }
 
+    if (!strcmp(sub, "fifo")) {
+        /* 【v2.6.3】SIO FIFO 深度探针：不 reset、不 launch，
+         * 纯读 + 断电对比。冷启动后第一条命令跑它可抓原始状态。 */
+        emit("IPC: SIO FIFO probe (see TTL/UART0 for hex dump)\r\n");
+        ipc_fifo_probe();
+        return 0;
+    }
+
     if (!strcmp(sub, "stop")) {
         ipc_stop();
         emit("IPC: core1 reset, state=READY\r\n");
@@ -120,12 +128,12 @@ static int cmd_ipc(int argc, char **argv, shell_ctx_t *ctx) {
         return 0;
     }
 
-    shell_puts(ctx, "usage: ipc start|stop|status|bench [n]|selftest\r\n");
+    shell_puts(ctx, "usage: ipc start|stop|status|bench [n]|selftest|fifo\r\n");
     return 1;
 }
 
 void shell_ipc_register(void) {
     shell_register("ipc", cmd_ipc,
-                   "ipc start|stop|status|bench|selftest",
+                   "ipc start|stop|status|bench|selftest|fifo",
                    "dual-core shared-mem IPC (FIFO + 2x16KB ping-pong, core1 SRAM worker)");
 }

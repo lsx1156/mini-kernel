@@ -56,6 +56,10 @@ extern void tud_task_ext(uint32_t timeout_ms, int in_isr);
  * SET_CONTROL_LINE_STATE 处理掉。 */
 extern uint8_t tud_cdc_n_get_line_state(uint8_t itf);
 
+/* 【v2.6.4】启动期 FIFO/PSM 快照（实现见 rp2040_port/ipc/shmem_ipc.c，
+ * 输出走 UART0/TTL——诊断专用，不依赖 USB/TinyUSB 状态） */
+extern void ipc_boot_snap(const char *tag);
+
 /* 内核回调：滴答中断尾部 */
 extern void kernel_tick_hook(void);
 
@@ -162,6 +166,7 @@ static inline void _usb_force_poll(void);
 static void hal_console_init_impl(uint32_t baudrate) {
     (void)baudrate;
     stdio_init_all();
+    ipc_boot_snap("B-after-usb");   /* 【v2.6.4】USB 枚举后的 FIFO/PSM 状态 */
 }
 
 /* 控制台输出：PRIMASK 保护 putchar_raw + 每 32 字符 yield 让 idle 刷新 USB FIFO。
@@ -211,6 +216,7 @@ static void hal_bootlog_putc(char c) {
 /* 停止捕获（内核在 sched_start 前调用 hal_bootlog_end，见 hal_interface.h） */
 void hal_bootlog_end(void) {
     s_bootlog_capture = false;
+    ipc_boot_snap("C-pre-sched");   /* 【v2.6.4】sched_start 前最后一刻 */
 }
 
 static void _bootlog_dtr_check(void);   /* 实现见文件后部（依赖 SETUP 快照） */
@@ -1212,6 +1218,7 @@ void hal_diag_init(void) {
     uart_init(uart0, 115200);
     gpio_set_function(0, GPIO_FUNC_UART);
     gpio_set_function(1, GPIO_FUNC_UART);
+    ipc_boot_snap("A-poweron");     /* 【v2.6.4】最早快照：上电即楔死 → 硬件 */
 }
 void hal_diag_putc(char c) {
     while (DIAG_UART_FR & DIAG_UART_TXFF) { }   /* 忙等 TX FIFO 非满 */

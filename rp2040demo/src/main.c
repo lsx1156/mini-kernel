@@ -19,9 +19,16 @@
 
 /* mini-kernel 内核入口（由 mini-kernel 静态库导出） */
 extern void kernel_main(void);
+/* 【v2.6.4】UART0 诊断口初始化 + FIFO/PSM 上电快照。
+ * kernel.c 的 weak main 被本文件强 main 覆盖后，hal_diag_init 从未被
+ * 调用（链接器 GC）——在此显式补回，并成为启动期最早的快照点 A。 */
+extern void hal_diag_init(void);
 
 int main(void) {
     const uint LED = (uint)PICO_DEFAULT_LED_PIN;
+
+    /* A 点快照：crt0 → main 第一句（LED 诊断闪烁之前），TTL 输出 */
+    hal_diag_init();
 
     /* --- 诊断阶段 1：5 次 250ms 快闪 --- */
     gpio_init(LED);

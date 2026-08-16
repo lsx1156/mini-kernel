@@ -1,28 +1,31 @@
-/* memmap_ipc.ld — v2.6 双核 IPC 内存映射（基于 SDK memmap_default.ld 修改）
+/* memmap_ipc.ld — v2.6.1 双核 IPC 内存映射（基于 SDK memmap_default.ld 修改）
  *
- * 相对默认脚本的改动（只有 3 处）：
- *   1. RAM 条带区 256k → 128k：4 个 64KB bank 的前 32KB 被条带占用，
- *      每 bank 剩余 32KB（0x210X8000-0x210XFFFF）只能经非条带别名访问，
- *      内核没有任何符号指向那里 → 与内核 heap/栈物理隔离。
- *   2. 新增 CORE1 区域：bank1 别名 0x21019000，28KB（前面 0x21018000 的
- *      4KB 留给 IPC ctrl 控制块，不属于本区域）。
- *   3. 新增 .core1_text/.core1_data（LMA 在 Flash，VMA 在 CORE1，由
- *      ipc_start() 手动拷贝镜像）与 .core1_bss（NOLOAD，手动清零）。
+ * 【v2.6.1 关键修正：放弃 bank 别名区】
+ *   v2.6 把 IPC 区放在非条带别名（0x2101xxxx），基于"条带区只占每 bank
+ *   前 32KB"的推算。实测该推算不成立：写 0x21018000（ctrl 清零）直接
+ *   打爆内核 .data（hal_systick_ops.delay_us 被清零 → idle blx 0 →
+ *   HardFault PC=0）。别名区与条带区的实际物理映射以硅片为准，不再假设。
  *
- * 其余 bank 别名分配（纯宏定义，不进 linker，见 rp2040_port/ipc/shmem_ipc.h）：
- *   bank1 0x21018000 : IPC ctrl   4KB
- *   bank1 0x21019000 : Core1 镜像 28KB（本脚本 CORE1 区，栈在最顶 8KB）
- *   bank2 0x21028000 : IN-A/IN-B  各 16KB（Core0→Core1 乒乓）
- *   bank3 0x21038000 : OUT-A/OUT-B 各 16KB（Core1→Core0 乒乓）
+ *   改为 linker 亲自裁剪的常规条带地址：RAM 缩到 96k（内核现用 ~26KB，
+ *   余量充足），0x20018000 起的 IPC 区不属于任何可分配 region →
+ *   构造上保证内核不可能踩到：
+ *     0x20018000 - 0x20018FFF  IPC ctrl   4KB（无 region，裸地址）
+ *     0x20019000 - 0x2001FFFF  CORE1     28KB（镜像 + 顶 8KB 栈）
+ *     0x20020000 - 0x2002FFFF  IPCBUF    64KB（IN-A/B + OUT-A/B 各 16KB）
+ *
+ * 其余改动：
+ *   .core1_text/.core1_data（LMA 在 Flash，VMA 在 CORE1，由 ipc_start()
+ *   手动拷贝镜像）与 .core1_bss（NOLOAD，手动清零）。
  */
 
 MEMORY
 {
     FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 2048k
-    RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 128k
+    RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 96k
     SCRATCH_X(rwx) : ORIGIN = 0x20040000, LENGTH = 4k
     SCRATCH_Y(rwx) : ORIGIN = 0x20041000, LENGTH = 4k
-    CORE1(rwx) : ORIGIN = 0x21019000, LENGTH = 28k
+    CORE1(rwx) : ORIGIN = 0x20019000, LENGTH = 28k
+    IPCBUF(rwx) : ORIGIN = 0x20020000, LENGTH = 64k
 }
 
 ENTRY(_entry_point)
@@ -166,8 +169,8 @@ SECTIONS
     __scratch_y_source__ = LOADADDR(.scratch_y);
 
     /* ================================================================
-     * v2.6 Core1 镜像段：LMA 在 Flash（随固件烧录），VMA 在 bank1
-     * 别名区。ipc_start() 用下面的符号手动 memcpy 过去再拉起 Core1。
+     * v2.6 Core1 镜像段：LMA 在 Flash（随固件烧录），VMA 在条带 RAM
+     * CORE1 区。ipc_start() 用下面的符号手动 memcpy 过去再拉起 Core1。
      * 注意：crt0 只搬 .data，这几段必须手工搬运 / 清零。
      * ================================================================ */
     .core1_text : {
