@@ -57,7 +57,11 @@
 #define SHOW_OLED_ADDR   0x3Cu
 #define SHOW_I2C_HZ      400000u     /* SSD1306 Fast-mode（VT2 验证过） */
 #define SHOW_FB_COLS     128         /* 有效列 */
-#define SHOW_TX_COLS     132         /* 发送列（SH1106 兼容，SSD1306 wrap 无害） */
+#define SHOW_TX_COLS     128         /* 发送列（本工程屏为 SSD1306 128x64）。
+                                      * v2.7.1：原 132 会让 SSD1306 页寻址写满
+                                      * 128 列后 column 指针回绕到 0，末 4 字节(0)
+                                      * 每帧覆盖左上角列 0-3 → 左上角像素闪烁。
+                                      * 若换 SH1106(132 列) 再改回 132。 */
 #define SHOW_PAGES       8
 #define SHOW_SCENE_MS    5000u       /* 场景轮播周期 */
 
@@ -152,21 +156,25 @@ static void fb_disc(int cx, int cy, int r)
             if (dx * dx + dy * dy <= r * r) fb_px(cx + dx, cy + dy);
 }
 
-/* ---- 3x5 迷你字体（"0-9 : FPS"）——列式 glyph，bit0=顶行 ---- */
-static const uint8_t FONT_3X5_DIGIT[10][3] = {
-    {0x1F, 0x00, 0x1F},  /* 0 */
-    {0x10, 0x1F, 0x12},  /* 1 */
-    {0x1D, 0x15, 0x17},  /* 2 */
-    {0x1F, 0x15, 0x1B},  /* 3 */
-    {0x0E, 0x06, 0x07},  /* 4 */
-    {0x1F, 0x15, 0x15},  /* 5 */
-    {0x1F, 0x15, 0x1D},  /* 6 */
-    {0x1F, 0x00, 0x01},  /* 7 */
-    {0x1F, 0x15, 0x1F},  /* 8 */
-    {0x1F, 0x15, 0x1D},  /* 9 */
+/* ---- 5x7 点阵字体（"0-9 F"）——列式 glyph，bit0=顶行，5 列 × 7 行 ----
+ * v2.7.1：原 3x5 迷你字体在 128x64 屏上几乎看不清，改为 5x7 提升可读性。 */
+static const uint8_t FONT_5X7_DIGIT[10][5] = {
+    {0x3E, 0x41, 0x41, 0x41, 0x3E},  /* 0 */
+    {0x00, 0x02, 0x7F, 0x40, 0x00},  /* 1 */
+    {0x60, 0x51, 0x49, 0x47, 0x40},  /* 2 */
+    {0x08, 0x49, 0x49, 0x77, 0x08},  /* 3 */
+    {0x18, 0x14, 0x12, 0x79, 0x70},  /* 4 */
+    {0x47, 0x49, 0x49, 0x49, 0x79},  /* 5 */
+    {0x3E, 0x49, 0x49, 0x49, 0x31},  /* 6 */
+    {0x01, 0x01, 0x79, 0x07, 0x01},  /* 7 */
+    {0x3E, 0x41, 0x41, 0x41, 0x3E},  /* 8 */
+    {0x06, 0x49, 0x49, 0x49, 0x7E},  /* 9 */
 };
-#define FONT_W 3
-#define FONT_H 5
+/* 'F'（单位标记） */
+static const uint8_t FONT_5X7_F[5] = {0x7F, 0x09, 0x09, 0x01, 0x01};
+#define FONT_W 5
+#define FONT_H 7
+#define FONT_PITCH 6          /* 5 宽 + 1 间距 */
 
 /* 画数字串（十进制），返回字符数 */
 static int fb_num(int x, int y, uint32_t v)
@@ -175,11 +183,11 @@ static int fb_num(int x, int y, uint32_t v)
     if (v == 0) b[n++] = 0;
     while (v) { b[n++] = (char)(v % 10u); v /= 10u; }
     for (int i = n - 1; i >= 0; i--) {
-        const uint8_t *g = FONT_3X5_DIGIT[(int)b[i]];
-        for (int c = 0; c < 3; c++)
-            for (int r = 0; r < 5; r++)
+        const uint8_t *g = FONT_5X7_DIGIT[(int)b[i]];
+        for (int c = 0; c < FONT_W; c++)
+            for (int r = 0; r < FONT_H; r++)
                 if (g[c] & (1u << r)) fb_px(x + c, y + r);
-        x += 4;
+        x += FONT_PITCH;
     }
     return n;
 }
@@ -189,19 +197,19 @@ static void fb_fps_badge(uint32_t fps)
 {
     if (fps > 99u) fps = 99u;
     int digits = (fps >= 10u) ? 2 : 1;
-    int w = digits * 4 + 6;                     /* 边距2 + 数字×4 + F(3)+1 */
+    int w = digits * FONT_PITCH + FONT_W + 2;   /* 边距1 + 数字 + F + 边距1 */
     int x0 = SHOW_FB_COLS - w - 1, y0 = 1;
     for (int y = y0; y < y0 + FONT_H + 2; y++)
         for (int x = x0; x < x0 + w; x++)
             s_fb[y >> 3][x] &= (uint8_t)~(1u << (y & 7));
     fb_rect(x0, y0, w, FONT_H + 2);
-    int tx = x0 + 2;
+    int tx = x0 + 1;
     (void)fb_num(tx, y0 + 1, fps);
-    tx += digits * 4;
+    tx += digits * FONT_PITCH;
     {
-        const uint8_t gF[3] = {0x01, 0x05, 0x05};   /* F */
-        for (int c = 0; c < 3; c++)
-            for (int r = 0; r < 5; r++)
+        const uint8_t *gF = FONT_5X7_F;
+        for (int c = 0; c < FONT_W; c++)
+            for (int r = 0; r < FONT_H; r++)
                 if (gF[c] & (1u << r)) fb_px(tx + c, y0 + 1 + r);
     }
 }
