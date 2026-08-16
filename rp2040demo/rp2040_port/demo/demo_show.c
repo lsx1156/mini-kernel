@@ -503,8 +503,10 @@ static void show_task_spawn(void)
      * 栈帧 ~100B + timeout 检查器 + hal 层），shell.c 注释明确警告
      * "768 会溢出"，VT2 用 1536；show 渲染局部（px/py 各 64B）更深，
      * 取 2048。1024 实测溢出 → r5 恢复成 g_tick_interval_us(1000) →
-     * blx r5 跳 ROM 0x3E8 → HardFault（flash76 板上实测）。 */
-    g_show_task = task_create("show", task_show, NULL, 2048, 2);
+     * blx r5 跳 ROM 0x3E8 → HardFault（flash76 板上实测）。
+     * v2.7.1：绑定到 core1（task_create_on core=1），OLED 刷屏在核1跑，
+     * 把重负载 I2C/渲染从 core0 卸荷。core1 由 boot_setup 开机自动启动。 */
+    g_show_task = task_create_on("show", task_show, NULL, 2048, 2, 1);
 }
 
 /* demo_app_init 调用（调度器启动前）：config 决定是否自动运行 */

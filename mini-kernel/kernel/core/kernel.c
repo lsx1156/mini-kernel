@@ -140,10 +140,11 @@ static void _boot_setup_task(void *arg) {
      * (vtable 中 TIMER_IRQ_0 仍是 __unhandled_user_irq)。 */
     hal_systick_init(OS_CFG_TICK_HZ);
 
-    /* — Step 1.5: 记入多核意图（config_mcore_apply 已把 flag 置位）。
-     * 【临时策略】不在 boot 自动启动 core1：core1 启动会引发内存损坏/乱码，
-     * 改为由 `mcore demo` 命令显式启动，避免固化了 mcore=1 就开机即崩、
-     * 无法进 shell 恢复。诊断稳定后再恢复 boot 自动启动。 */
+    /* — Step 1.5: 自动启动 core1 调度器。
+     * v2.7.1：把 OLED 刷屏(show)任务绑定到 core1 后，core1 必须在 boot
+     * 阶段就运行，show 任务才会被 core1 调度。此时在 create(show) 之前
+     * 拉起 core1：core1_scheduler_entry 会为 core1 配置独立 systick
+     * (ALARM1+TIMER_IRQ_1) 并跑 sched_start()，从 core1 就绪队列选任务。 */
 
     /* — Step 2.5: 等控制台（USB CDC）枚举完成（最多 2s），确保开机 banner 能
      * 通过 USB 输出。等待期间让出 CPU，idle 任务跑 hal_usb_poll → tud_task
@@ -162,6 +163,14 @@ static void _boot_setup_task(void *arg) {
         for (int i = 0; i < 60; i++) hal_console_putc('=');
         hal_console_putc('\r'); hal_console_putc('\n');
     }
+
+    /* — Step 2.6: 自动启动 core1 调度器（须在 demo_app_init 创建 show 任务之前）。
+     *   core1_scheduler_entry 为 core1 配置独立 systick(ALARM1+TIMER_IRQ_1)
+     *   并跑 sched_start()，从 core1 就绪队列选任务。core1 空闲时纯忙等，
+     *   不触碰 USB/TinyUSB（仅 core0 的 idle 负责 hal_usb_poll）。 */
+#if OS_CFG_MULTICORE
+    hal_mcore_start();
+#endif
 
     /* — Step 3: Demo 应用初始化（创建 led / heartbeat / mem / ctrl + shell） — */
     if (&demo_app_init != NULL) {

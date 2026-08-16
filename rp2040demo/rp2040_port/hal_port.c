@@ -1197,15 +1197,15 @@ static void __attribute__((noreturn)) core1_scheduler_entry(void) {
     while (1) { }
 }
 
-/* 多核启动请求标志：config_mcore_apply 只记录（固化语义），
- * 实际启动由 `mcore demo` 命令调用 hal_mcore_start() 显式执行。 */
+/* 多核启动请求标志：config_mcore_apply 只记录（固化语义）。 */
 static volatile int g_mcore_requested = 0;
 void config_mcore_apply(bool enable) {
     g_mcore_requested = enable ? 1 : 0;
 }
 void hal_mcore_start(void) {
-    /* TODO(多核诊断)：core1 启动当前会引发内存损坏/乱码，先只允许
-     * 通过 mcore demo 显式启动；boot 不自动启动。 */
+    /* v2.7.1：boot_setup 开机自动启动 core1（配合 show 任务绑定核1）。
+     * core1_scheduler_entry 为 core1 配置独立 systick 并跑 sched_start()，
+     * 从 core1 就绪队列选任务。仅 core0 调用（内部二次校验）。 */
     if (hal_core_id() == 0) {
         multicore_launch_core1(core1_scheduler_entry);
     }
