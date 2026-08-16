@@ -1,14 +1,14 @@
 @echo off
 REM ================================================================
-REM  Mini Kernel Build / Flash Script for RP2040
-REM  (Safe version: always pauses, writes full log, escapes pitfalls)
+REM  Mini Kernel - Pure Static Library Build Script
 REM
 REM  Usage:
 REM    build.bat              Build incrementally
 REM    build.bat clean        Delete build/ then reconfigure + build
-REM    build.bat flash        Build + auto-flash (Pico in BOOTSEL)
-REM    build.bat just-flash   Skip compile, only flash (BOOTSEL)
 REM    build.bat /nowait      Do not pause at the end (scripted use)
+REM
+REM  NOTE: This is a pure kernel STATIC LIBRARY (no firmware/UF2).
+REM  To build the RP2040 firmware, use rp2040demo/build.bat.
 REM ================================================================
 setlocal
 
@@ -16,13 +16,10 @@ set "ARG1=%1"
 set "ARG2=%2"
 
 set "DO_CLEAN=0"
-set "DO_FLASH=0"
 set "SKIP_BUILD=0"
 set "NO_WAIT=0"
 
 if /i "%ARG1%"=="clean"        set DO_CLEAN=1
-if /i "%ARG1%"=="flash"        set DO_FLASH=1
-if /i "%ARG1%"=="just-flash" ( set DO_FLASH=1 & set SKIP_BUILD=1 )
 if /i "%ARG1%"=="/nowait"      set NO_WAIT=1
 if /i "%ARG2%"=="/nowait"      set NO_WAIT=1
 
@@ -32,10 +29,10 @@ set "TOOLCHAIN_BIN=C:\Users\master\.platformio\packages\toolchain-gccarmnoneeabi
 set "CMAKE_BIN=C:\Program Files\CMake\bin"
 set "NINJA_BIN=C:\Users\master\AppData\Local\Programs\Python\Python312\Scripts"
 set "PROJECT_ROOT=%~dp0"
-REM strip trailing backslash from %~dp0 so -S "%PROJECT_ROOT%" does not escape the quote
 if "%PROJECT_ROOT:~-1%"=="\" set "PROJECT_ROOT=%PROJECT_ROOT:~0,-1%"
 set "BUILD_DIR=%PROJECT_ROOT%\build"
-set "UF2=%BUILD_DIR%\mini_kernel.uf2"
+set "KERNEL_A=%BUILD_DIR%\libkernel_core.a"
+set "SHELL_A=%BUILD_DIR%\libshell_module.a"
 set "TOOLCHAIN_FILE=%PROJECT_ROOT%\toolchain-arm-none-eabi.cmake"
 set "LOG=%BUILD_DIR%\build.log"
 
@@ -44,7 +41,7 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
 REM -------- Start log --------
 >  "%LOG%" echo ================================================================
->> "%LOG%" echo Mini Kernel Build Run - %date% %time%
+>> "%LOG%" echo Mini Kernel Pure Library Build Run - %date% %time%
 >> "%LOG%" echo Args = [%ARG1%] [%ARG2%]
 >> "%LOG%" echo ================================================================
 
@@ -87,72 +84,27 @@ call :RUN_CMAKE_BUILD
 if errorlevel 1 goto FAIL
 :after_build
 
-REM -------- Artifact check --------
-if not exist "%UF2%" (
-    >> "%LOG%" echo ERROR: UF2 missing - %UF2%
+REM -------- Artifact check (static library outputs) --------
+if not exist "%KERNEL_A%" (
+    >> "%LOG%" echo ERROR: kernel_core library missing - %KERNEL_A%
     goto FAIL
 )
-for %%F in ("%UF2%") do >> "%LOG%" echo BUILD OK - UF2 %%~zF bytes @ %%~fF
-
-REM -------- Flash step --------
-if %DO_FLASH% NEQ 1 goto OK
-
->> "%LOG%" echo.
->> "%LOG%" echo [FLASH] Scanning drives for Pico BOOTSEL marker INFO_UF2.TXT
-set DFOUND=
-if exist "C:\INFO_UF2.TXT" set DFOUND=C:
-if not defined DFOUND if exist "D:\INFO_UF2.TXT" set DFOUND=D:
-if not defined DFOUND if exist "E:\INFO_UF2.TXT" set DFOUND=E:
-if not defined DFOUND if exist "F:\INFO_UF2.TXT" set DFOUND=F:
-if not defined DFOUND if exist "G:\INFO_UF2.TXT" set DFOUND=G:
-if not defined DFOUND if exist "H:\INFO_UF2.TXT" set DFOUND=H:
-if not defined DFOUND if exist "I:\INFO_UF2.TXT" set DFOUND=I:
-if not defined DFOUND if exist "J:\INFO_UF2.TXT" set DFOUND=J:
-if not defined DFOUND if exist "K:\INFO_UF2.TXT" set DFOUND=K:
-if not defined DFOUND if exist "L:\INFO_UF2.TXT" set DFOUND=L:
-if not defined DFOUND if exist "M:\INFO_UF2.TXT" set DFOUND=M:
-if not defined DFOUND if exist "N:\INFO_UF2.TXT" set DFOUND=N:
-if not defined DFOUND if exist "O:\INFO_UF2.TXT" set DFOUND=O:
-if not defined DFOUND if exist "P:\INFO_UF2.TXT" set DFOUND=P:
-if not defined DFOUND if exist "Q:\INFO_UF2.TXT" set DFOUND=Q:
-if not defined DFOUND if exist "R:\INFO_UF2.TXT" set DFOUND=R:
-if not defined DFOUND if exist "S:\INFO_UF2.TXT" set DFOUND=S:
-if not defined DFOUND if exist "T:\INFO_UF2.TXT" set DFOUND=T:
-if not defined DFOUND if exist "U:\INFO_UF2.TXT" set DFOUND=U:
-if not defined DFOUND if exist "V:\INFO_UF2.TXT" set DFOUND=V:
-if not defined DFOUND if exist "W:\INFO_UF2.TXT" set DFOUND=W:
-if not defined DFOUND if exist "X:\INFO_UF2.TXT" set DFOUND=X:
-if not defined DFOUND if exist "Y:\INFO_UF2.TXT" set DFOUND=Y:
-if not defined DFOUND if exist "Z:\INFO_UF2.TXT" set DFOUND=Z:
-
-if not defined DFOUND (
-    >> "%LOG%" echo FLASH WARN: No Pico BOOTSEL drive detected.
-    >> "%LOG%" echo Fix: unplug - hold BOOTSEL - replug USB - run 'build.bat flash' again.
-    goto OK
+for %%F in ("%KERNEL_A%") do >> "%LOG%" echo BUILD OK - kernel_core.a %%~zF bytes @ %%~fF
+if exist "%SHELL_A%" (
+    for %%F in ("%SHELL_A%") do >> "%LOG%" echo BUILD OK - shell_module.a %%~zF bytes @ %%~fF
+) else (
+    >> "%LOG%" echo BUILD OK - shell_module disabled (OS_CFG_SHELL=0)
 )
-
->> "%LOG%" echo FLASH: drive = %DFOUND%
-copy /y "%UF2%" "%DFOUND%\" >> "%LOG%" 2>&1
-if errorlevel 1 (
-    >> "%LOG%" echo FLASH ERROR: copy failed - Pico may have rebooted early.
-    goto FAIL
-)
->> "%LOG%" echo FLASH OK. Pico will reboot in ~1 second.
 
 goto OK
-
 
 :FAIL
 echo. >> "%LOG%"
 echo ################  FAILED  ################ >> "%LOG%"
 echo.
-echo ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-echo ^>^>  BUILD / FLASH FAILED
+echo ^>^>  BUILD FAILED
 echo ^>^>  Full log = %LOG%
-echo vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
 call :TAIL "%LOG%" 25
-echo ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-echo.
 if %NO_WAIT%==0 (
     echo Press any key to close...
     pause >nul
@@ -164,10 +116,9 @@ echo.
 echo ================================================================
 echo  SUCCESS
 echo   Log file : %LOG%
-echo   UF2      : %UF2%
-if %DO_FLASH%==1 (
-    echo   Flash op : executed ^(check log for drive/result^)
-)
+echo   Library  : %KERNEL_A%
+if exist "%SHELL_A%" echo   Library  : %SHELL_A%
+echo   (pure static kernel library; build firmware via rp2040demo)
 echo ================================================================
 echo.
 if %NO_WAIT%==0 (
@@ -182,9 +133,8 @@ REM ================== subroutines ==================
 
 :RUN_CMAKE_CONFIG
 >> "%LOG%" echo [CONFIG] cmake configure
-set "CFG_CMD=cmake.exe -S "%PROJECT_ROOT%" -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN_FILE% -DPICO_SDK_PATH=%PICO_SDK_PATH%"
->> "%LOG%" echo %CFG_CMD%
-%CFG_CMD% >> "%LOG%" 2>&1
+>> "%LOG%" echo cmake -S "%PROJECT_ROOT%" -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN_FILE%" -DPICO_SDK_PATH="%PICO_SDK_PATH%"
+cmake.exe -S "%PROJECT_ROOT%" -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN_FILE%" -DPICO_SDK_PATH="%PICO_SDK_PATH%" >> "%LOG%" 2>&1
 exit /b %errorlevel%
 
 :RUN_CMAKE_BUILD

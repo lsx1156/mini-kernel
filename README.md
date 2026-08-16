@@ -1,21 +1,21 @@
 # Mini Kernel · Project Repository（GitHub 仓库根入口）
 
 > **GitHub 仓库地址**：[lsx1156/mini-kernel](https://github.com/lsx1156/mini-kernel)
-> **当前版本**：v2.3.6 · 2026-08
+> **当前版本**：v2.5 · 2026-08
 > **项目性质**：**轻量分时通用 32 位 MCU 内核**（协作式多任务，非 RTOS；非抢占、无优先级、不承诺硬实时）
+>
+> 📖 **指令说明书（Shell 命令手册）**：[指令说明书.md](./指令说明书.md)
+>
+> 🟢 **v2.5 更新：两版本分离（内核库纯净化）**
+> · **mini-kernel** 改为**可移植纯静态库**（只导出 `kernel_core.a` / `shell_module.a`），平台无关、不链接 Pico SDK，可移植到其它 MCU
+> · **rp2040demo** 为独立目标工程，编译 `rp2040_port` 移植层并产出 `.uf2` 固件
+> · 两版本各自有独立 `os_config.h`；RP2040 专属功能（超频/多核/MSC/FatFs/bootscript/vtest 等）用总开关 `OS_CFG_PORT_RP2040` 隔离，纯库编译为空
+> · 新增**指令说明书**：完整收录全部 Shell 命令（基础 + RP2040 专属）
 >
 > 🟢 **v2.3.6 更新：根治 >30 次轮询崩溃（I2C 单事务原子性）**
 > · **根因**：VT3 每 10s 对 VT2 做 `task_suspend/resume`，若 VT2 恰在 `i2c_write_timeout_us` 中途被挂起 3s，SDK 的 200ms 超时是"调用起点算起的绝对截止"，恢复后立即判超时 → `HAL_ERR_IO` → 反复 `reinit` 复位外设，累积约 30 轮后触发 HardFault
 > · **修复**：用 PRIMASK 临界区包住"单次 I2C 事务"（`VT2` 的 `set_addr`/`write_block`），使 PendSV 上下文切换无法打断一次 START..STOP 事务，VT2 永不带着过期截止指针被挂起（400kHz 下单次最多约 3ms 关中断）
 > · 该修复同时消除"屏幕刷新错误随轮询次数递增"的现象
->
-> 🟢 **v2.2.7 更新：OLED 底层驱动重构 + 调度权重可调**
-> · 重构 0.96" I2C OLED 最底层驱动：命令/数据统一走 16 位 I2C 编码（Co 控制字节），`set_addr` 旧式寻址 + 列偏移，`write_block` 数据块写入，与网上通用 0.96 驱动写法对齐
-> · 驱动缓冲全部移出任务栈（BSS 静态），消除栈帧指针错乱导致的 HardFault
-> · I2C 事务失败自动重试 + `hal_i2c_init` 外设复位重试，解决 VT3 suspend/resume 打断白帧刷新
-> · I2C 时钟 100kHz → 400kHz，刷新提速 4 倍
-> · VT2 权重 1 → 8（时间片 5ms → 40ms），整帧在一个时间片内连续跑完，肉眼看瞬间整屏刷新（消除逐行扫描）
-> · `help` 新增"调度说明"：解释 weight=时间片倍数、非抢占、无优先级
 >
 > ✅ **已知问题状态**：~~应用层轮询连续超过 30 次 HardFault 崩溃风险~~ → **v2.3.6 已修复**（I2C 单事务原子性）
 > · 使用教程详见 [mini-kernel/README.md § 完整使用教程 + vtest 案例分析](./mini-kernel/README.md#-完整使用教程linux-man-风格)
@@ -43,42 +43,38 @@
 ```
 project/                          ← 本仓库根目录（单仓 · monorepo）
 │
-├── mini-kernel/                  📚 【可移植内核库】——对外提供的纯 C + 移植汇编内核
-│   │                               （硬件无关代码 100% 在这；RP2040 demo 通过的所有 Bug 修复
-│   │                                 全部同步回此目录，rp2040demo/ 不维护任何内核副本）
+├── mini-kernel/                  📚 【可移植纯内核库】——平台无关的通用内核（静态库）
+│   │                               （只含纯 C 调度核心 + 基础 Shell；不含任何 RP2040 文件）
 │   │
-│   ├── include/                  对外头文件入口
-│   │   ├── os_config.h           ✂️ 内核裁剪宏（开/关功能用这个）
-│   │   ├── hal/                  HAL 统一接口（移植新 MCU 时实现）
-│   │   │   └── flash_layout.h    Flash 三分区布局宏定义（1MiB FW / 1012KiB MSC / 8KiB Bootscript）
-│   │   └── kernel.h              用户态唯一 API 入口（os_task_create / os_time_dly_ms 等）
+│   ├── include/
+│   │   ├── os_config.h           ✂️ 内核裁剪宏（纯库配置：RP2040 功能全 0）
+│   │   ├── hal/hal_interface.h   HAL 统一接口（移植新 MCU 时实现 hal_port）
+│   │   └── kernel.h              用户态 API 入口
 │   │
-│   ├── kernel/                   内核核心 + 可裁剪扩展模块（100% 硬件无关，可移植）
-│   │   ├── core/                 kernel.c / sched.c / task.c / mem/heap.c（最底层核心）
+│   ├── kernel/
+│   │   ├── core/                 kernel.c / sched.c / task.c / mem.c（最底层核心）
 │   │   ├── syscall/              SVC 异常契约表（X-Macro 静态生成）
-│   │   ├── modules/shell/        交互式 Shell（命令 + 文件系统目录命令）
-│   │   ├── modules/fatfs_shim/   FatFs 适配层（含 f_mkfs 实现、Flash HAL 读写、单写者互斥）
-│   │   ├── modules/periph/       外设服务（GPIO / SPI / I2C / UART，按 OS_CFG 裁剪）
-│   │   └── examples/builtin_demo/ 可选示例任务（LED/心跳/bootscript 执行）
+│   │   └── modules/shell/        基础 Shell（help/ps/heap/... + 扩展命令注册）
 │   │
-│   ├── port/                     🔌 硬件移植层（每款 MCU 一个子目录；当前已实现 rp2040/）
-│   │   └── rp2040/
-│   │       ├── context_switch.S  Cortex-M0+ SVC + PendSV 上下文切换（r4-r11 完整保存）
-│   │       ├── hal_impl.c        HAL Flash / Time / Uart 具体实现
-│   │       └── msc_usb.c         USB Composite（CDC 串口 + MSC U 盘）描述符 + SCSI 回调
-│   │
-│   ├── tests/                    单元测试 + 诊断固件（可选）
-│   ├── cmake/check_size.cmake    体积红线检查脚本（内核本体 Flash ≤ 20KB / RAM ≤ 8KB）
-│   ├── README.md                 📖 **完整详细文档请点这里**（特性表/命令手册/架构/移植指南）
-│   └── CMakeLists.txt            mini-kernel 作为 CMake 静态库的构建
+│   ├── tests/                    单元测试
+│   ├── cmake/check_size.cmake    体积红线检查脚本
+│   ├── README.md                 详细文档（特性表/架构/移植指南）
+│   └── CMakeLists.txt            纯静态库构建（导出 kernel_core / shell_module）
 │
-└── rp2040demo/                   🛠️ 【RP2040 演示平台】——真正烧录到 RP2040 的示例工程
-    │                               （用 add_subdirectory(../mini-kernel) 直接引用内核库，
-    │                                 + Pico SDK；产生可拖拽的 .uf2 固件）
-    ├── src/main.c                应用入口（强符号 main() 覆盖内核的弱 main）
+└── rp2040demo/                   🛠️ 【RP2040 目标工程】——真正烧录到 RP2040 的示例固件
+    │                               （通过 add_subdirectory(../mini-kernel) 引用内核库 + Pico SDK）
+    ├── src/main.c                应用入口（main() → kernel_main()）
+    ├── os_config.h               本工程专属裁剪配置（RP2040 功能全开）
+    ├── rp2040_port/              🔌 RP2040 移植层（全部 RP2040 专属代码）
+    │   ├── hal_port.c             HAL 实现 + USB/Timer/GPIO/Flash 驱动
+    │   ├── context_switch.S       Cortex-M0+ SVC + PendSV 上下文切换
+    │   ├── msc_usb.c / msc_blockdev.c   USB Composite(CDC+MSC) + 块设备
+    │   ├── include/hal/           config_store.h / sysclk.h / flash_layout.h
+    │   ├── kernel/                config_store.c / diskio.c / FatFs 配置
+    │   ├── shell/                 bootscript.c / shell_fs.c / shell_mcore.c / shell_ovclk.c
+    │   └── demo/demo_app.c        演示任务（LED/心跳/vtest 等）
     ├── CMakeLists.txt
-    ├── build.bat                 Windows 一键构建（会自动拉 Pico SDK + 生成 uf2）
-    └── build/rp2040demo.uf2      构建产物（烧录用）
+    └── build.bat                 Windows 一键构建（产出 .uf2 固件）
 ```
 
 ---
@@ -102,10 +98,11 @@ cd rp2040demo
 
 | 版本 | 状态 | 关键词 |
 |---|---|---|
-| v2.2.7 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **OLED 底层驱动重构**（16 位 I2C 编码 + 旧式寻址 + 列偏移）+ 权重驱动刷屏提速 + help 调度说明；⚠️ 已知问题：>30 次轮询有崩溃风险（排查中） |
-| v2.2.6 | ✅ 已发布历史 | 🟢 **调度系统完全正常**：boot_setup "复活" Bug 修复 + Shell 栈溢出修复；状态机/队列契约 100% 合规 |
-| v2.2.x | ✅ 已发布历史 | v2.2.0~v2.2.4：三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / 诊断闪灯 / mkfs 实现 / ALARM3 tick 修复 |
-| v2.3 | 📅 规划中（下一版） | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp 复制 / mv 重命名） |
+| v2.5 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **两版本分离（内核库纯净化）**：mini-kernel 改为可移植纯静态库；rp2040demo 独立编译 `rp2040_port`；`OS_CFG_PORT_RP2040` 总开关隔离；新增指令说明书 |
+| v2.4 | ✅ 已发布历史 | 🟢 超频档位/任意 MHz + 多核基础 + 固化配置 + 开机日志回放 |
+| v2.3.x | ✅ 已发布历史 | 🟢 OLED 底层驱动重构 + I2C 单事务原子性（根治 >30 次轮询崩溃）+ 权重刷屏提速 + help 调度说明 |
+| v2.2.x | ✅ 已发布历史 | 🟢 调度系统完全正常 / 三分区 Flash / Composite USB(CDC+MSC) / FatFs 目录命令 / Bootscript 固化 / mkfs 实现 / ALARM3 tick 修复 |
+| v2.3+ | 📅 规划中 | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp / mv） |
 | v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |
 | v3.5 | 📅 远期规划 | RP2350 多核（SMP）+ RISC-V（CH32V/bl702）移植 |
 
@@ -115,15 +112,18 @@ cd rp2040demo
 
 | 文档/文件 | 链接 |
 |---|---|
+| 📖 **指令说明书（Shell 命令手册）** | [指令说明书.md](./指令说明书.md) |
 | 📖 完整详细主文档（必看）| [mini-kernel/README.md](./mini-kernel/README.md) |
-| 🧩 裁剪宏总开关 | [mini-kernel/include/os_config.h](./mini-kernel/include/os_config.h) |
-| 🧠 内核主入口（启动顺序+FatFs自动初始化）| [mini-kernel/kernel/core/kernel.c](./mini-kernel/kernel/core/kernel.c) |
+| 🧩 纯库裁剪宏总开关 | [mini-kernel/include/os_config.h](./mini-kernel/include/os_config.h) |
+| 🧩 rp2040demo 裁剪宏 | [rp2040demo/os_config.h](./rp2040demo/os_config.h) |
+| 🧠 内核主入口 | [mini-kernel/kernel/core/kernel.c](./mini-kernel/kernel/core/kernel.c) |
 | 🔄 调度器（非抢占 FIFO + 时间片） | [mini-kernel/kernel/core/sched.c](./mini-kernel/kernel/core/sched.c) |
-| 🔀 Cortex-M0+ 上下文切换（SVC+PendSV） | [mini-kernel/port/rp2040/context_switch.S](./mini-kernel/port/rp2040/context_switch.S) |
-| 💾 Flash 三分区布局宏 | [mini-kernel/include/hal/flash_layout.h](./mini-kernel/include/hal/flash_layout.h) |
-| 🔌 USB Composite (CDC+MSC) 描述符 | [mini-kernel/port/rp2040/msc_usb.c](./mini-kernel/port/rp2040/msc_usb.c) |
-| 🐚 Shell 文件系统目录命令（ls/cd/pwd/mkdir） | [mini-kernel/kernel/modules/shell/shell_fs.c](./mini-kernel/kernel/modules/shell/shell_fs.c) |
+| 🔀 Cortex-M0+ 上下文切换（SVC+PendSV） | [rp2040demo/rp2040_port/context_switch.S](./rp2040demo/rp2040_port/context_switch.S) |
+| 🔌 USB Composite (CDC+MSC) 描述符 | [rp2040demo/rp2040_port/msc_usb.c](./rp2040demo/rp2040_port/msc_usb.c) |
+| 🐚 Shell 文件系统目录命令（ls/cd/pwd/mkdir） | [rp2040demo/rp2040_port/shell/shell_fs.c](./rp2040demo/rp2040_port/shell/shell_fs.c) |
+| ⚡ 超频/多核命令 | [rp2040demo/rp2040_port/shell/shell_ovclk.c](./rp2040demo/rp2040_port/shell/shell_ovclk.c) |
 | 🛠️ 一键构建脚本（RP2040 演示固件） | [rp2040demo/build.bat](./rp2040demo/build.bat) |
+| 🛠️ 纯内核库构建脚本 | [mini-kernel/build.bat](./mini-kernel/build.bat) |
 
 ---
 

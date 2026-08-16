@@ -173,10 +173,23 @@ uint32_t hal_mcore_core1_ticks(void); /* 诊断：core1 产生的 tick 计数 */
 
 /* 开机日志缓存回放（v2.4.3）：
  *   启动阶段 hal_console_putc 的输出会被移植层同步捕获进 RAM 缓冲；
- *   内核在启动流程结束（sched_start 前）调用 hal_bootlog_end() 停止捕获。
- *   之后若主机（如 USB 终端）迟于启动才连接，移植层检测到连接时会把
- *   缓存的完整开机日志回放一遍，保证"无论何时打开终端都能看到开机画面"。 */
+ *   内核在启动流程真正结束（_boot_setup_task 末尾，sched_start 之后）
+ *   调用 hal_bootlog_end() 停止捕获。之后若主机（如 USB 终端）迟于启动
+ *   才连接，移植层检测到连接时会把缓存的完整开机日志回放一遍，保证
+ *   "无论何时打开终端都能看到开机画面"。 */
 void hal_bootlog_end(void);
+
+/* 开机日志回放诊断（v2.4.3，供 shell `bootlog` 命令） */
+uint32_t hal_bootlog_captured(void);  /* 已捕获字节数（0 = 缓存为空/未捕获到） */
+uint32_t hal_bootlog_replayed(void);  /* 是否已回放过（0/1） */
+uint32_t hal_bootlog_capturing(void); /* 是否仍在捕获（启动流程未结束） */
+uint32_t hal_bootlog_dtr_prev(void);  /* 最近一次检测到的 CDC DTR 状态 */
+
+/* 由 shell 任务（栈 2048B）调用：设备就绪后满 3 秒才回放开机日志。
+ * 【v2.4.3-fix】回放绝不能放在 idle 任务里执行——idle 栈仅 1024B，
+ * 回放深 USB 输出链会击穿栈底 MAGIC → idle 行为异常 → 串口 dump 内存乱码。
+ * 返回 0 = 未到期/未就绪/已回放；1 = 本次刚执行回放。 */
+uint32_t hal_bootlog_try_replay(void);
 
 /* 早期诊断输出：在调度器启动前（sched_start 之前）也必须可用。
  *   · hal_diag_init()  初始化早期诊断通道（如 UART0 115200）

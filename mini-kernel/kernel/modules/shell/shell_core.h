@@ -15,6 +15,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "os_config.h"   /* OS_CFG_OVCLK / OS_CFG_MULTICORE 裁剪宏 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,9 +53,15 @@ void    shell_puts(shell_ctx_t *ctx, const char *s);
 int     shell_snprintf(char *buf, size_t bufsz, const char *fmt, ...);
 
 /* ---------- 初始化钩子（由 shell.c 在启动 banner 前调用）---------- */
-void shell_fs_register(void);      /* 定义在 shell_fs.c（注册 msc/ls/cd/...） */
-void shell_ovclk_register(void);   /* 定义在 shell_ovclk.c（注册 ovclk） */
-void shell_mcore_register(void);   /* 定义在 shell_mcore.c（注册 mcore） */
+#if OS_CFG_PORT_RP2040
+void shell_fs_register(void);      /* 定义在 shell_fs.c（注册 msc/ls/cd/...），RP2040 专属 */
+#endif
+#if OS_CFG_OVCLK
+void shell_ovclk_register(void);   /* 定义在 shell_ovclk.c（注册 ovclk，RP2040 专属） */
+#endif
+#if OS_CFG_MULTICORE
+void shell_mcore_register(void);   /* 定义在 shell_mcore.c（注册 mcore，RP2040 专属） */
+#endif
 
 #ifdef __cplusplus
 }

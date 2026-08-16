@@ -456,7 +456,7 @@ typedef struct {
 
 ```
 1. 轮询驱动 hal_usb_poll()：
-   ├─ 仅当 INTE==0 时恢复（先 dcd_int_enable，失败再写安全掩码 0x0009004D）
+   ├─ 仅当 INTE==0 时恢复（先 dcd_int_enable，失败再写安全掩码 0x0001F010）
    ├─ _snapshot_setup_if_pending() 抓 SETUP 包
    ├─ dcd_int_handler(0) 处理挂起中断（处理 CDC SET_LINE_CODING 等 Control Request）
    ├─ tud_task_ext(0,0) 驱动 TinyUSB 状态机
@@ -472,9 +472,13 @@ typedef struct {
 3. idle 任务每 1ms 调用一次 hal_usb_poll()，确保 CDC OUT 数据不堆积
 ```
 
-> **【安全掩码 0x0009004D】** 只用 TinyUSB 有 ack 代码的中断位：
-> STALL_STATUS(bit0) | BUFF_STATUS(bit2) | ERROR(bit3) | EP0_SETUP_REQ(bit6) | BUS_RESET(bit16) | RESUME(bit19)
-> **禁止** SOF(bit3) 等未处理的位，否则 CPU 100% 跑 USB 中断死循环。
+> **【安全掩码 0x0001F010】** 只用 TinyUSB 的 `dcd_rp2040_irq` 有 ack 代码的中断位：
+> BUFF_STATUS(bit4) | BUS_RESET(bit12) | DEV_CONN_DIS(bit13) | DEV_SUSPEND(bit14) | DEV_RESUME(bit15) | SETUP_REQ(bit16)
+> **禁止** DEV_SOF / EP_STALL_NAK / ERROR 等位，否则：SOF 占满 CPU 死循环，或
+> NAK/ERROR 位未被 `dcd_rp2040_irq` 处理 → `panic("Unhandled IRQ 0x%x")`。
+> （v2.4.3-fix：旧掩码 0x0009004D 位号全错——把 HOST_CONN_DIS/HOST_SOF/TRANS_COMPLETE/
+> ERROR_RX_TIMEOUT/EP_STALL_NAK 误当成 STALL_STATUS/BUFF_STATUS/ERROR/EP0_SETUP_REQ/BUS_RESET/
+> RESUME，导致设备 NAK 时 PANIC，且漏开 BUFF_STATUS 使 CDC IN 完成中断收不到。）
 
 #### 5.2.3 板载 Flash 操作 (W25Q16JV 2MB)
 
@@ -861,7 +865,7 @@ len=0xFF 表示数组结束
 | 编号 | 机制 | 代码位置 | 防止的卡死场景 |
 |------|------|---------|--------------|
 | 9.5.1 | **条件式 INTE 恢复：仅 INTE==0 才干预** | [hal_port.c#L354-L372](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L354-L372) | 不覆盖 TinyUSB 自身正常管理的 INTE 值，避免竞争；只有 dcd_int_disable() 被抢占未配对恢复时才兜底 |
-| 9.5.2 | **安全掩码 0x0009004D，不含 SOF** | [hal_port.c#L312-L316](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L312-L316) | 避免 SOF 等未处理中断位 → CPU 100% 跑 USB IRQ 死循环 → 其他任务抢不到时间片 → 启动画面截断卡死 |
+| 9.5.2 | **安全掩码 0x0001F010，不含 SOF** | [hal_port.c#L387-L407](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L387-L407) | 只含 TinyUSB 有 ack 代码的位：避免 SOF 占满 CPU 死循环 + 避免 EP_STALL_NAK/ERROR 等未处理位触发 `Unhandled IRQ` PANIC（v2.4.3-fix 修正旧 0x0009004D 位号错误） |
 | 9.5.3 | **SETUP/Control Request 必须同步处理** | [hal_port.c#L293-L310](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L293-L310) | PuTTY 打开串口时 Windows 发 SET_LINE_CODING + SET_CONTROL_LINE_STATE → 若不应答则 CDC 不就绪 → **绝不向 EP1 OUT 发任何数据包** → Shell 输入永远空 |
 | 9.5.4 | **绕过 TinyUSB 接收层，直接读 EP1 OUT 硬件端点** | [hal_port.c#L234-L289](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L234-L289) | 终极兜底：即使 TinyUSB 内部状态机完全异常，也能从 DPRAM → 私有 ring buffer 取字节 |
 | 9.5.5 | **私有 ring buffer 128B + 临界区保护** | [hal_port.c#L221-L289](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c#L221-L289) | 生产者 (EP1 drain) 和消费者 (getc) 多任务下 head/tail 不原子 → 关中断保护，防止数据丢失 |
@@ -1260,7 +1264,10 @@ Log file: e:\ppCD\project\mini-kernel\build\build.log
 ### 15.6 开机日志缓存回放（[hal_port.c](file:///e:/ppCD/project/mini-kernel/port/rp2040/hal_port.c)）
 
 * 启动阶段（`sched_start` 之后到 `_boot_setup_task` 末尾 `hal_bootlog_end()`）`hal_console_putc` 输出同步捕获进 2KB RAM 缓冲。
-* `hal_usb_poll` 解析 CDC `SET_CONTROL_LINE_STATE(0x21/0x22)` 的 **DTR 上升沿**（= 用户刚打开终端）→ 回放完整开机日志。
+* `hal_usb_poll` 解析 CDC `SET_CONTROL_LINE_STATE(0x21/0x22)` 的 **DTR 上升沿**（= 用户刚打开终端）→ 记录就绪时刻。
+* **回放由 shell 任务驱动**（`hal_bootlog_try_replay()`，设备就绪后满 3 秒执行），**绝不在 idle 任务里回放**：
+  idle 栈仅 1024B，回放深输出链（`hal_console_putc → putchar_raw → stdio_usb_out_chars → tud_cdc_n_write`）需 ~2048B 栈，
+  在 idle 里跑会击穿栈底 MAGIC → idle 行为异常 → 串口 dump 内存乱码（症状：FAT 扇区 / task 名 / 内存内容被 dump）。
 * 配合 `PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000`（1s 半阻塞）→ 迟开终端也能看到完整开机画面。
 
 ### 15.7 已知限制（超频稳定性）

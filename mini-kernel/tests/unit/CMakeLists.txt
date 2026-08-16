@@ -36,7 +36,6 @@ target_include_directories(unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include/hal
     ${CMAKE_SOURCE_DIR}/kernel/core
     ${CMAKE_SOURCE_DIR}/kernel/syscall
-    ${CMAKE_SOURCE_DIR}/port/rp2040
 )
 
 target_compile_definitions(unit_tests PRIVATE

@@ -1,18 +1,19 @@
 cmake_minimum_required(VERSION 3.13)
 
 # ================================================================
-#  RP2040 Demo 独立工程 —— 使用 mini-kernel 作为内核静态库
+#  RP2040 Demo 独立工程（v2.5 两版本分离后）
 #
 #  目录设计（project/ 作为 git 单仓根）：
-#    rp2040demo/        应用层（本工程）
-#      ├ src/main.c      main()，调用 kernel_main() 起内核
-#      └ build.bat       一键构建脚本
-#    mini-kernel/       内核库（平级兄弟目录）
-#      └ CMakeLists.txt 导出 kernel_core / hal_port / shell_module 等 target
+#    rp2040demo/            应用层（本工程）
+#      ├ src/main.c         main()，调用 kernel_main() 起内核
+#      ├ os_config.h        本工程专属裁剪配置（启用心全部 RP2040 功能）
+#      ├ rp2040_port/       RP2040 移植层（hal_port / context_switch / msc /
+#      │                      config_store / sysclk / FatFs diskio / bootscript /
+#      │                      shell_fs / shell_mcore / shell_ovclk / demo_app）
+#      └ build.bat          一键构建脚本
+#    mini-kernel/           纯净内核库（平台无关，只导出 kernel_core / shell_module）
 #
-#  PICO SDK 初始化必须在 project() 之前 — 这是 Pico SDK 官方强制顺序，
-#  否则会丢掉 -mcpu=cortex-m0plus -mthumb 等关键 flags，最终导致
-#  hardware/sync.h 中的 PRIMASK/cpsid 指令无法通过汇编。
+#  PICO SDK 初始化必须在 project() 之前 — 这是 Pico SDK 官方强制顺序。
 # ================================================================
 
 set(PICO_SDK_PATH "$ENV{PICO_SDK_PATH}" CACHE PATH "Path to Pico SDK")
@@ -29,9 +30,10 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
 # ================================================================
-# 1. mini-kernel 作为子目录引入（EXCLUDE_FROM_ALL：不构建其内置 demo 固件，
-#    只构建静态库 target。我们 rp2040demo 可执行链接这些静态库）
+# 1. mini-kernel 作为子目录引入（只构建静态库，不构建其内置可执行）
+#    先把 OS_CONFIG_HEADER 指向本工程专属 os_config.h，替换内核库默认配置。
 # ================================================================
+set(OS_CONFIG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/os_config.h" CACHE FILEPATH "rp2040demo os_config.h")
 set(MINIK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../mini-kernel"
     CACHE PATH "mini-kernel root dir")
 if(NOT EXISTS "${MINIK_ROOT}/CMakeLists.txt")
@@ -40,28 +42,8 @@ endif()
 add_subdirectory(${MINIK_ROOT} ${CMAKE_BINARY_DIR}/minik-build EXCLUDE_FROM_ALL)
 
 # ================================================================
-# 2. 应用源文件
+# 2. 编译选项（Cortex-M0+ Thumb）
 # ================================================================
-set(RP2040DEMO_SRCS
-    src/main.c
-)
-
-# demo_app.c 由 mini-kernel 侧的 OS_CFG_DEMO_APP 开关控制
-#   mini-kernel 自身的 CMakeLists.txt 仅把它编译到 mini_kernel 可执行目标，
-#   rp2040demo 作为独立工程需要自己判断 OS_CFG_DEMO_APP 变量（已被
-#   mini-kernel 的 add_subdirectory 解析并设置到父作用域）。
-if(OS_CFG_DEMO_APP)
-    list(APPEND RP2040DEMO_SRCS
-        ${MINIK_ROOT}/examples/builtin_demo/demo_app.c
-    )
-endif()
-
-add_executable(${PROJECT_NAME} ${RP2040DEMO_SRCS})
-
-# 【关键】为 rp2040demo 可执行目标添加 Cortex-M0+ Thumb 模式编译选项
-#   SDK 源代码（如 hardware/sync.h 中的 PRIMASK/cpsid 指令）必须用 -mthumb
-#   编译才能正确生成 Thumb 指令。mini-kernel 的各库 target 都已添加这些标志，
-#   但 rp2040demo 是独立可执行目标，需显式添加。
 set(DEMO_COMMON_FLAGS
     "-mcpu=cortex-m0plus"
     "-mthumb"
@@ -74,45 +56,157 @@ set(DEMO_COMMON_FLAGS
     "-Wextra"
     "-Wpedantic"
 )
-target_compile_options(${PROJECT_NAME} PRIVATE ${DEMO_COMMON_FLAGS})
-
-# 将 COMMON_FLAGS 转为空格分隔字符串添加到全局 C_FLAGS
-# 防止 SDK OBJECT 库（如 pico_stdlib）在链接时因 CPU 模式不匹配报错
 string(REPLACE ";" " " DEMO_FLAGS_STR "${DEMO_COMMON_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${DEMO_FLAGS_STR}")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${DEMO_FLAGS_STR} -x assembler-with-cpp")
 
-# 【关键修复】为 rp2040demo 目标添加 OS_CFG_* 编译宏定义
-#   demo_app.c / shell.c / hal_port.c 等文件使用 #if OS_CFG_xxx 条件编译。
-#   mini-kernel 通过 add_compile_definitions() 添加的宏只在 mini-kernel
-#   目录及其子目录生效，rp2040demo 目标编译这些源文件时看不到它们。
-#   必须显式把 OS_CFG_DEFINES 列表加到 rp2040demo 的 target_compile_definitions。
+# ================================================================
+# 3. RP2040 移植层目录
+# ================================================================
+set(RP2040_PORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rp2040_port")
+
+# ================================================================
+# 4. RP2040 移植层库（HAL + 上下文切换 + MSC + 固化配置 + FatFs diskio +
+#    bootscript + shell_fs/mcore/ovclk + demo_app）
+# ================================================================
+file(GLOB RP2040_PORT_SRCS
+    ${RP2040_PORT_DIR}/hal_port.c
+    ${RP2040_PORT_DIR}/context_switch.S
+    ${RP2040_PORT_DIR}/msc_blockdev.c
+    ${RP2040_PORT_DIR}/msc_usb.c
+    ${RP2040_PORT_DIR}/kernel/config_store.c
+    ${RP2040_PORT_DIR}/kernel/diskio.c
+    ${RP2040_PORT_DIR}/shell/bootscript.c
+    ${RP2040_PORT_DIR}/shell/shell_fs.c
+    ${RP2040_PORT_DIR}/shell/shell_mcore.c
+    ${RP2040_PORT_DIR}/shell/shell_ovclk.c
+    ${RP2040_PORT_DIR}/demo/demo_app.c
+)
+add_library(rp2040_port STATIC ${RP2040_PORT_SRCS})
+
+# 移植层公共 include（内核头 + 移植层自身头 + SDK 头）
+#   【关键】rp2040demo/os_config.h（端口配置）必须在 include path 最前，
+#   否则 #include "os_config.h" 会命中 mini-kernel/include/os_config.h
+#   （纯库配置：PERIPH_SERVICE=0/FATFS=0），导致 HAL_FLASH_SECTOR_SIZE 等未定义。
+target_include_directories(rp2040_port PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${MINIK_ROOT}/include
+    ${MINIK_ROOT}/include/hal
+    ${MINIK_ROOT}/kernel/core
+    ${MINIK_ROOT}/kernel/syscall
+    ${MINIK_ROOT}/kernel/modules/shell
+    ${RP2040_PORT_DIR}
+    ${RP2040_PORT_DIR}/include
+    ${RP2040_PORT_DIR}/shell
+    ${RP2040_PORT_DIR}/kernel
+)
+# 直接依赖内核库（继承其 PUBLIC include）与 Pico SDK（继承 include 路径）
+target_link_libraries(rp2040_port PRIVATE
+    pico_stdlib
+    hardware_uart
+    hardware_timer
+    hardware_gpio
+    hardware_spi
+    hardware_i2c
+    hardware_irq
+)
+target_compile_options(rp2040_port PRIVATE ${DEMO_COMMON_FLAGS})
+if(OS_CFG_DEFINES)
+    target_compile_definitions(rp2040_port PRIVATE ${OS_CFG_DEFINES})
+endif()
+# MSC/USB 需要 TinyUSB 头文件（msc_usb.c 引用 tusb.h）
+target_compile_definitions(rp2040_port PRIVATE
+    CFG_TUD_MSC=1
+    CFG_TUD_MSC_EP_BUFSIZE=512
+)
+target_include_directories(rp2040_port PRIVATE
+    "${PICO_SDK_PATH}/lib/tinyusb/src"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/cdc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/msc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/common"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/device"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/osal"
+    "${PICO_SDK_PATH}/src/rp2_common/pico_stdio_usb/include"
+    "${PICO_SDK_PATH}/src/rp2_common/tinyusb"
+    "${CMAKE_BINARY_DIR}/generated/pico-sdk"
+)
+
+# 让内核库（kernel_core / shell_module）在编译时也能找到移植层头
+#   · kernel.c 在 OS_CFG_OVCLK=1 时 #include "config_store.h"/"sysclk.h"（在 rp2040_port/include）
+#   · shell.c 在 OS_CFG_PORT_RP2040=1 时 #include "bootscript.h"（在 rp2040_port/shell）
+target_include_directories(kernel_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${RP2040_PORT_DIR}/include
+)
+target_include_directories(shell_module PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${RP2040_PORT_DIR}/shell
+)
+# shell_module 需要 rp2040_port（shell_ovclk/mcore 在其内）以实现链接
+target_link_libraries(shell_module PUBLIC rp2040_port)
+
+# ================================================================
+# 5. FatFs 模块（Elm FatFs，来自 Pico SDK + 我们的 ffconf.h/diskio.h）
+#    用 shim 目录技巧让 SDK 的 ff.c/#include "ffconf.h" 命中我们的配置
+#    （FF_USE_MKFS=1，diskio.c 已在 rp2040_port 库中）。
+# ================================================================
+if(OS_CFG_FATFS)
+    set(FATFS_SDK_SRC "${PICO_SDK_PATH}/lib/lib/fatfs/source")
+    if(NOT (EXISTS "${FATFS_SDK_SRC}/ff.c" AND EXISTS "${FATFS_SDK_SRC}/ffunicode.c"))
+        message(FATAL_ERROR "OS_CFG_FATFS=1 but Pico SDK FatFs source missing at ${FATFS_SDK_SRC}/ff.c")
+    endif()
+    set(FATFS_SHIM_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs_shim_rp2040demo")
+    file(MAKE_DIRECTORY "${FATFS_SHIM_DIR}")
+    configure_file("${FATFS_SDK_SRC}/ff.h"         "${FATFS_SHIM_DIR}/ff.h"         COPYONLY)
+    configure_file("${FATFS_SDK_SRC}/ff.c"         "${FATFS_SHIM_DIR}/ff.c"         COPYONLY)
+    configure_file("${FATFS_SDK_SRC}/ffunicode.c"  "${FATFS_SHIM_DIR}/ffunicode.c"  COPYONLY)
+    configure_file("${RP2040_PORT_DIR}/kernel/ffconf.h" "${FATFS_SHIM_DIR}/ffconf.h" COPYONLY)
+
+    add_library(fatfs_module STATIC
+        "${FATFS_SHIM_DIR}/ff.c"
+        "${FATFS_SHIM_DIR}/ffunicode.c"
+    )
+    target_include_directories(fatfs_module PUBLIC
+        "${FATFS_SHIM_DIR}"
+        "${RP2040_PORT_DIR}/kernel"
+        "${FATFS_SDK_SRC}"
+        "${MINIK_ROOT}/include"
+    )
+    target_compile_options(fatfs_module PRIVATE ${DEMO_COMMON_FLAGS})
+    if(OS_CFG_DEFINES)
+        target_compile_definitions(fatfs_module PRIVATE ${OS_CFG_DEFINES})
+    endif()
+    # shell_fs.c（在 rp2040_port 里）需要 fatfs 头与符号
+    target_link_libraries(fatfs_module PUBLIC rp2040_port)
+    target_include_directories(rp2040_port PRIVATE
+        "${FATFS_SHIM_DIR}"
+        "${FATFS_SDK_SRC}"
+    )
+endif()
+
+# ================================================================
+# 6. 应用可执行目标
+# ================================================================
+add_executable(${PROJECT_NAME}
+    src/main.c
+)
+target_compile_options(${PROJECT_NAME} PRIVATE ${DEMO_COMMON_FLAGS})
 if(OS_CFG_DEFINES)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ${OS_CFG_DEFINES})
 endif()
 
-# USB CDC 关键定义：半阻塞输出（FIFO 满等 1s 让主机读走，避免开机打印不全）、
-# USB 枚举不要求 DTR
+# USB CDC 关键定义
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
     PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000000
-    # 【v2.4 调整】内核 systick 已改用 ALARM0 + TIMER_IRQ_0（见 hal_port.c
-    #   KTICK_ALARM_IDX=0），因此 SDK alarm_pool 必须用 ALARM3（即 SDK
-    #   默认值），两者不冲突。之前设成 0 是为了给旧内核 ALARM3 让路，
-    #   现在内核改用 ALARM0，若仍设 0 会与内核抢占 ALARM0 →
-    #   irq_set_exclusive_handler 断言失败 → panic → LED 爆闪。
     PICO_TIME_DEFAULT_ALARM_POOL_HARDWARE_ALARM_NUM=3
 )
 
-# v2.2: USB Composite (CDC+MSC) 强制 TinyUSB 打开 MSC class。
-#   CFG_TUD_MSC 控制 tinyusb_device 是否编译 src/class/msc/msc_device.c，
-#   我们的 msc_usb.c 依赖这些 MSC API (tud_msc_inquiry_cb 等)。
-#   同时设置 CFG_TUD_MSC_EP_BUFSIZE=512 (与 MSC_BLOCKDEV_SECTOR_BYTES 一致)。
+# USB Composite (CDC+MSC)：打开 TinyUSB MSC class
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     CFG_TUD_MSC=1
     CFG_TUD_MSC_EP_BUFSIZE=512
 )
-# 同时直接作用于 SDK 的 tinyusb_device_common 目标（如果已创建）。
 if(TARGET tinyusb_device_common)
     target_compile_definitions(tinyusb_device_common INTERFACE
         CFG_TUD_MSC=1
@@ -122,24 +216,24 @@ endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    # demo_app.c 需要内核头文件（task.h, sched.h, hal_interface.h 等）
     ${MINIK_ROOT}/include
     ${MINIK_ROOT}/include/hal
     ${MINIK_ROOT}/kernel/core
     ${MINIK_ROOT}/kernel/syscall
-    ${MINIK_ROOT}/port/rp2040
+    ${MINIK_ROOT}/kernel/modules/shell
+    ${RP2040_PORT_DIR}
+    ${RP2040_PORT_DIR}/include
+    ${RP2040_PORT_DIR}/shell
+    ${RP2040_PORT_DIR}/kernel
 )
 
 # ================================================================
-# 3. 链接内核库（裁剪开关由 mini-kernel 侧的 OS_CFG_* 决定）
-#    OS_CFG_* 变量已由 mini-kernel 的 CMakeLists.txt 通过 PARENT_SCOPE 传递
-#    到父作用域，可直接用于条件判断。
+# 7. 链接内核库 + 移植层 + SDK
 # ================================================================
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    rp2040_port
     kernel_core
-    hal_port
-    # Pico SDK targets 只在最终可执行 link 一次，
-    # 避免内核静态库嵌入 SDK OBJECT 副本。
+    shell_module
     pico_stdlib
     hardware_uart
     hardware_timer
@@ -147,19 +241,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_spi
     hardware_i2c
     hardware_irq
-    pico_multicore   # 多核：config_mcore_apply 启动 core1
+    pico_multicore
+    hardware_vreg
+    hardware_pll
+    hardware_clocks
 )
-# 直接使用 *_ENABLED 变量判断模块链接（由 mini-kernel 的 add_module_if_enabled 设置）
-if(periph_module_ENABLED)
-    target_link_libraries(${PROJECT_NAME} PRIVATE periph_module)
-endif()
-if(shell_module_ENABLED)
-    target_link_libraries(${PROJECT_NAME} PRIVATE shell_module)
-endif()
-if(vfs_module_ENABLED)
-    target_link_libraries(${PROJECT_NAME} PRIVATE vfs_module)
-endif()
-if(OS_CFG_FATFS)
+if(fatfs_module)
     target_link_libraries(${PROJECT_NAME} PRIVATE fatfs_module)
 endif()
 
@@ -167,35 +254,7 @@ endif()
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
 
-# ================================================================
-# 【v2.2.4 致命修复：GCC multilib 路径错误导致 crt0.o 指令集不兼容！】
-#
-#  map file 对比证据：
-#    diagnostic_minimal_led_test 用的 crt0.o 在：
-#       .../arm-none-eabi/lib/thumb/v6-m/nofp/crt0.o   ✅ ARMv6-M 专用
-#    rp2040demo 之前用的 crt0.o 在：
-#       .../arm-none-eabi/lib/crt0.o                   ❌ 通用 ARM 版
-#
-#  通用版 crt0.o 包含 Cortex-M0+（ARMv6-M）**不支持的指令**：
-#  例如 ARMv7-M 的 `muls r0,r1,r2`（3-operand mul）、`udiv/sdiv`、
-#  Thumb-2 32-bit 非 ARMv6-M 子集指令。这些指令在 runtime_init 中
-#  一旦被执行就立刻触发 UsageFault → HardFault 死循环 → 表现：
-#  "LED 完全不亮，USB 完全不枚举"（连 main 第一行都到不了）。
-#
-#  为什么 diagnostic_minimal_led_test 没问题？
-#    → mini-kernel/CMakeLists.txt 中 diagnostic 目标直接 target_link_libraries
-#      pico_stdlib，Pico SDK 的 pico_standard_link 会把 `-mcpu=cortex-m0plus
-#      -mthumb -mfloat-abi=soft --specs=nosys.specs --specs=nano.specs` 这些
-#      multilib 关键选项通过 INTERFACE_LINK_OPTIONS 准确注入到最终 link 命令。
-#    → rp2040demo 通过 add_subdirectory(mini-kernel EXCLUDE_FROM_ALL)，
-#      再加上我们在 rp2040demo CMakeLists.txt 中手写了全局 CMAKE_C_FLAGS，
-#      导致 Pico SDK 的 target_link_options 注入被覆盖/顺序错误，GCC 链接时
-#      找不到 `-mcpu=cortex-m0plus -mthumb` → 回退到通用 ARM crt0.o → 崩。
-#
-#  修复：在最终可执行目标上显式加 target_link_options（这是 CMake 3.13+
-#  最可靠方式，优先级高于全局 CMAKE_EXE_LINKER_FLAGS），强制 GCC 链接驱动
-#  选择 thumb/v6-m/nofp multilib 路径。
-# ================================================================
+# 强制 GCC 链接驱动选择 thumb/v6-m/nofp multilib 路径
 target_link_options(${PROJECT_NAME} PRIVATE
     -mcpu=cortex-m0plus
     -mthumb
@@ -205,16 +264,32 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--gc-sections
 )
 
-# 说明：pico_stdio_usb 的 stdio_usb_descriptors.c 移除
-#   已经在 mini-kernel/CMakeLists.txt 中（诊断固件创建之后、
-#   mini_kernel 主目标链接之前）执行过。pico_stdio_usb 是
-#   INTERFACE 库，修改全局生效，rp2040demo 在此 add_subdirectory
-#   之后，自动继承过滤后的 INTERFACE_SOURCES（无重复定义）。
+# ================================================================
+# 8. 移除 Pico SDK 默认 USB 描述符（仅 CDC），改为 msc_usb.c 的
+#    Composite (CDC+MSC) 描述符，避免 multiple definition。
+#    （v2.2 起原由 mini-kernel 处理，现移到本工程。）
+# ================================================================
+if(TARGET pico_stdio_usb)
+    get_target_property(_STDIO_USB_IFACE_SRCS pico_stdio_usb INTERFACE_SOURCES)
+    if(_STDIO_USB_IFACE_SRCS)
+        set(_STDIO_USB_FILTERED "")
+        foreach(_s ${_STDIO_USB_IFACE_SRCS})
+            get_filename_component(_s_name "${_s}" NAME)
+            if(NOT "${_s_name}" STREQUAL "stdio_usb_descriptors.c")
+                list(APPEND _STDIO_USB_FILTERED "${_s}")
+            endif()
+        endforeach()
+        set_target_properties(pico_stdio_usb PROPERTIES
+            INTERFACE_SOURCES "${_STDIO_USB_FILTERED}"
+        )
+        message(STATUS "[rp2040demo] Removed stdio_usb_descriptors.c from pico_stdio_usb (using msc_usb.c Composite descriptors)")
+    endif()
+endif()
 
 pico_add_extra_outputs(${PROJECT_NAME})
 
 # ================================================================
-# 4. 体积检查（复用 mini-kernel 的 check_size.cmake）
+# 9. 体积检查（复用 mini-kernel 的 check_size.cmake）
 # ================================================================
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND}

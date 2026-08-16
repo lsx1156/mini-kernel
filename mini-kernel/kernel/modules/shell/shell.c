@@ -11,6 +11,13 @@
  *  注意：本文件由 kernel/modules/shell/ 下的 CMake add_module_if_enabled
  *        扫描并编入，裁剪宏 OS_CFG_SHELL=0 时整体不编译（链接零开销）。
  */
+/* ================================================================
+ * v2.5 两版本分离：RP2040 专属内容用 OS_CFG_PORT_RP2040 隔离。
+ *   纯内核库（OS_CFG_PORT_RP2040=0）只保留基础命令（help/ps/heap/tick/
+ *   version/suspend/resume/kill/clear/led/gpio/i2c 等平台无关 HAL 命令），
+ *   bootscript / vtest / reboot / bootlog / factory_reset / FS / ovclk /
+ *   mcore / USB 旁路 等 RP2040 专属内容在纯库中全部编译为空。
+ * ================================================================ */
 #include "task.h"
 #include "mem.h"
 #include "hal_interface.h"
@@ -21,6 +28,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#if OS_CFG_PORT_RP2040
 /* Pico SDK API 前向声明（shell 模块无 SDK 头文件路径） */
 #define PICO_ERROR_TIMEOUT ((int)((unsigned int)-1))
 extern int getchar_timeout_us(uint32_t timeout_us);
@@ -36,6 +44,7 @@ extern uint32_t tud_cdc_n_read(uint8_t itf, void *buffer, uint32_t bufsize);
 static inline void _tud_flush_only(void) {
     tud_cdc_n_write_flush(0);            /* 仅刷新 CDC IN 发送缓冲区 */
 }
+#endif /* OS_CFG_PORT_RP2040 */
 
 /* 对外导出符号声明（满足 -Wmissing-prototypes；裁剪关闭时下面也有空桩） */
 void shell_start(void);
@@ -43,7 +52,9 @@ void shell_start(void);
 #if OS_CFG_SHELL
 
 /* bootscript 固化子系统（放在文件最开头，避免先引用后定义 + include 位置冲突） */
+#if OS_CFG_PORT_RP2040
 #include "bootscript.h"
+#endif
 
 /* 版本字符串（由 demo_app.c 提供的公共实现） */
 extern const char *k_version(void);
@@ -181,12 +192,14 @@ typedef struct {
     const char     *help;
 } shell_cmd_t;
 
+#if OS_CFG_PORT_RP2040
 /* 别名：g_cmd_table 里引用 cmd_save/cmd_unsave/cmd_list，但实现在 bootscript
  * 代码块里命名为 cmd_bootscript_save 等 —— 命令表初始化之前先 define 做重定向，
  * 这样 g_cmd_table 中取函数指针时取的就是 bootscript_* 版本。*/
 #define cmd_save    cmd_bootscript_save
 #define cmd_unsave  cmd_bootscript_unsave
 #define cmd_list    cmd_bootscript_list
+#endif
 
 /* —— 各命令处理函数前向声明 —— */
 static int cmd_help(int argc, char **argv);
@@ -202,12 +215,14 @@ static int cmd_led(int argc, char **argv);
 static int cmd_syscalls(int argc, char **argv);
 static int cmd_gpio(int argc, char **argv);
 static int cmd_i2c(int argc, char **argv);
+#if OS_CFG_PORT_RP2040
 static int cmd_save(int argc, char **argv);
 static int cmd_unsave(int argc, char **argv);
 static int cmd_list(int argc, char **argv);
 static int cmd_boot(int argc, char **argv);
 static int cmd_factory_reset(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
+static int cmd_bootlog(int argc, char **argv);
 static int cmd_vtest(int argc, char **argv);
 static int cmd_jobs(int argc, char **argv);
 
@@ -249,20 +264,25 @@ static void vt_task_ctrl(void *arg);
 #undef cmd_save
 #undef cmd_unsave
 #undef cmd_list
+#endif /* OS_CFG_PORT_RP2040 */
 
 /* bootscript/shell 内部跨函数引用的前向声明（避免先引用后定义） */
 static int  shell_exec_line(char *line);        /* 定义在 命令解析 dispatch 末尾 */
+#if OS_CFG_PORT_RP2040
 static int  cmd_bootscript_boot_exec(int argc, char **argv);  /* 定义在 bootscript 命令块末尾 */
 extern int   bootscript_run_all(void);          /* 定义在 bootscript 命令块前面（非 static，暴露 API） */
+#endif
 
 /* ================================================================
  * 命令表（驱动扩展：新增命令只需加一行）
  * 构建命令表之前临时定义 save/unsave/list → cmd_bootscript_* 映射
  * ================================================================ */
 static const shell_cmd_t g_cmd_table[] = {
+#if OS_CFG_PORT_RP2040
 #define cmd_save    cmd_bootscript_save
 #define cmd_unsave  cmd_bootscript_unsave
 #define cmd_list    cmd_bootscript_list
+#endif
     { "help",    cmd_help,    "help [cmd]",            "打印帮助信息" },
     { "ps",      cmd_ps,      "ps",                    "列出所有任务（ID/状态/栈/剩余tick）" },
     { "heap",    cmd_heap,    "heap",                  "打印内核堆空闲字节 / 最大空闲块" },
@@ -277,6 +297,7 @@ static const shell_cmd_t g_cmd_table[] = {
                                                     "GPIO 子命令：初始化/读/写/翻转任意 RP2040 引脚" },
     { "i2c",     cmd_i2c,     "i2c help | init ... | scan | wr | rd | memwr | memrd",
                                                     "I2C 主机子命令：扫描总线/读写/寄存器访问" },
+#if OS_CFG_PORT_RP2040
     { "vtest",   cmd_vtest,   "vtest start [bus] [addr] | stop | status",
                                                     "三任务嵌套调度验证: start=启动VT1(LED心跳)/VT2(OLED刷新)/VT3(压力+嵌套suspend-resume); status=查看三任务计数器; stop=销毁三任务" },
     { "jobs",    cmd_jobs,    "jobs",                  "列出用户创建的后台任务（类似 Linux jobs）" },
@@ -289,6 +310,8 @@ static const shell_cmd_t g_cmd_table[] = {
     { "factory_reset", cmd_factory_reset, "factory_reset | factory_reset confirm",
                                                     "出厂重置：擦除所有持久化数据(bootscript+末尾保留区)；保留内核固件本身" },
     { "reboot",   cmd_reboot,   "reboot",            "软复位系统：重新执行完整启动流程(重现开机画面 + 应用固化超频/多核)" },
+    { "bootlog",  cmd_bootlog,  "bootlog",           "开机日志回放诊断：captured(缓存字节数)/replayed/capturing/dtr" },
+#endif
     { "syscalls",cmd_syscalls,"syscalls",              "列出系统调用契约表" },
     { "ver",     cmd_version, NULL, NULL },            /* version 的别名 */
     { "cls",     cmd_clear,   NULL, NULL },            /* clear 的别名 */
@@ -1054,6 +1077,10 @@ static int cmd_i2c(int argc, char **argv) {
 #endif
 }
 
+/* ========== 以下为 RP2040 专属命令（bootscript / reboot / bootlog / vtest / jobs）==========
+ * 纯内核库（OS_CFG_PORT_RP2040=0）不编译 —— 这些命令深度依赖 RP2040 板载
+ * Flash（bootscript 固化）、USB CDC（bootlog 回放）、I2C+OLED（vtest）。 */
+#if OS_CFG_PORT_RP2040
 /* ========== cmd_boot 包装子命令 ========== */
 static int cmd_bootscript_status(int argc, char **argv);   /* 前向声明，定义在下方 */
 
@@ -1161,6 +1188,7 @@ static int cmd_bootscript_status(int argc, char **argv) {
     sh_puts("==============================================================\r\n");
     return 0;
 }
+#endif /* OS_CFG_PORT_RP2040 —— 临时关闭，让通用 shell_split_argv 始终编译 */
 
 /* ================================================================
  * 行解析器：按"空格"拆分 argv[0..argc-1]
@@ -1183,6 +1211,7 @@ static int shell_split_argv(char *line, char **argv, int max_args, bool *overflo
     return argc;
 }
 
+#if OS_CFG_PORT_RP2040
 /* ================================================================
  * bootscript 命令：固化指令到板载 Flash（开机自动执行）
  *   save <cmd ...>        → 追加固化（不立即执行）
@@ -1441,6 +1470,25 @@ static int cmd_reboot(int argc, char **argv) {
     return 0;   /* 不可达 */
 }
 
+/* bootlog —— 开机日志回放诊断（v2.4.3）
+ *   captured  = 缓存字节数（0=空；远小于预期=捕获阶段输出就被截断）
+ *   replayed  = 是否已回放过（打开终端触发 DTR 上升沿后为 1）
+ *   capturing = 是否仍在捕获（启动流程未结束则为 1）
+ *   dtr       = 最近检测到的 CDC DTR 状态 */
+static int cmd_bootlog(int argc, char **argv) {
+    (void)argc; (void)argv;
+    char line[80];
+    shell_snprintf(line, sizeof(line),
+        "[BOOTLOG] captured=%lu bytes  replayed=%lu  capturing=%lu  dtr=%lu\r\n",
+        (unsigned long)hal_bootlog_captured(),
+        (unsigned long)hal_bootlog_replayed(),
+        (unsigned long)hal_bootlog_capturing(),
+        (unsigned long)hal_bootlog_dtr_prev());
+    sh_puts(line);
+    return 0;
+}
+#endif /* OS_CFG_PORT_RP2040 —— 结束 bootscript/reboot/bootlog RP2040 专属命令 */
+
 /* ================================================================
  * 执行单条命令（新增："!" 前缀糖衣）
  *   "! gpio init 25 out 1" → 先执行 "gpio init 25 out 1"，
@@ -1470,7 +1518,8 @@ static int shell_exec_line(char *line) {
         }
     }
 
-    /* "!" 前缀糖衣：先执行命令，成功再固化 */
+    #if OS_CFG_PORT_RP2040
+    /* "!" 前缀糖衣：先执行命令，成功再固化（RP2040 专属，依赖 bootscript Flash 固化） */
     bool bang_append_on_success = false;
     {
         char *p = line;
@@ -1491,6 +1540,7 @@ static int shell_exec_line(char *line) {
         if (ll >= sizeof(bang_original)) ll = sizeof(bang_original) - 1;
         memcpy(bang_original, line, ll); bang_original[ll] = '\0';
     }
+#endif /* OS_CFG_PORT_RP2040 */
 
     static char *argv[SHELL_MAX_ARGS];
     bool overflowed = false;
@@ -1528,6 +1578,7 @@ static int shell_exec_line(char *line) {
         sh_puts(" (try 'help')\r\n");
     }
 
+    #if OS_CFG_PORT_RP2040
     /* ! 糖衣：执行成功 → 追加 Flash；成功/失败都汇报剩余 slots */
     if (bang_append_on_success && rc == 0) {
         hal_err_t br = bootscript_append(bang_original);
@@ -1541,6 +1592,7 @@ static int shell_exec_line(char *line) {
             shell_put_err((int)br); sh_puts(")\r\n");
         }
     }
+#endif /* OS_CFG_PORT_RP2040 */
     return rc;
 }
 
@@ -1549,8 +1601,9 @@ static int shell_exec_line(char *line) {
  *   · 三个并发任务嵌套依赖：VT3 操作 VT2 的状态，VT2 长时间 I2C 阻塞
  *     期间 VT1 继续跑 → 完整验证时间片轮转 / SLEEP 队列 /
  *     SUSPEND↔READY 状态切换 / 堆零碎片 / TCB 队列不损坏
+ *   · RP2040 专属（OLED/I2C/SIO 寄存器），纯内核库不编译。
  * ================================================================ */
-
+#if OS_CFG_PORT_RP2040
 /* — VT1: LED 心跳任务（500ms 翻转 GPIO25，与固化的 led 命令用同一 PIN 同一 SIO 寄存器）
  *   不依赖 OS_CFG_PERIPH_SERVICE，任何裁剪开关下都能看到 LED 状态，
  *   是调度器仍在正常轮转的"心跳指示器"。*/
@@ -2374,6 +2427,7 @@ static int cmd_vtest(int argc, char **argv) {
     sh_puts("vtest: unknown subcmd '"); sh_puts(sub); sh_puts("'. Try 'vtest status'.\r\n");
     return 1;
 }
+#endif /* OS_CFG_PORT_RP2040 —— 结束 vtest/jobs RP2040 专属命令 */
 
 /* ================================================================
  * Shell 主任务：非阻塞拼行 + 解析 + 打印提示符
@@ -2386,11 +2440,17 @@ static void task_shell(void *arg) {
 
     /* v2.2 ① 先注册扩展命令（msc/ls/cd/pwd/mkdir/rmdir/rm/cat）到 shell_register
      *        动态命令表。这样 help + dispatch 都能立即看到它们。 */
+#if OS_CFG_PORT_RP2040
     shell_fs_register();
-    /* v2.4 ② 注册 ovclk（超频 / 多核固化）命令 */
+#endif
+#if OS_CFG_OVCLK
+    /* v2.4 ② 注册 ovclk（超频 / 多核固化）命令（RP2040 专属，内核库裁剪关闭时不编译） */
     shell_ovclk_register();
-    /* v2.4 ③ 注册 mcore（多核调度测试）命令 */
+#endif
+#if OS_CFG_MULTICORE
+    /* v2.4 ③ 注册 mcore（多核调度测试）命令（RP2040 专属，内核库裁剪关闭时不编译） */
     shell_mcore_register();
+#endif
 
 #if OS_CFG_FATFS
     /* v2.2 ② 挂载 FatFs（空片时会自动 f_mkfs FAT16）
@@ -2433,10 +2493,19 @@ static void task_shell(void *arg) {
     while (1) {
         char c = 0;
 
+        #if OS_CFG_PORT_RP2040
+        /* 【v2.4.3-fix】开机日志回放由 shell 任务驱动（栈 2048B，安全）：
+         * 设备就绪后满 3 秒才回放。回放绝不能在 idle 任务（栈 1024B）里执行，
+         * 否则回放深 USB 输出链击穿 idle 栈底 MAGIC → 串口 dump 内存乱码。
+         * 每次循环检查一次（未满 3 秒返回 0，下轮再查；已回放则幂等跳过）。 */
+        extern uint32_t hal_bootlog_try_replay(void);
+        (void)hal_bootlog_try_replay();
+
         /* hal_console_getc 内部已调用 _usb_force_poll（含 dcd_int_handler +
          * tud_task_ext + EP1 OUT 搬运），无需再单独 poll。
          * 此处只补 CDC IN flush，确保打印字符立即到达主机。 */
         _tud_flush_only();
+#endif /* OS_CFG_PORT_RP2040 */
 
         /* 方案 0（最高优先级，内核硬件旁路）：HAL 层私有 ring buffer
          *   内核环境下 TinyUSB 的 INTE/ISER 会被抢占破坏，
@@ -2448,6 +2517,7 @@ static void task_shell(void *arg) {
                 c = hc;
             }
         }
+#if OS_CFG_PORT_RP2040
         /* 方案 1（备选）：TinyUSB 直读 CDC FIFO */
         if (c == 0 && tud_cdc_n_available(0)) {
             uint8_t b = 0;
@@ -2459,6 +2529,7 @@ static void task_shell(void *arg) {
             int ch = getchar_timeout_us(0);
             if (ch > 0) c = (char)(ch & 0xFF);
         }
+#endif /* OS_CFG_PORT_RP2040 */
 
         if (c != 0) {
             /* 【已移除字符 LED 短闪副作用】
@@ -2483,11 +2554,13 @@ static void task_shell(void *arg) {
             case 0x03:  /* Ctrl+C — Linux 风格中断：停止后台任务 + 清空输入行 */
                 sh_puts("^C");
                 sh_crlf();
+#if OS_CFG_PORT_RP2040
                 if (g_vtest_running) {
                     sh_puts("[Interrupt] Stopping vtest...\r\n");
                     vtest_stop_all();
                     sh_puts("[Interrupt] vtest stopped. LED OFF.\r\n");
                 }
+#endif
                 g_shell_pos = 0;
                 sh_puts(SHELL_PROMPT_STR);
                 break;
@@ -2534,8 +2607,10 @@ static void task_shell(void *arg) {
  *   bootscript_run_all 内部会 "No persistent commands" 友好提示 0 条的情况。
  * ================================================================ */
 void shell_start(void) {
+#if OS_CFG_PORT_RP2040
     /* 先跑固化指令（如果有） */
     (void)bootscript_run_all();
+#endif
     /* 再启动交互式 shell */
     tcb_t *t = task_create(SHELL_TASK_NAME, task_shell, NULL,
                            SHELL_TASK_STACK, SHELL_TASK_WEIGHT);

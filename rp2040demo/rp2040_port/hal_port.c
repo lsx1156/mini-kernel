@@ -50,6 +50,12 @@ extern void dcd_int_handler(uint8_t rhport);
 extern void dcd_int_enable (uint8_t rhport);
 extern void tud_task_ext(uint32_t timeout_ms, int in_isr);
 
+/* CDC 行状态检测（v2.4.3）：tud_cdc_get_line_state 是 static inline 不可链接，
+ * 改调其内部实现 tud_cdc_n_get_line_state(0)，返回 line_state 字节（bit0=DTR）。
+ * 比抓 SETUP 包快照可靠：正常运行时 USB IRQ 会在轮询前先把
+ * SET_CONTROL_LINE_STATE 处理掉。 */
+extern uint8_t tud_cdc_n_get_line_state(uint8_t itf);
+
 /* 内核回调：滴答中断尾部 */
 extern void kernel_tick_hook(void);
 
@@ -191,6 +197,8 @@ static char             s_bootlog[BOOTLOG_SIZE];
 static volatile uint16_t s_bootlog_len     = 0u;
 static volatile bool    s_bootlog_capture  = true;   /* 启动阶段捕获中 */
 static volatile bool    s_bootlog_replayed = false;  /* 已回放过（避免每次连接都重放） */
+static volatile bool    s_bootlog_dtr_prev = false;  /* 最近一次检测到的 CDC DTR 状态 */
+static volatile uint32_t s_bootlog_open_us  = 0u;    /* DTR 上升沿（设备就绪）时刻，us */
 
 /* 控制台输出时同步捕获（由 hal_console_putc_impl 调用） */
 static void hal_bootlog_putc(char c) {
@@ -377,15 +385,27 @@ static inline void _ep1_out_drain_all(void) {
  *     - 正常情况 INTE != 0：完全不动 INTE，避免覆盖 SDK 设置；
  *     - 异常情况 INTE == 0：先调 dcd_int_enable 让 SDK 重建，失败再写安全掩码。
  *
- * 安全掩码：只用 TinyUSB 有 ack 代码的位，避免 SOF 占满 CPU：
- *   STALL_STATUS(bit0) | BUFF_STATUS(bit2) | ERROR(bit3) |
- *   EP0_SETUP_REQ(bit6) | BUS_RESET(bit16) | RESUME(bit19)
- *   = 0x0009_004D */
-#define USB_INTE_SAFE_MASK 0x0009004Du
+ * 安全掩码：只用 TinyUSB 的 dcd_rp2040_irq 有 ack 代码的位，避免 SOF 占满 CPU。
+ *   【v2.4.3-fix · 掩码位号全面纠错，修复 "Unhandled IRQ 0x%x" PANIC】
+ *   旧掩码 0x0009004D 的位号解读全错（把 HOST 模式位当成了设备模式位）：
+ *     - 误开了 TinyUSB 未处理的位：EP_STALL_NAK(bit19 0x80000)、
+ *       ERROR_RX_TIMEOUT(bit6 0x40)、TRANS_COMPLETE(bit3 0x8)、
+ *       HOST_SOF(bit2 0x4)、HOST_CONN_DIS(bit0 0x1)。
+ *       dcd_rp2040_irq 读到 `status ^ handled != 0` → panic("Unhandled IRQ 0x%x")
+ *       （主机在设备忙/未 re-arm 时轮询 EP1 OUT → 硬件 NAK → EP_STALL_NAK 置位
+ *       → 直接 PANIC；重负载 + 抢占调度下极易触发）。
+ *     - 同时漏了 BUFF_STATUS(bit4)/BUS_RESET(bit12)/DEV_SUSPEND(bit14)/
+ *       DEV_RESUME(bit15)，CDC IN 发送完成中断收不到。
+ *   正确掩码 = TinyUSB dcd_init 使能且 dcd_rp2040_irq 全部处理的位：
+ *     BUFF_STATUS(bit4 0x10) | BUS_RESET(bit12 0x1000) |
+ *     DEV_CONN_DIS(bit13 0x2000) | DEV_SUSPEND(bit14 0x4000) |
+ *     DEV_RESUME_FROM_HOST(bit15 0x8000) | SETUP_REQ(bit16 0x10000)
+ *   = 0x0001_F010  （不含 DEV_SOF：TinyUSB 运行期按需开/关） */
+#define USB_INTE_SAFE_MASK 0x0001F010u
 #define USB_INTE_REG       0x50110014u   /* USB_INTE (Interrupt Enable) */
 #define USB_INTS_REG       0x50110010u   /* USB_INTS = raw_flags & INTE (只读) */
-#define USB_EP0_SETUP_BIT  (1u << 6)     /* INTS bit6 = EP0_SETUP_REQ pending */
-#define USB_EP1_BUFF_BIT   (1u << 2)     /* INTS bit2 = BUFF_STATUS pending */
+#define USB_EP0_SETUP_BIT  (1u << 16)    /* INTS bit16 = EP0_SETUP_REQ pending（旧 1u<<6 是 ERROR_RX_TIMEOUT） */
+#define USB_EP1_BUFF_BIT   (1u << 4)     /* INTS bit4  = BUFF_STATUS pending（旧 1u<<2 是 HOST_SOF） */
 
 /* ===== 诊断统计计数器 ===== */
 static volatile uint32_t s_poll_dcd_enable_count = 0;
@@ -420,29 +440,78 @@ static inline void _snapshot_setup_if_pending(void) {
     }
 }
 
-/* 回放完整开机日志（仅一次；经控制台输出，半阻塞保证送达） */
+/* 十进制打印（走 hal_console_putc，仅回放标记/诊断用） */
+static void _bootlog_put_u32(uint32_t v) {
+    char b[11]; int n = 0;
+    if (v == 0) { hal_console_putc('0'); return; }
+    while (v > 0) { b[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n > 0) hal_console_putc(b[--n]);
+}
+
+/* 回放完整开机日志（仅一次；经控制台输出，半阻塞保证送达）。
+ * 开头打印 [BOOTLOG] 标记 + 缓存字节数，用于区分"实时输出"与"回放"、
+ * 并诊断缓存是否抓全（若 N 远小于预期 = 捕获阶段输出就被截断）。
+ *
+ * 【关键守卫】s_bootlog_capture 仍为真（启动流程未结束）时**禁止回放**：
+ * 若终端在启动时就开着，hal_usb_poll 会立刻检测到 DTR 上升沿 → 启动中途
+ * 触发回放 → 回放输出又走 hal_console_putc → hal_bootlog_putc 重新捕获 →
+ * 缓存被污染 + 回放与实时输出交织 → 满屏乱码。 */
 static void _bootlog_replay(void) {
+    if (s_bootlog_capture) return;   /* 启动中不回放（避免重捕获污染缓存） */
     if (s_bootlog_replayed) return;
     if (s_bootlog_len == 0u) return;
     s_bootlog_replayed = true;
+    hal_console_putc('\r'); hal_console_putc('\n');
+    const char *h1 = "[BOOTLOG] replay ";
+    while (*h1) hal_console_putc(*h1++);
+    _bootlog_put_u32((uint32_t)s_bootlog_len);
+    const char *h2 = " bytes:\r\n";
+    while (*h2) hal_console_putc(*h2++);
     for (uint16_t i = 0; i < s_bootlog_len; i++) {
         hal_console_putc(s_bootlog[i]);
     }
 }
 
-/* 由 hal_usb_poll 调用：解析最近 SETUP 包，检测 CDC DTR 上升沿。
- * w0: byte0=bmRequestType, byte1=bRequest, byte2..3=wValue(bit0=DTR)。
- * 0x21/0x22 = SET_CONTROL_LINE_STATE；DTR 0→1 = 用户刚打开终端。 */
+/* ---- 开机日志回放诊断（shell `bootlog` 命令用） ---- */
+uint32_t hal_bootlog_captured(void)  { return (uint32_t)s_bootlog_len; }
+uint32_t hal_bootlog_replayed(void)  { return s_bootlog_replayed ? 1u : 0u; }
+uint32_t hal_bootlog_capturing(void) { return s_bootlog_capture ? 1u : 0u; }
+uint32_t hal_bootlog_dtr_prev(void)  { return s_bootlog_dtr_prev ? 1u : 0u; }
+
+/* 由 hal_usb_poll 调用：直接读 TinyUSB CDC 行状态的 DTR 位，检测上升沿。
+ * DTR 0→1 = 用户刚打开终端（设备就绪）→ 记录就绪时刻。
+ * 【v2.4.3-fix】回放不再在这里（idle 任务上下文）执行：
+ *   idle 栈仅 OS_CFG_IDLE_STACK_SIZE(1024B)，而回放输出链
+ *   hal_console_putc → putchar_raw → stdio_usb_out_chars → tud_cdc_n_write
+ *   需要 ~2048B 栈，在 idle 里跑会击穿栈底 MAGIC → idle 行为异常 →
+ *   串口 dump 内存乱码（症状：FAT 扇区 / task 名 / 内存内容被 dump）。
+ *   改为：idle 只记录"就绪时刻"，由 shell 任务（栈 2048B）在
+ *   hal_bootlog_try_replay() 里安全执行回放。
+ * 之前用 SETUP 包快照解析（s_last_setup_w0）不可靠：正常运行时 USB IRQ
+ * 会在本函数轮询前先把 SET_CONTROL_LINE_STATE 处理掉，快照永远抓不到。 */
+#define BOOTLOG_REPLAY_DELAY_US  3000000u   /* 设备就绪后第 3 秒才开始回放 */
+
 static void _bootlog_dtr_check(void) {
-    static volatile bool s_dtr_prev = false;
-    uint32_t w0 = s_last_setup_w0;
-    if ((w0 & 0xFFFFu) == 0x2221u) {
-        bool dtr = (bool)((w0 >> 16) & 1u);
-        if (dtr && !s_dtr_prev) {
-            _bootlog_replay();   /* 终端刚打开 → 回放开机日志 */
-        }
-        s_dtr_prev = dtr;
+    bool dtr = (tud_cdc_n_get_line_state(0) & 0x01u) != 0u;   /* bit0 = DTR */
+    if (dtr && !s_bootlog_dtr_prev) {
+        s_bootlog_open_us = time_us_32();   /* 设备就绪时刻（DTR 0→1） */
+    } else if (!dtr) {
+        s_bootlog_open_us = 0u;             /* 终端关闭 → 取消未到期的回放 */
     }
+    s_bootlog_dtr_prev = dtr;
+}
+
+/* 由 shell 任务调用（栈 2048B，安全）：设备就绪后满 3 秒才回放开机日志。
+ * 返回 0 = 未到期/未就绪/已回放；1 = 本次已执行回放。 */
+uint32_t hal_bootlog_try_replay(void) {
+    bool dtr = (tud_cdc_n_get_line_state(0) & 0x01u) != 0u;
+    if (!dtr) return 0u;                    /* 终端没开 */
+    if (s_bootlog_open_us == 0u) return 0u; /* 未记录就绪时刻 */
+    if ((uint32_t)(time_us_32() - s_bootlog_open_us) < BOOTLOG_REPLAY_DELAY_US) {
+        return 0u;                          /* 未满 3 秒 */
+    }
+    _bootlog_replay();                      /* 满 3 秒 → 安全回放（幂等，内部查 replayed） */
+    return 1u;
 }
 
 uint32_t hal_usb_force_poll_and_snapshot(uint32_t *inte_after, uint32_t *iser_after,
@@ -468,15 +537,17 @@ uint32_t hal_usb_force_poll_and_snapshot(uint32_t *inte_after, uint32_t *iser_af
         }
     }
 
-    /* 2. 在 dcd_int_handler 之前抓 SETUP 快照（handler 会清 INTS 位） */
-    _snapshot_setup_if_pending();
+    /* 2. 在 dcd_int_handler 之前抓 SETUP 快照（handler 会清 INTS 位）。
+     * 【v2.4.3-fix】仅当 INTE==0（中断失效）才手动调 dcd_int_handler 兜底；
+     * 中断正常驱动时不手动处理，避免与 USBCTRL_IRQ 中断双路径竞态 → HardFault。 */
+    if (*(volatile uint32_t *)USB_INTE_REG == 0u) {
+        _snapshot_setup_if_pending();
+        dcd_int_handler(0);
+        s_dcd_handler_called++;
+    }
 
-    /* 3. 调 dcd_int_handler 处理所有挂起的中断（含 SETUP/Control Request） */
-    dcd_int_handler(0);
-    s_dcd_handler_called++;
+    /* 3. 推进 TinyUSB 软件状态机 + 手动搬 EP1 OUT → ring */
     tud_task_ext(0, 0);
-
-    /* 4. 手动搬 EP1 OUT → ring */
     _ep1_out_drain_all();
 
     if (inte_after)  *inte_after  = *(volatile uint32_t *)USB_INTE_REG;
@@ -487,9 +558,15 @@ uint32_t hal_usb_force_poll_and_snapshot(uint32_t *inte_after, uint32_t *iser_af
 }
 
 static inline void _usb_force_poll(void) {
-    /* 仅在 INTE==0 时恢复掩码，避免与 TinyUSB 自身的 INTE 管理竞争。
-     * 详见 hal_usb_force_poll_and_snapshot 的注释。 */
+    /* 【v2.4.3-fix · 消除 USB 中断双路径竞态 → HardFault 爆闪】
+     *   USBCTRL_IRQ 硬件中断（dcd_rp2040_irq）与轮询 dcd_int_handler 是同一函数。
+     *   若 INTE!=0（中断正常驱动）时轮询仍无条件调 dcd_int_handler，则重开 PuTTY
+     *   触发 bus reset / 重新枚举时两条路径同时处理同一批事件 → TinyUSB 状态损坏
+     *   → HardFault → LED 5Hz 爆闪。
+     *   修复：仅当 INTE==0（中断被抢占清零、失效）时才手动调 dcd_int_handler 兜底；
+     *   中断正常时只推进软件状态机 + EP1 旁路搬运，单一路径。 */
     if (*(volatile uint32_t *)USB_INTE_REG == 0u) {
+        /* INTE==0 → TinyUSB 中断路径失效，手动恢复掩码 + 手动处理硬件事件（兜底） */
         dcd_int_enable(0);
         s_poll_dcd_enable_count++;
         if (*(volatile uint32_t *)USB_INTE_REG == 0u) {
@@ -499,10 +576,11 @@ static inline void _usb_force_poll(void) {
         if (((*(volatile uint32_t *)0xE000E100u >> 21) & 1u) == 0u) {
             *(volatile uint32_t *)0xE000E100u = (1u << 21);
         }
+        _snapshot_setup_if_pending();
+        dcd_int_handler(0);
+        s_dcd_handler_called++;
     }
-    _snapshot_setup_if_pending();
-    dcd_int_handler(0);
-    s_dcd_handler_called++;
+    /* INTE!=0：硬件中断正常驱动硬件事件；轮询只推进 TinyUSB 软件状态机 + EP1 旁路 */
     tud_task_ext(0, 0);
     _ep1_out_drain_all();
 }

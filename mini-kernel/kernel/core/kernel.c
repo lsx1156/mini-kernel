@@ -19,9 +19,16 @@
 #include "sched.h"
 #include "mem.h"
 #include "hal_interface.h"
+#include "os_config.h"
+
+/* v2.4.4：内核库纯净化。超频/多核固化（config_store + sysclk）为 RP2040
+ * 专属，已剥离到目标工程 rp2040_port/include。内核核心仅在 OS_CFG_OVCLK=1
+ * （目标工程编译移植层时）才引用这些头与启动钩子；纯内核库（OS_CFG_OVCLK=0)
+ * 不依赖。头文件路径由目标工程通过 include 目录提供。 */
+#if OS_CFG_OVCLK
 #include "hal/config_store.h"
 #include "hal/sysclk.h"
-#include "os_config.h"
+#endif
 
 /* 内核核心只依赖 hal_interface.h 提供的平台无关接口，不含任何
  * Pico SDK / RP2040 专属内容，保证可移植到其它 MCU。板级能力
@@ -303,7 +310,9 @@ void kernel_main(void) {
      *   v2.4：读取独立 Config 区。有效 → 应用超频档位 + 多核；
      *   无效/未固化/CRC 损坏 → config_apply 内部回退到 单核 + 125MHz，
      *   不做任何改动，保证安全兜底。必须在 sched_start 之前执行，
-     *   使 ALARM0 节拍与 USB/Timer 在目标频率下初始化。 —— */
+     *   使 ALARM0 节拍与 USB/Timer 在目标频率下初始化。
+     *   v2.4.4：超频/多核为 RP2040 专属，仅 OS_CFG_OVCLK=1 时编译。 —— */
+#if OS_CFG_OVCLK
     {
         int applied = config_apply();
         hal_diag_putc('\r'); hal_diag_putc('\n');
@@ -311,6 +320,7 @@ void kernel_main(void) {
         hal_diag_puts("MHz applied=");    hal_diag_put_u32((uint32_t)applied);
         hal_diag_puts("\r\n");
     }
+#endif
 
     /* —— 冷初始化 Step 6: 启动调度器（内部 cpsie i + msr psp + svc #0） ——
      *   注意：开机日志捕获的停止点在 _boot_setup_task 末尾（hal_bootlog_end），
