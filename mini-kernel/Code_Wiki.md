@@ -1,6 +1,8 @@
 # Mini Kernel Code Wiki
 
-> **版本**: v2.2.8 STABLE | **目标平台**: RP2040 (Cortex-M0+) | **文档生成**: 2026-08-15
+> **版本**: v2.5.0 STABLE | **目标平台**: RP2040 (Cortex-M0+) | **文档生成**: 2026-08-16
+>
+> **v2.5 两版本分离（重要）**：mini-kernel 已改为**可移植纯内核库**（`kernel_core.a` / `shell_module.a`），RP2040 专属文件全部移入 **`rp2040demo/rp2040_port/`**。本 Wiki 中所有提到 `mini-kernel/port/rp2040/` 的路径，在 v2.5 起一律对应 `rp2040demo/rp2040_port/`（如 `hal_port.c`、`context_switch.S`、`msc_usb.c`、`config_store.c`、`sysclk` 等均已在移入目录下）。
 
 ---
 
@@ -138,73 +140,60 @@ Reset → boot2 (ROM) → crt0.S (SDK) → runtime_init → main() (弱符号)
 
 ## 3. 目录结构
 
+> **v2.5 两版本分离**：下面 `mini-kernel/` 只含**平台无关内核库**；RP2040 专属代码（原 `port/rp2040/`、`examples/builtin_demo/`、`modules/vfs/fatfs/`、`bootscript.c`、`shell_fs.c` 等）已移入 **`rp2040demo/rp2040_port/`**，由目标工程编译。
+
 ```
-project/mini-kernel/
-├── CMakeLists.txt              # 顶层构建脚本（分层编译 + 裁剪 + 体积检查）
-├── build.bat                   # Windows 编译/烧录脚本（安全版，带日志+暂停）
+project/mini-kernel/          # 【可移植纯内核库】（v2.5 起，静态库）
+├── CMakeLists.txt            # 纯静态库构建（导出 kernel_core / shell_module）
+├── build.bat                 # Windows 纯库构建脚本（产物 .a，无固件）
 ├── toolchain-arm-none-eabi.cmake
 ├── platformio.ini
 │
-├── include/                    # 【对外头文件】用户应用仅包含此目录
-│   ├── kernel.h                # 内核统一 API（系统调用封装）
-│   ├── os_config.h             # 裁剪配置宏（体积红线+功能开关）
+├── include/                  # 【对外头文件】
+│   ├── kernel.h              # 内核统一 API（系统调用封装）
+│   ├── os_config.h           # 裁剪配置宏（纯库配置：RP2040 功能全 0）
 │   └── hal/
-│       ├── hal_interface.h     # HAL 统一接口（ops 表）
-│       └── flash_layout.h      # Flash 三分区定义（固件/MSC/Bootscript）
+│       └── hal_interface.h   # HAL 统一接口（ops 表 + 板级基础功能）
 │
 ├── kernel/
-│   ├── core/                   # 【内核核心】必编，不可裁剪
-│   │   ├── kernel.c            # 内核主入口 + 启动流程 + tick_hook
-│   │   ├── task.c / task.h     # 任务管理：TCB/状态机/创建/销毁/睡眠/挂起
-│   │   ├── sched.c / sched.h   # 调度器：RR/权重/就绪队列/睡眠队列
-│   │   └── mem.c / mem.h       # 内存管理：固定池 + 隐式链表堆
+│   ├── core/                 # 【内核核心】必编，不可裁剪
+│   │   ├── kernel.c          # 内核主入口 + 启动流程 + tick_hook
+│   │   ├── task.c / task.h   # 任务管理：TCB/状态机/创建/销毁/睡眠/挂起
+│   │   ├── sched.c / sched.h # 调度器：RR/权重/就绪队列/睡眠队列
+│   │   └── mem.c / mem.h     # 内存管理：固定池 + 隐式链表堆
 │   │
-│   ├── syscall/                # 系统调用契约表（X-Macro 静态生成）
+│   ├── syscall/              # 系统调用契约表（X-Macro 静态生成）
 │   │   ├── syscall_contract.h
 │   │   └── syscall_contract.c
 │   │
-│   └── modules/                # 【可裁剪模块】按 OS_CFG_* 开关编入
-│       ├── shell/
-│       │   ├── shell.c         # Shell 主逻辑：输入/解析/28+ 条命令
-│       │   ├── shell_core.h    # 扩展命令注册 API（shell_register）
-│       │   ├── shell_register.c
-│       │   ├── shell_fs.c      # FS/MSC 扩展命令：ls/cd/msc mount/format...
-│       │   ├── bootscript.c/h  # 固化命令：save/! 双备份 + CRC8 校验
-│       │   └── bootscript.h
-│       │
-│       └── vfs/fatfs/
-│           ├── diskio.c/h      # FatFs 磁盘 I/O（对接 Flash MSC 分区）
-│           ├── ffconf.h        # FatFs 配置（FF_USE_MKFS=1）
-│           └── fatfs_api.h     # f_mkfs / mount / 格式化封装
+│   └── modules/shell/        # 【基础 Shell】RP2040 命令用 OS_CFG_PORT_RP2040 隔离
+│       ├── shell.c           # Shell 主逻辑：输入/解析/基础命令
+│       ├── shell_core.h      # 扩展命令注册 API（shell_register）
+│       └── shell_register.c
 │
-├── port/rp2040/                # 【RP2040 移植层】
-│   ├── hal_port.c              # HAL ops 实现：SysTick/Console/GPIO/SPI/I2C/UART/Flash/USB
-│   ├── hal_port.h
-│   ├── context_switch.S        # ★ 核心：PendSV/SVC/HardFault/NMI/Invalid IRQ
-│   ├── startup_rp2040.S        # 备用（当前用 SDK crt0.S，不参与链接）
-│   ├── msc_usb.c               # USB 复合设备描述符 + MSC SCSI 回调
-│   ├── msc_blockdev.c/h        # MSC 块设备（读 Flash MSC 分区扇区）
-│   └── rp2040.ld               # 备用（当前用 SDK memmap_default.ld）
-│
-├── examples/builtin_demo/
-│   └── demo_app.c              # 演示应用入口（创建 Shell 任务 + FatFs 初始化）
-│
-├── tests/
-│   ├── unit/                   # 单元测试（Unity 框架）
-│   │   ├── test_mem_mgmt.c
-│   │   ├── test_sched.c
-│   │   └── test_task_mgmt.c
-│   ├── minimal_led_test.c      # 诊断固件 1：纯 SDK 闪灯（排除硬件问题）
-│   └── usb_print_test.c        # 诊断固件 2：纯 SDK USB CDC 打印（排除 USB 通路）
-│
-├── cmake/check_size.cmake      # 构建后体积红线检查（解析 .map）
+├── tests/unit/               # 单元测试（Unity 框架）
+├── cmake/check_size.cmake    # 构建后体积红线检查（解析 .map）
 └── scripts/gen_config_macros.py
+
+project/rp2040demo/           # 【RP2040 目标工程】（烧录固件）
+├── src/main.c                # 应用入口（main() → kernel_main()）
+├── os_config.h               # 本工程专属裁剪配置（RP2040 功能全开）
+├── CMakeLists.txt / build.bat
+└── rp2040_port/              # 【RP2040 移植层】（v2.5 起全部搬到这里）
+    ├── hal_port.c / hal_port.h         # HAL ops 实现：SysTick/Console/GPIO/I2C/UART/Flash/USB
+    ├── context_switch.S                # ★ 核心：PendSV/SVC/HardFault/NMI/Invalid IRQ
+    ├── msc_usb.c / msc_blockdev.c/h    # USB 复合设备 + MSC 块设备
+    ├── include/hal/                    # config_store.h / sysclk.h / flash_layout.h
+    ├── kernel/                         # config_store.c / diskio.c / fatfs_api.h / ffconf.h
+    ├── shell/                          # bootscript.c / shell_fs.c / shell_mcore.c / shell_ovclk.c
+    └── demo/demo_app.c                 # 演示应用入口（创建 Shell 任务 + FatFs 初始化）
 ```
 
 **关键代码引用**:
-- 构建系统: [CMakeLists.txt](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt)
-- 编译脚本: [build.bat](file:///e:/ppCD/project/mini-kernel/build.bat)
-- Flash 分区: [flash_layout.h](file:///e:/ppCD/project/mini-kernel/include/hal/flash_layout.h)
+- 构建系统: [mini-kernel/CMakeLists.txt](file:///e:/ppCD/project/mini-kernel/CMakeLists.txt)
+- 编译脚本: [mini-kernel/build.bat](file:///e:/ppCD/project/mini-kernel/build.bat)
+- RP2040 移植层: [rp2040demo/rp2040_port](file:///e:/ppCD/project/rp2040demo/rp2040_port)
+- Flash 分区: [rp2040demo/rp2040_port/include/hal/flash_layout.h](file:///e:/ppCD/project/rp2040demo/rp2040_port/include/hal/flash_layout.h)
 
 ---
 
