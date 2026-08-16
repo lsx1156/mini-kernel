@@ -40,7 +40,8 @@ void config_defaults(config_data_t *cfg) {
     cfg->version = CONFIG_VERSION;
     cfg->clock_mhz = 0;                      /* 0 = 未设置 → 启动回 125MHz 默认 */
     cfg->multi_core = 0;                     /* 单核 */
-    /* reserved 已 memset 为 0 */
+    cfg->reserved[0] = 1;                    /* v2.7 demo_show：默认开（展示任务自动运行） */
+    /* 其余 reserved 已 memset 为 0 */
     cfg->crc32 = config_calc_crc(cfg);
 }
 

@@ -32,6 +32,8 @@ extern const char *k_version(void);
 void demo_app_init(void);
 /* shell_start 由 shell.c 提供（OS_CFG_SHELL=1 时创建交互 shell 任务）*/
 extern void shell_start(void);
+/* v2.7 展示/稳定性验证（demo_show.c）：OLED FPS 动画 + LED 呼吸 + GP15 PWM */
+extern void demo_show_boot_start(void);
 
 #if OS_CFG_DEMO_APP
 
@@ -371,6 +373,12 @@ void demo_app_init(void) {
         demo_puts("[BOOT  ] Entering persistent boot command playback (shell_start → bootscript_run_all)...\r\n");
         demo_puts("\r\n");
     }
+#endif
+
+#if OS_CFG_PERIPH_SERVICE
+    /* v2.7 展示/稳定性验证：config 开（默认）→ 创建 show 任务
+     *   （OLED FPS 动画 + LED 呼吸灯 + GP15 PWM；'show off' 固化删除）。 */
+    demo_show_boot_start();
 #endif
 
     /* 创建交互式 Shell 任务（USB CDC + UART0 双通道）

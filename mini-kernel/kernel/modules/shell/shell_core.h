@@ -65,6 +65,9 @@ void shell_mcore_register(void);   /* 定义在 shell_mcore.c（注册 mcore，R
 #if OS_CFG_IPC
 void shell_ipc_register(void);     /* 定义在 shell_ipc.c（注册 ipc，v2.6 双核共享内存 IPC） */
 #endif
+#if OS_CFG_DEMO_APP
+void shell_show_register(void);    /* 定义在 demo_show.c（注册 show，v2.7 展示/稳定性验证） */
+#endif
 
 #ifdef __cplusplus
 }

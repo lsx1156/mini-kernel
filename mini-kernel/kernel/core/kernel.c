@@ -157,7 +157,7 @@ static void _boot_setup_task(void *arg) {
     {
         for (int i = 0; i < 60; i++) hal_console_putc('=');
         hal_console_putc('\r'); hal_console_putc('\n');
-        const char *banner = "=== Mini Kernel Boot v2.6.0-flash75 ===\r\n";
+        const char *banner = "=== Mini Kernel Boot v2.7.0-flash76 ===\r\n";
         for (const char *p = banner; *p; p++) hal_console_putc(*p);
         for (int i = 0; i < 60; i++) hal_console_putc('=');
         hal_console_putc('\r'); hal_console_putc('\n');

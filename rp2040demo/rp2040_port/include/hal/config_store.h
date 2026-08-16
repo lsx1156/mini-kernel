@@ -29,7 +29,8 @@ extern "C" {
 
 /* ---------- 魔数与版本 ---------- */
 #define CONFIG_MAGIC          0x4D4B3243u   /* 'MK2C' */
-#define CONFIG_VERSION        2u            /* v2.4.2：clock_tier(档位号) → clock_mhz(任意 MHz) */
+#define CONFIG_VERSION        3u            /* v2.7：reserved[0] → demo_show（展示任务开关，默认 1=开）。
+                                             * v3 起旧 v2 配置判无效 → 回 defaults（demo_show=1）。 */
 
 /* ---------- 固化配置数据结构（固定 20 字节） ---------- */
 typedef struct {
@@ -37,7 +38,8 @@ typedef struct {
     uint16_t version;      /* == CONFIG_VERSION */
     uint16_t clock_mhz;    /* 超频主频 MHz：0=未设置（启动回 125MHz 默认） */
     uint8_t  multi_core;   /* 多核使能：0=单核（默认） 1=双核 */
-    uint8_t  reserved[7];  /* 保留，将来扩展，当前恒 0x00 */
+    uint8_t  reserved[7];  /* reserved[0]=demo_show：0=开机不跑展示 1=自动运行（默认）。
+                           * 其余保留，恒 0x00。 */
     uint32_t crc32;        /* CRC32(前 16 字节) */
 } config_data_t;
 

@@ -197,6 +197,7 @@ endif()
 add_executable(${PROJECT_NAME}
     src/main.c
     ${RP2040_PORT_DIR}/demo/demo_app.c   # v2.5.1：直接编进 exe（见上方 rp2040_port 库注释）
+    ${RP2040_PORT_DIR}/demo/demo_show.c  # v2.7：展示/稳定性验证（OLED FPS + 呼吸 LED + GP15 PWM）
 )
 target_compile_options(${PROJECT_NAME} PRIVATE ${DEMO_COMMON_FLAGS})
 if(OS_CFG_DEFINES)
@@ -259,6 +260,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_spi
     hardware_i2c
     hardware_irq
+    hardware_pwm
     pico_multicore
     hardware_vreg
     hardware_pll
