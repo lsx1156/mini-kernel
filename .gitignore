@@ -27,6 +27,9 @@ bat_run*.log
 *.dis
 *.elf.map
 *.elf
+# Except ready-to-flash builds in firmware/ (published for download)
+!firmware/
+!firmware/*.uf2
 
 # Backup files
 *.bak

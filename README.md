@@ -110,6 +110,12 @@ cd rp2040demo
 - 🖥️ USB 串口（115200-8-N-1）：看启动 banner、打 Shell 命令
 - 💾 USB 可移动磁盘（≈ 1012 KiB FAT16 U 盘）：电脑直接读写，Shell 也能 `ls/cd/cat/mkdir`
 
+**💾 直接下载固件（免构建，v2.7.1-fix）**：仓库 [`firmware/`](./firmware) 目录下已放置现成的 `.uf2`，直接下载拖进 `RPI-RP2` 即可：
+| 固件 | 命令集 | 展示任务 | 下载 |
+|---|---|---|---|
+| rp2040demo.uf2 | 完整（fs/msc/ovclk/mcore/ipc/...） | ✅ 有（OLED FPS + 呼吸 LED + GP15 PWM） | [下载](./firmware/rp2040demo.uf2) |
+| rp2040system.uf2 | 完整（同上） | ❌ 无展示 | [下载](./firmware/rp2040system.uf2) |
+
 ---
 
 ## 🗂️ 版本状态速览（与 mini-kernel/README 一致）
