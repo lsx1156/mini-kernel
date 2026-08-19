@@ -120,8 +120,7 @@ cd rp2040demo
 
 ## 🗂️ 版本状态速览（与 mini-kernel/README 一致）
 
-| 版本 | 状态 | 关键词 |
-|---|---|---|
+| v2.8 | 📅 规划中 | 🟢 **PLC 循环指令引擎**：100+ 梯形图指令 + 10ms 扫描周期 + 4 Flash 槽位持久化 + 在线调试 |
 | v2.7.1 | ✅ **当前稳定**（仓库 HEAD） | 🟢 **三部分分离 + 时钟树说明**：mini-kernel / rp2040demo（Demo 完整体截止）/ rp2040system（无展示）；多核 idle 栈修复、FPS 修正、GP15 精确台阶 PWM。🟡 **v2.7.1-fix**：移除超频切换的 USB 阻塞 busy-wait + shell 栈 4096 + 故障转储升级，修复 `ovclk try 250` 运行时崩溃。⚠️ **demo 已知限制**：>250MHz 超频不稳定 + USB CDC 失效，demo 不再修复，后续可能在 system 修 |
 | v2.7 | ✅ 已发布历史 | 🟢 展示/稳定性验证：OLED FPS 动画 + 呼吸 LED + GP15 PWM（show 任务） |
 | v2.5 | ✅ 已发布历史 | 🟢 两版本分离（内核库纯净化）：mini-kernel 可移植纯静态库；rp2040demo 独立编译 `rp2040_port`；`OS_CFG_PORT_RP2040` 总开关隔离；新增指令说明书 |
