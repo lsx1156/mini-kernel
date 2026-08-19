@@ -130,6 +130,7 @@ cd rp2040demo
 | v2.3+ | 📅 规划中 | GPIO → TFT LCD 驱动 / 目录命令补全（cat 大文件分屏 / cp / mv） |
 | v3.0 | 📅 远期规划 | VFS 虚拟文件系统抽象层（挂载多路，路径/驱动解耦） |
 | v3.5 | 📅 远期规划 | RP2350 多核（SMP）+ RISC-V（CH32V/bl702）移植 |
+| v4.0 | 🔮 预告     | **RP2350 (Cortex-M33 + RISC-V) 适配**：双核 SMP 调度、TrustZone 安全、更大 RAM/Flash、更高主频、更多外设、Pico 2 硬件支持 |
 
 ---
 

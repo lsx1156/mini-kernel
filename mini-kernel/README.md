@@ -117,6 +117,7 @@ project/
 | v2.3               | 📋 规划      | RP2040 板载 TFT (SPI 线路 B 剩余) + 图形 API 演示                                                                                                                                                                                                                                                |
 | v3.0               | 🗓️ 规划     | VFS 抽象层 + 多分区 + SD Card (SPI1)                                                                                                                                                                                                                                                         |
 | v3.5               | 🗓️ 规划     | 多核调度 (RP2040 Core 1 唤醒) + RISC-V RV32 移植                                                                                                                                                                                                                                               |
+| v4.0               | 🔮 预告     | **RP2350 (Cortex-M33 + RISC-V) 适配**：双核 SMP 调度、TrustZone 安全、更大 RAM/Flash、更高主频、更多外设、Pico 2 硬件支持 |
 
 ***
 
