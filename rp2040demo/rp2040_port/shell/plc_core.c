@@ -841,6 +841,10 @@ static plc_err_t exec_inst(plc_ctx_t *ctx, const plc_inst_t *inst) {
             break;
         }
 
+        case PLC_OP_LABEL:
+            /* 伪指令：标号定义，运行时不做任何操作，相当于 NOP */
+            break;
+
         default:
             return PLC_ERR_INVALID_OP;
     }
