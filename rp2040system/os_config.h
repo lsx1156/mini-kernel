@@ -69,7 +69,7 @@
 #define OS_CFG_MAX_MUTEX              4   /* 最大互斥锁数                 */
 #define OS_CFG_MAX_QUEUE              8   /* 最大消息队列数               */
 #define OS_CFG_MAX_TIMERS             4   /* 最大软件定时器数             */
-#define OS_CFG_HEAP_SIZE_BYTES        (16*1024) /* 内核堆大小（任务栈+TCB+kmalloc） */
+#define OS_CFG_HEAP_SIZE_BYTES        (32*1024) /* 内核堆大小（任务栈+TCB+kmalloc） */
 #define OS_CFG_IDLE_STACK_SIZE        4096 /* 空闲任务栈 (字节)。v2.7.1: 1024B 崩、
                                             * 2048B 仍崩。idle 每 1ms 跑 hal_usb_poll，
                                             * USB TX 忙(tud_cdc_n_write)时深栈 >2KB，
