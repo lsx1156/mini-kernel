@@ -80,9 +80,11 @@ file(GLOB RP2040_PORT_SRCS
     ${RP2040_PORT_DIR}/shell/shell_fs.c
     ${RP2040_PORT_DIR}/shell/shell_mcore.c
     ${RP2040_PORT_DIR}/shell/shell_ovclk.c
+    ${RP2040_PORT_DIR}/shell/shell_plc.c
     ${RP2040_PORT_DIR}/ipc/shmem_ipc.c
     ${RP2040_PORT_DIR}/ipc/core1_worker.c
     ${RP2040_PORT_DIR}/ipc/shell_ipc.c
+    ${RP2040_PORT_DIR}/shell/plc_core.c
 )
 # 【v2.5.1 关键修复】demo_app.c 不进静态库、直接编进可执行目标：
 #   kernel.c 对 demo_app_init 只有 weak 引用 —— weak 引用不会从静态库拉取

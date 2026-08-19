@@ -2465,6 +2465,10 @@ static void task_shell(void *arg) {
      * OS_CFG_SHOW_DEMO=0 → 不注册 show 命令（无展示）。 */
     shell_show_register();
 #endif
+#if OS_CFG_PORT_RP2040
+    /* v2.8 注册 plc（类梯形图循环指令引擎）命令 */
+    shell_plc_register();
+#endif
 
 #if OS_CFG_FATFS
     /* v2.2 ② 挂载 FatFs（空片时会自动 f_mkfs FAT16）

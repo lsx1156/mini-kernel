@@ -68,6 +68,9 @@ void shell_ipc_register(void);     /* 定义在 shell_ipc.c（注册 ipc，v2.6 
 #if OS_CFG_DEMO_APP
 void shell_show_register(void);    /* 定义在 demo_show.c（注册 show，v2.7 展示/稳定性验证） */
 #endif
+#if OS_CFG_PORT_RP2040
+void shell_plc_register(void);     /* 定义在 shell_plc.c（注册 plc，类梯形图循环指令引擎） */
+#endif
 
 #ifdef __cplusplus
 }
