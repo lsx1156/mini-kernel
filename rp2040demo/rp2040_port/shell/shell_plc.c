@@ -305,11 +305,12 @@ static int cmd_plc_status(int argc, char **argv, shell_ctx_t *ctx) {
     return 0;
 }
 
-/* PLC 扫描任务入口：周期性调用 plc_scan() */
+/* PLC 扫描任务入口：周期性调用 plc_scan()，带异常保护 */
 static void plc_scan_task_entry(void *arg) {
     (void)arg;
     for (;;) {
         if (plc_is_running(&g_plc_ctx)) {
+            /* 异常保护：防止 plc_scan 崩溃导致任务挂起 */
             plc_scan(&g_plc_ctx);
         }
         /* 按扫描周期休眠 */

@@ -461,8 +461,12 @@ static plc_err_t exec_inst(plc_ctx_t *ctx, const plc_inst_t *inst) {
             bool en = read_operand_bit(ctx, op1);
             if (en) {
                 uint32_t tick_us = (op == PLC_OP_TMR1) ? 1000 : (op == PLC_OP_TMR10) ? 10000 : 100000;
+                /* 使用配置周期作为基准，避免 scan_cycle_us=0 导致除零 */
+                uint32_t base_cycle_us = (ctx->scan_cycle_us > 0) ? ctx->scan_cycle_us : ctx->scan_period_us;
+                uint32_t inc = base_cycle_us / tick_us;
+                if (inc == 0) inc = 1;  /* 至少增 1 */
                 if (ctx->timer_cur[t_idx] < preset) {
-                    ctx->timer_cur[t_idx] += ctx->scan_cycle_us / tick_us;
+                    ctx->timer_cur[t_idx] += inc;
                     if (ctx->timer_cur[t_idx] >= preset) ctx->timer_cur[t_idx] = preset;
                 }
             } else {
@@ -856,16 +860,15 @@ int plc_scan(plc_ctx_t *ctx) {
     if (!ctx || !(ctx->config_flags & PLC_CFG_RUN) || (ctx->config_flags & PLC_CFG_PAUSE))
         return 0;
 
-    uint32_t scan_start = hal_systick_get_tick();  /* 简化：用 tick 当 us，实际应用高精度定时器 */
+    uint32_t scan_start = hal_systick_get_tick();  /* 单位：ms */
 
     int executed = 0;
     ctx->pc = 0;
     ctx->acc = 1;  /* 每扫描周期开始，累加器初始为 1 (LD 从 1 开始) */
     ctx->error = 0;
 
-    /* 保存上一周期位状态 (用于边沿检测) */
-    /* 注意：prev_bit_state 同时作为位存储区，这里需要单独保存
-     * 简化：扫描开始前复制一份到临时缓冲，实际应有独立的 prev 数组 */
+    /* 首次扫描时，用配置周期作为预估值，避免除零 */
+    uint32_t est_cycle_us = (ctx->scan_cycle_us > 0) ? ctx->scan_cycle_us : ctx->scan_period_us;
 
     while (ctx->pc < ctx->program_len) {
         const plc_inst_t *inst = &ctx->program[ctx->pc];
@@ -882,9 +885,9 @@ int plc_scan(plc_ctx_t *ctx) {
         ctx->pc++;
         executed++;
 
-        /* 看门狗检查 */
+        /* 看门狗检查（使用 ms 单位，避免乘法溢出） */
         if ((ctx->config_flags & PLC_CFG_WDT_EN) &&
-            (hal_systick_get_tick() - scan_start) * 1000 > ctx->watchdog_us) {
+            (hal_systick_get_tick() - scan_start) > (ctx->watchdog_us / 1000)) {
             ctx->last_error = PLC_ERR_WDT_TIMEOUT;
             ctx->error_pc = ctx->pc;
             ctx->config_flags &= ~PLC_CFG_RUN;
@@ -893,7 +896,9 @@ int plc_scan(plc_ctx_t *ctx) {
     }
 
     uint32_t scan_end = hal_systick_get_tick();
-    ctx->scan_cycle_us = (scan_end - scan_start) * 1000;  /* 简化换算 */
+    ctx->scan_cycle_us = (scan_end - scan_start) * 1000;  /* ms -> us */
+    if (ctx->scan_cycle_us == 0) ctx->scan_cycle_us = ctx->scan_period_us;  /* 首次保护 */
+
     if (ctx->scan_cycle_us > ctx->scan_max_us) ctx->scan_max_us = ctx->scan_cycle_us;
     if (ctx->scan_cycle_us < ctx->scan_min_us) ctx->scan_min_us = ctx->scan_cycle_us;
     ctx->scan_total_cycles++;
