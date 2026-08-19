@@ -77,13 +77,16 @@ file(GLOB RP2350_PORT_SRCS
     ${RP2350_PORT_DIR}/startup_rp2350.S
     ${RP2350_PORT_DIR}/rp2350_clk.c
     ${RP2350_PORT_DIR}/rp2350_gpio.c
-    ${RP2350_PORT_DIR}/rp2350_usb.c
     ${RP2350_PORT_DIR}/rp2350_flash.c
     ${RP2350_PORT_DIR}/kernel/config_store.c
     ${RP2350_PORT_DIR}/kernel/diskio.c
+    ${RP2350_PORT_DIR}/msc_blockdev.c
+    ${RP2350_PORT_DIR}/msc_usb.c
     ${RP2350_PORT_DIR}/shell/bootscript.c
     ${RP2350_PORT_DIR}/shell/shell_fs.c
     ${RP2350_PORT_DIR}/shell/shell_ovclk.c
+    ${RP2350_PORT_DIR}/shell/shell_mcore.c
+    ${RP2350_PORT_DIR}/shell/shell_ipc.c
     ${RP2350_PORT_DIR}/shell/shell_plc.c
     ${RP2350_PORT_DIR}/ipc/shmem_ipc.c
     ${RP2350_PORT_DIR}/ipc/core1_worker.c
@@ -104,6 +107,7 @@ target_include_directories(rp2350_port PUBLIC
     ${RP2350_PORT_DIR}/include
     ${RP2350_PORT_DIR}/shell
     ${RP2350_PORT_DIR}/kernel
+    ${RP2350_PORT_DIR}/ipc
 )
 
 # 依赖 Pico SDK
@@ -135,6 +139,23 @@ target_compile_options(rp2350_port PRIVATE ${DEMO_COMMON_FLAGS_M33})
 target_compile_definitions(rp2350_port PRIVATE
     RP2350_HAS_TRUSTZONE=1
     PICO_RP2350=1
+)
+
+# MSC/USB 需要 TinyUSB 头文件 (msc_usb.c 引用 tusb.h)
+target_compile_definitions(rp2350_port PRIVATE
+    CFG_TUD_MSC=1
+    CFG_TUD_MSC_EP_BUFSIZE=512
+)
+target_include_directories(rp2350_port PRIVATE
+    "${PICO_SDK_PATH}/lib/tinyusb/src"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/cdc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/class/msc"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/common"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/device"
+    "${PICO_SDK_PATH}/lib/tinyusb/src/osal"
+    "${PICO_SDK_PATH}/src/rp2_common/pico_stdio_usb/include"
+    "${PICO_SDK_PATH}/src/rp2_common/tinyusb"
+    "${CMAKE_BINARY_DIR}/generated/pico-sdk"
 )
 
 # ================================================================
@@ -210,6 +231,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${RP2350_PORT_DIR}/include
     ${RP2350_PORT_DIR}/shell
     ${RP2350_PORT_DIR}/kernel
+    ${RP2350_PORT_DIR}/ipc
 )
 
 if(TARGET fatfs_module)
