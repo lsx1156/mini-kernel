@@ -26,6 +26,7 @@
 #include "hal/plc_core.h"
 #include "hal/flash_layout.h"
 #include "hal/hal_interface.h"
+#include "task.h"   /* for task_create, task_suspend, task_resume, task_sleep */
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -38,6 +39,7 @@
 
 static plc_ctx_t g_plc_ctx;
 static bool g_plc_inited = false;
+static tcb_t *g_plc_scan_task = NULL;  /* PLC 扫描任务句柄 */
 
 /* Flash 存储区：PLC 程序存储在 Config 区之后、Bootscript SEC_A 之前
  * 可用空间：0x1FD000 (Config结束) 到 0x1FE000 (SEC_A开始) = 4KB
@@ -303,10 +305,38 @@ static int cmd_plc_status(int argc, char **argv, shell_ctx_t *ctx) {
     return 0;
 }
 
+/* PLC 扫描任务入口：周期性调用 plc_scan() */
+static void plc_scan_task_entry(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (plc_is_running(&g_plc_ctx)) {
+            plc_scan(&g_plc_ctx);
+        }
+        /* 按扫描周期休眠 */
+        task_sleep(g_plc_ctx.scan_period_us / 1000);  /* scan_period_us 是微秒，task_sleep 单位是 tick (1ms) */
+    }
+}
+
 static int cmd_plc_run(int argc, char **argv, shell_ctx_t *ctx) {
     (void)argc; (void)argv;
     if (!g_plc_inited) { shell_puts(ctx, "PLC not initialized.\r\n"); return 1; }
+    
     plc_run(&g_plc_ctx);
+    
+    /* 创建扫描任务（如果不存在） */
+    if (!g_plc_scan_task) {
+        g_plc_scan_task = task_create("plc_scan", plc_scan_task_entry, NULL, 1024, 2);
+        if (!g_plc_scan_task) {
+            shell_puts(ctx, "PLC RUNNING (but scan task creation failed!)\r\n");
+            return 1;
+        }
+    } else {
+        /* 任务已存在，确保它被唤醒 */
+        if (g_plc_scan_task->state == TASK_STATE_SUSPEND) {
+            task_resume(g_plc_scan_task);
+        }
+    }
+    
     shell_puts(ctx, "PLC RUNNING\r\n");
     return 0;
 }
@@ -314,7 +344,14 @@ static int cmd_plc_run(int argc, char **argv, shell_ctx_t *ctx) {
 static int cmd_plc_stop(int argc, char **argv, shell_ctx_t *ctx) {
     (void)argc; (void)argv;
     if (!g_plc_inited) { shell_puts(ctx, "PLC not initialized.\r\n"); return 1; }
+    
     plc_stop(&g_plc_ctx);
+    
+    /* 挂起扫描任务 */
+    if (g_plc_scan_task) {
+        task_suspend(g_plc_scan_task);
+    }
+    
     shell_puts(ctx, "PLC STOPPED\r\n");
     return 0;
 }
@@ -323,6 +360,12 @@ static int cmd_plc_pause(int argc, char **argv, shell_ctx_t *ctx) {
     (void)argc; (void)argv;
     if (!g_plc_inited) { shell_puts(ctx, "PLC not initialized.\r\n"); return 1; }
     plc_pause(&g_plc_ctx);
+    
+    /* 挂起扫描任务 */
+    if (g_plc_scan_task) {
+        task_suspend(g_plc_scan_task);
+    }
+    
     shell_puts(ctx, "PLC PAUSED\r\n");
     return 0;
 }
@@ -344,6 +387,12 @@ static int cmd_plc_reset(int argc, char **argv, shell_ctx_t *ctx) {
     (void)argc; (void)argv;
     if (!g_plc_inited) { shell_puts(ctx, "PLC not initialized.\r\n"); return 1; }
     plc_reset(&g_plc_ctx);
+    
+    /* 复位时也停止扫描任务 */
+    if (g_plc_scan_task) {
+        task_suspend(g_plc_scan_task);
+    }
+    
     shell_puts(ctx, "PLC RESET\r\n");
     return 0;
 }
