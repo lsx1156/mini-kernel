@@ -964,8 +964,15 @@ static hal_err_t hal_flash_erase_sector_impl(uint32_t offset) {
     if ((offset % HAL_FLASH_SECTOR_SIZE) != 0) return HAL_ERR_PARAM;
     if (offset > (PICO_FLASH_SIZE_BYTES - HAL_FLASH_SECTOR_SIZE)) return HAL_ERR_PARAM;
     
-    /* 使用 SDK 的 flash_range_erase，它内部会在扇区擦除间隙重新启用中断保护 USB */
-    flash_range_erase(offset, HAL_FLASH_SECTOR_SIZE);
+    /* 手动分片擦除：每次擦除 1/4 扇区 (1KB)，每次操作后重新启用中断保护 USB */
+    const uint32_t chunk_size = HAL_FLASH_SECTOR_SIZE / 4;  /* 1KB per chunk */
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t chunk_offset = offset + i * chunk_size;
+        flash_range_erase(chunk_offset, chunk_size);
+        /* 显式重新启用中断，让 USB 有机会处理 SOF */
+        __asm volatile ("cpsie i" ::: "memory");
+        busy_wait_us(10);  /* 短暂延时让 USB 处理中断 */
+    }
     return HAL_OK;
 }
 
@@ -990,8 +997,10 @@ static hal_err_t hal_flash_program_impl(uint32_t offset, const uint8_t *data, si
             page_buf[page_off + i] &= src[i];
         }
         
-        /* 每页单独调用 flash_range_program，SDK 内部会在页间隙重新启用中断 */
+        /* 每页单独调用 flash_range_program，写入后显式重新启用中断 */
         flash_range_program(page_start, page_buf, HAL_FLASH_PAGE_SIZE);
+        __asm volatile ("cpsie i" ::: "memory");
+        busy_wait_us(5);  /* 短暂延时让 USB 处理中断 */
         
         offset += chunk;
         src += chunk;
