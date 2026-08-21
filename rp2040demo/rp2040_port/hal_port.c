@@ -1091,76 +1091,64 @@ bool sysclk_apply_mhz(uint32_t mhz) {
         return false;
     }
 
-    /* 【v2.4.3 · 切换全程关中断】
-     * 内核 tick(TIMER_IRQ_0)/USB IRQ 在 clk_sys 重新配置的瞬间若抢占，
-     * ISR 会在过渡频率 + 过渡 flash 分频下从 XIP 取指 → 二次崩溃风险。
-     * 这里把"升压 + flash 分频 + PLL 切换 + clk_peri"整个临界区关中断，
-     * 保证切换原子性（耗时几百 µs，丢一两个 tick 无碍，USB 短暂停顿可恢复）。 */
-    uint32_t irq_save = save_and_disable_interrupts();
-
-    /* 【v2.7.1-fix】通知 core1 show 任务在切换期间暂停（核心切换只保护 core0 中断）。
-     * 不能在这里 busy_wait 等 show —— save_and_disable_interrupts() 已把 core0
-     * 全部中断屏蔽，若 busy_wait 50ms，USB 就 50ms 不被服务 → 主机判定设备超时
-     * 发起 reset/重新枚举 → 中断恢复后 USB IRQ 处理一个被破坏的端点状态 → 二次崩。
-     * 正确做法：只置标志（show 在帧边界自检暂停），随后立即执行切换。切换窗口仅
-     * 几百 µs，flash 分频已提前放大 + clk_peri 已钳制，show 即使恰在 I2C 中也会
-     * 由 I2C 超时/重初恢复；show 栈已是 4096，不再溢出破坏共享 RAM。 */
+    /* 【v2.7.1-fix】通知 core1 show 任务在切换期间暂停 */
     g_oc_switching = 1;
 
+    /* ===== 阶段 1：VREG 升压 + 稳定等待 (开中断，可被 USB/timer 抢占) ===== */
     /* 高主频先升压，保证 PLL/核心时序余量。
-             * RP2040 官方建议（需根据实测调整）：
-             *   125MHz: 1.10V (默认)
-             *   200-250MHz: 1.20V
-             *   270-350MHz: 1.25V
-             *   375-500MHz: 1.30V (VREG_VOLTAGE_MAX) - 实测 375MHz 需 1.30V
-             * 本实现仅支持预设档位，避免任意频率导致 PLL 锁定失败。 */
-            if (target >= 375u) {
-                vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 375/500MHz */
-            } else if (target >= 250u) {
-                vreg_set_voltage(VREG_VOLTAGE_1_20);      /* 1.20V - 250MHz */
-            } else {
-                vreg_set_voltage(VREG_VOLTAGE_1_10);      /* 1.10V - 125MHz */
-            }
+     * RP2040 实测建议：
+     *   125MHz: 1.10V (默认)
+     *   200-250MHz: 1.20V
+     *   270-350MHz: 1.25V
+     *   375-500MHz: 1.30V (VREG_VOLTAGE_MAX) - 实测 375MHz 需 1.30V */
+    if (target >= 375u) {
+        vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 375/500MHz */
+    } else if (target >= 250u) {
+        vreg_set_voltage(VREG_VOLTAGE_1_20);      /* 1.20V - 250MHz */
+    } else {
+        vreg_set_voltage(VREG_VOLTAGE_1_10);      /* 1.10V - 125MHz */
+    }
 
-            /* 电压稳定等待：VREG 升压约需 100-200μs，给足余量避免 PLL 切换时欠压 */
-            if (target > 125u) {
-                busy_wait_us(2000);  /* 2ms 确保 VREG 完全稳定 */
-            }
+    /* 电压稳定等待：VREG 升压约需 100-200μs，给足余量避免 PLL 切换时欠压
+     * 这里开中断等待，不阻塞 USB/timer 中断 */
+    if (target > 125u) {
+        busy_wait_us(2000);  /* 2ms 确保 VREG 完全稳定 */
+    }
 
-    /* 【v2.4.2 · XIP flash 分频必须在时钟切换的"正确时机"写入】
-     * set_sys_clock_khz 内部序列：切 clk_sys 到 pll_usb(48MHz) → 重配
-     * pll_sys → **把 clk_sys 直接切到目标频率**。若分频没提前准备好，
-     * 切到 375MHz 的瞬间 flash 时钟 = 375 / 旧分频(≈2) ≈ 187MHz 远超
-     * flash 上限 → XIP 取指失败 → CPU 挂死（现象：`ovclk try 2` 打出
-     * "applying now..." 后串口立刻断，连 apply 结果都来不及打印）。
-     *
-     * 正确顺序（保证整个切换过程 flash 时钟都不超 SYSCLK_FLASH_MAX_MHZ）：
+    /* ===== 阶段 2：Flash 分频提前设置 + PLL 切换 (短暂关中断 ~几百μs) ===== */
+    /* 正确顺序（保证整个切换过程 flash 时钟都不超 SYSCLK_FLASH_MAX_MHZ）：
      *   · 升频：先把分频加大（此刻 clk_sys 还低，flash 只会更慢，安全），
      *     再切 PLL —— 切到目标频率瞬间 flash 时钟 = 目标/新分频 ≤ 上限；
      *   · 降频：先降 clk_sys（旧分频下 flash 时钟随 clk_sys 一起下降，
-     *     不会超速），切完再把分频减小。
-     * （set_sys_clock_khz 不触碰 pll_usb，USB 时钟独立保持 48MHz。） */
+     *     不会超速），切完再把分频减小。 */
     uint32_t new_baud = (target + SYSCLK_FLASH_MAX_MHZ - 1u) / SYSCLK_FLASH_MAX_MHZ;
     if (new_baud < 1u) new_baud = 1u;
     const bool up = (target > sysclk_current_mhz());
-    if (up) ssi_hw->baudr = new_baud;
 
-    /* 切换 SYS PLL 到目标频率（target 已由 check_sys_clock_khz 确认可达）。 */
-    if (!set_sys_clock_khz(target * 1000u, true)) {
+    /* 短暂关中断：仅保护 Flash 分频写入 + set_sys_clock_khz 调用瞬间 */
+    uint32_t irq_save = save_and_disable_interrupts();
+
+    if (up) ssi_hw->baudr = new_baud;  /* 升频：先加大分频 */
+
+    /* 切换 SYS PLL 到目标频率（target 已由 check_sys_clock_khz 确认可达）。
+     * set_sys_clock_khz 内部会：切 clk_sys 到 48MHz → 重配 PLL → 切回目标频率。 */
+    bool ok = set_sys_clock_khz(target * 1000u, true);
+
+    if (!up) ssi_hw->baudr = new_baud;  /* 降频：先切频率再减小分频 */
+
+    if (!ok) {
         set_sys_clock_khz(SYSCLK_MHZ_DEFAULT * 1000u, true);
         ssi_hw->baudr = (SYSCLK_MHZ_DEFAULT + SYSCLK_FLASH_MAX_MHZ - 1u) / SYSCLK_FLASH_MAX_MHZ;
-        g_oc_switching = 0;                /* 恢复 core1 show 任务 */
+        g_oc_switching = 0;
         restore_interrupts(irq_save);
         return false;
     }
-    if (!up) ssi_hw->baudr = new_baud;
 
+    restore_interrupts(irq_save);  /* 关键：尽快恢复中断，让 USB/timer 继续工作 */
+
+    /* ===== 阶段 3：PLL 锁定已完成 (set_sys_clock_khz 返回即锁定)，配置 clk_peri (开中断) ===== */
     /* 把 clk_peri 钳到 SYSCLK_PERI_MAX_MHZ 以内（自动整数分频）。
-     *   · 预设档都是 125 的整数倍（125/250/375/500）→ ceil(f/133) 分频后
-     *     clk_peri 恰好 = 125MHz（整数），UART/SPI/I2C/Timer 波特率与节拍
-     *     完全不变；
-     *   · 任意频率按真实 clk_sys 就近取整数分频，clk_peri ≤ 133MHz 保证
-     *     外设不超规格；USB 在 pll_usb(48MHz) 上，始终不受影响。 */
+     * 预设档都是 125 的整数倍 → clk_peri 恰好 = 125MHz（整数），外设波特率不变。 */
     uint32_t actual_mhz = sysclk_current_mhz();
     uint32_t pdiv = (actual_mhz + SYSCLK_PERI_MAX_MHZ - 1u) / SYSCLK_PERI_MAX_MHZ;
     if (pdiv < 1u) pdiv = 1u;
@@ -1170,15 +1158,10 @@ bool sysclk_apply_mhz(uint32_t mhz) {
                     actual_mhz * 1000u * 1000u,
                     (actual_mhz / pdiv) * 1000u * 1000u);
 
-    /* 【v2.4.3 · 按新 clk_peri 重设 UART0 波特率】
-     * clk_peri 被整数分频后（任意频率 ≠125 的倍数时 ≠125MHz），UART0 分频
-     * 仍按旧 clk_peri 算 → TTL 调试串口波特率会偏。RP2040 UART 分频器带
-     * 6 位小数部分，这里按新 clk_peri 重算（uart_set_baudrate 内部读
-     * clock_get_hz(clk_peri)），把 TTL 调试口精确恢复到 115200。 */
+    /* 按新 clk_peri 重设 UART0 波特率 */
     uart_set_baudrate(uart0, 115200);
 
-    g_oc_switching = 0;                /* 恢复 core1 show 任务 */
-    restore_interrupts(irq_save);
+    g_oc_switching = 0;  /* 恢复 core1 show 任务 */
     return true;
 }
 
