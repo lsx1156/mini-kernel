@@ -48,15 +48,14 @@ static void ovclk_init_pending(void) {
 
 /* 解析 "<tier|MHz>" 为频率（MHz）。
  *   · 0..SYSCLK_TIER_COUNT-1      → 档位号，取该档 MHz；
- *   · SYSCLK_MHZ_MIN..SYSCLK_MHZ_MAX → 直接作为 MHz（任意频率）。
- *   成功返回 1 且 *out 填 MHz；失败返回 0。 */
+ *   · 其他输入视为非法，仅支持预设档位 (125/250/375/500MHz)，
+ *     避免任意频率导致 PLL 锁定失败 / 电压档位不匹配。 */
 static int ovclk_to_mhz(const char *s, uint32_t *out) {
     if (!s || !out) return 0;
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!end || *end != '\0') return 0;
     if (v >= 0 && v < SYSCLK_TIER_COUNT) { *out = g_sysclk_tiers[v].mhz; return 1; }
-    if (v >= (long)SYSCLK_MHZ_MIN && v <= (long)SYSCLK_MHZ_MAX) { *out = (uint32_t)v; return 1; }
     return 0;
 }
 
@@ -75,9 +74,9 @@ static int cmd_ovclk(int argc, char **argv, shell_ctx_t *ctx) {
     if (argc < 2) {
         shell_puts(ctx,
             "ovclk: overclock / multi-core persistence (takes effect after SAVE + REBOOT)\n"
-            "  ovclk list               - list preset tiers (or input any MHz 100..500)\n"
-            "  ovclk set <tier|MHz>     - set frequency to persist (RAM only)\n"
-            "  ovclk try <tier|MHz>     - switch clock NOW (NOT persisted, reboot reverts)\n"
+            "  ovclk list               - list preset tiers (125/250/375/500MHz)\n"
+            "  ovclk set <tier>         - set frequency tier to persist (RAM only)\n"
+            "  ovclk try <tier>         - switch clock NOW (NOT persisted, reboot reverts)\n"
             "  ovclk mcore <0|1>        - set multi-core flag to persist (0=single 1=dual)\n"
             "  ovclk get                - show current clock + saved config\n"
             "  ovclk save               - persist frequency + mcore to flash\n"
@@ -104,10 +103,10 @@ static int cmd_ovclk(int argc, char **argv, shell_ctx_t *ctx) {
 
     /* ---- set ---- */
     if (!strcmp(sub, "set")) {
-        if (argc < 3) { shell_puts(ctx, "usage: ovclk set <tier|MHz>\n"); return 1; }
+        if (argc < 3) { shell_puts(ctx, "usage: ovclk set <tier 0..3>\n"); return 1; }
         uint32_t mhz = 0u;
         if (!ovclk_to_mhz(argv[2], &mhz)) {
-            shell_puts(ctx, "ERROR: invalid value. Use tier 0..3 or MHz 100..500.\n");
+            shell_puts(ctx, "ERROR: invalid tier. Use 0=125MHz 1=250MHz 2=375MHz 3=500MHz.\n");
             return 2;
         }
         s_pending.clock_mhz = (uint16_t)mhz;
@@ -120,10 +119,10 @@ static int cmd_ovclk(int argc, char **argv, shell_ctx_t *ctx) {
 
     /* ---- try ---- 运行时临时切换（不固化，reboot 后回到固化值/125MHz） */
     if (!strcmp(sub, "try")) {
-        if (argc < 3) { shell_puts(ctx, "usage: ovclk try <tier|MHz>\n"); return 1; }
+        if (argc < 3) { shell_puts(ctx, "usage: ovclk try <tier 0..3>\n"); return 1; }
         uint32_t mhz = 0u;
         if (!ovclk_to_mhz(argv[2], &mhz)) {
-            shell_puts(ctx, "ERROR: invalid value. Use tier 0..3 or MHz 100..500.\n");
+            shell_puts(ctx, "ERROR: invalid tier. Use 0=125MHz 1=250MHz 2=375MHz 3=500MHz.\n");
             return 2;
         }
         shell_puts(ctx, "applying now... (NOT persisted; reboot returns to saved/125MHz)\n");
