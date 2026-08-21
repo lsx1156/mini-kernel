@@ -87,25 +87,23 @@ hal_err_t config_write(const config_data_t *cfg) {
     memset(page_buf, 0xFF, sizeof(page_buf));
     memcpy(page_buf, &tmp, sizeof(tmp));
 
-    /* 写入完整 256 字节页 */
+    /* 单次写入完整 256 字节页 (无重试，最小化中断禁用时间) */
     e = hal_flash_program(FLASH_LAYOUT_CONFIG_OFFSET, page_buf, sizeof(page_buf));
     if (e != HAL_OK) return e;
 
-    /* 【关键】XIP 缓存失效：确保后续 XIP 读取看到新数据 */
-    #ifdef __ARMCC_VERSION
-        __ISB(); __DSB();
-    #else
-        __asm volatile ("dsb sy; isb" ::: "memory");
-    #endif
+    /* 【关键】XIP 缓存失效：手动 DSB + ISB */
+    __asm volatile ("dsb sy; isb" ::: "memory");
 
     /* 读回验证：对比所有关键字段 */
     const config_data_t *written = (const config_data_t *)hal_flash_map_read(FLASH_LAYOUT_CONFIG_OFFSET);
-    if (!written || written->magic != CONFIG_MAGIC || written->version != CONFIG_VERSION ||
-        written->clock_mhz != tmp.clock_mhz || written->multi_core != tmp.multi_core ||
-        written->crc32 != tmp.crc32) {
-        return HAL_ERR_IO;  /* 读回校验失败 */
+    if (written && written->magic == CONFIG_MAGIC && 
+        written->version == CONFIG_VERSION &&
+        written->clock_mhz == tmp.clock_mhz && 
+        written->multi_core == tmp.multi_core &&
+        written->crc32 == tmp.crc32) {
+        return HAL_OK;
     }
-    return HAL_OK;
+    return HAL_ERR_IO;
 }
 
 hal_err_t config_clear_all(void) {
