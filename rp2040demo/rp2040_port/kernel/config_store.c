@@ -78,10 +78,20 @@ hal_err_t config_write(const config_data_t *cfg) {
     tmp.version = CONFIG_VERSION;
     tmp.crc32   = config_calc_crc(&tmp);
 
-    /* Config 区 = 1 个 4 KiB 扇区：先整扇区擦除，再写 struct @@ */
+    /* Config 区 = 1 个 4 KiB 扇区：先整扇区擦除，再写 struct */
     hal_err_t e = hal_flash_erase_sector(FLASH_LAYOUT_CONFIG_OFFSET);
     if (e != HAL_OK) return e;
-    return hal_flash_program(FLASH_LAYOUT_CONFIG_OFFSET, (const uint8_t *)&tmp, sizeof(tmp));
+    e = hal_flash_program(FLASH_LAYOUT_CONFIG_OFFSET, (const uint8_t *)&tmp, sizeof(tmp));
+    if (e != HAL_OK) return e;
+
+    /* 【关键修复】写入后读回验证，确保 Flash 真正写入成功 */
+    const config_data_t *written = (const config_data_t *)hal_flash_map_read(FLASH_LAYOUT_CONFIG_OFFSET);
+    if (!written || written->magic != CONFIG_MAGIC || written->version != CONFIG_VERSION ||
+        written->clock_mhz != tmp.clock_mhz || written->multi_core != tmp.multi_core ||
+        written->crc32 != tmp.crc32) {
+        return HAL_ERR_IO;  /* 读回校验失败 */
+    }
+    return HAL_OK;
 }
 
 hal_err_t config_clear_all(void) {
