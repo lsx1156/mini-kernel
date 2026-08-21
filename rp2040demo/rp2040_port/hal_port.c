@@ -1121,6 +1121,11 @@ bool sysclk_apply_mhz(uint32_t mhz) {
             vreg_set_voltage(VREG_VOLTAGE_1_10);      /* 1.10V - 125MHz */
         }
 
+        /* 电压稳定等待：VREG 升压约需 100-200μs，给足余量避免 PLL 切换时欠压 */
+        if (target > 125u) {
+            busy_wait_us(500);
+        }
+
     /* 【v2.4.2 · XIP flash 分频必须在时钟切换的"正确时机"写入】
      * set_sys_clock_khz 内部序列：切 clk_sys 到 pll_usb(48MHz) → 重配
      * pll_sys → **把 clk_sys 直接切到目标频率**。若分频没提前准备好，
