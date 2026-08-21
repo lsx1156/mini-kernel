@@ -78,13 +78,27 @@ hal_err_t config_write(const config_data_t *cfg) {
     tmp.version = CONFIG_VERSION;
     tmp.crc32   = config_calc_crc(&tmp);
 
-    /* Config 区 = 1 个 4 KiB 扇区：先整扇区擦除，再写 struct */
+    /* Config 区 = 1 个 4 KiB 扇区：先整扇区擦除，再写入完整页 */
     hal_err_t e = hal_flash_erase_sector(FLASH_LAYOUT_CONFIG_OFFSET);
     if (e != HAL_OK) return e;
-    e = hal_flash_program(FLASH_LAYOUT_CONFIG_OFFSET, (const uint8_t *)&tmp, sizeof(tmp));
+
+    /* 准备 256 字节完整页：前 20 字节为 config_data_t，其余 0xFF (擦除态) */
+    uint8_t page_buf[256];
+    memset(page_buf, 0xFF, sizeof(page_buf));
+    memcpy(page_buf, &tmp, sizeof(tmp));
+
+    /* 写入完整 256 字节页 */
+    e = hal_flash_program(FLASH_LAYOUT_CONFIG_OFFSET, page_buf, sizeof(page_buf));
     if (e != HAL_OK) return e;
 
-    /* 【关键修复】写入后读回验证，确保 Flash 真正写入成功 */
+    /* 【关键】XIP 缓存失效：确保后续 XIP 读取看到新数据 */
+    #ifdef __ARMCC_VERSION
+        __ISB(); __DSB();
+    #else
+        __asm volatile ("dsb sy; isb" ::: "memory");
+    #endif
+
+    /* 读回验证：对比所有关键字段 */
     const config_data_t *written = (const config_data_t *)hal_flash_map_read(FLASH_LAYOUT_CONFIG_OFFSET);
     if (!written || written->magic != CONFIG_MAGIC || written->version != CONFIG_VERSION ||
         written->clock_mhz != tmp.clock_mhz || written->multi_core != tmp.multi_core ||
