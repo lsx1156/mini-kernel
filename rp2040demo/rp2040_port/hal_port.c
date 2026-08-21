@@ -965,9 +965,7 @@ static hal_err_t hal_flash_erase_sector_impl(uint32_t offset) {
     /* 边界：offset + 4096 > FLASH_SIZE 才越界；最后一个扇区 (offset = FLASH - 4096) 是合法的
      *   （之前用 >= FLASH-4096 会把最后一个扇区误判，导致 bootscript 双备份 SEC_B 直接失败） */
     if (offset > (PICO_FLASH_SIZE_BYTES - HAL_FLASH_SECTOR_SIZE)) return HAL_ERR_PARAM;
-    uint32_t primask = save_and_disable_interrupts();
     flash_range_erase(offset, HAL_FLASH_SECTOR_SIZE); /* RAM-code safe per SDK */
-    restore_interrupts(primask);
     return HAL_OK;
 }
 
@@ -993,9 +991,7 @@ static hal_err_t hal_flash_program_impl(uint32_t offset, const uint8_t *data, si
         for (size_t i = 0; i < chunk; i++) {
             page_buf[page_off + i] &= src[i];
         }
-        uint32_t primask = save_and_disable_interrupts();
         flash_range_program(page_start, page_buf, HAL_FLASH_PAGE_SIZE);
-        restore_interrupts(primask);
         offset += chunk;
         src += chunk;
         remaining -= chunk;
