@@ -1108,16 +1108,14 @@ bool sysclk_apply_mhz(uint32_t mhz) {
     g_oc_switching = 1;
 
     /* 高主频先升压，保证 PLL/核心时序余量。
-             * RP2040 官方建议：
+             * RP2040 官方建议（需根据实测调整）：
              *   125MHz: 1.10V (默认)
              *   200-250MHz: 1.20V
              *   270-350MHz: 1.25V
-             *   375-500MHz: 1.30V (VREG_VOLTAGE_MAX)
+             *   375-500MHz: 1.30V (VREG_VOLTAGE_MAX) - 实测 375MHz 需 1.30V
              * 本实现仅支持预设档位，避免任意频率导致 PLL 锁定失败。 */
-            if (target >= 500u) {
-                vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 500MHz 极限档 */
-            } else if (target >= 375u) {
-                vreg_set_voltage(VREG_VOLTAGE_1_25);      /* 1.25V - 375MHz */
+            if (target >= 375u) {
+                vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 375/500MHz */
             } else if (target >= 250u) {
                 vreg_set_voltage(VREG_VOLTAGE_1_20);      /* 1.20V - 250MHz */
             } else {
