@@ -60,9 +60,13 @@ static int ovclk_to_mhz(const char *s, uint32_t *out) {
     return 0;
 }
 
-/* 格式化待固化/已固化频率：0 视为默认 125MHz */
+/* 格式化已固化频率：从 Flash 读取实际固化值 */
 static uint32_t ovclk_saved_mhz(void) {
-    return s_pending.clock_mhz ? s_pending.clock_mhz : SYSCLK_MHZ_DEFAULT;
+    config_data_t cfg;
+    if (config_read(&cfg)) {
+        return cfg.clock_mhz ? cfg.clock_mhz : SYSCLK_MHZ_DEFAULT;
+    }
+    return SYSCLK_MHZ_DEFAULT;
 }
 
 static int cmd_ovclk(int argc, char **argv, shell_ctx_t *ctx) {
