@@ -1108,23 +1108,23 @@ bool sysclk_apply_mhz(uint32_t mhz) {
     g_oc_switching = 1;
 
     /* 高主频先升压，保证 PLL/核心时序余量。
-         * 250MHz: 1.20V
-         * 375MHz: 1.25V
-         * 500MHz: 1.30V (VREG_VOLTAGE_MAX) */
-        if (target >= 500u) {
-            vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 500MHz 极限档 */
-        } else if (target >= 375u) {
-            vreg_set_voltage(VREG_VOLTAGE_1_25);      /* 1.25V - 375MHz */
-        } else if (target >= 250u) {
-            vreg_set_voltage(VREG_VOLTAGE_1_20);      /* 1.20V - 250MHz */
-        } else {
-            vreg_set_voltage(VREG_VOLTAGE_1_10);      /* 1.10V - 125MHz */
-        }
+             * 250MHz: 1.20V
+             * 375MHz: 1.25V
+             * 500MHz: 1.30V (VREG_VOLTAGE_MAX) */
+            if (target >= 500u) {
+                vreg_set_voltage(VREG_VOLTAGE_MAX);       /* 1.30V - 500MHz 极限档 */
+            } else if (target >= 375u) {
+                vreg_set_voltage(VREG_VOLTAGE_1_25);      /* 1.25V - 375MHz */
+            } else if (target >= 250u) {
+                vreg_set_voltage(VREG_VOLTAGE_1_20);      /* 1.20V - 250MHz */
+            } else {
+                vreg_set_voltage(VREG_VOLTAGE_1_10);      /* 1.10V - 125MHz */
+            }
 
-        /* 电压稳定等待：VREG 升压约需 100-200μs，给足余量避免 PLL 切换时欠压 */
-        if (target > 125u) {
-            busy_wait_us(500);
-        }
+            /* 电压稳定等待：VREG 升压约需 100-200μs，给足余量避免 PLL 切换时欠压 */
+            if (target > 125u) {
+                busy_wait_us(2000);  /* 增加到 2ms，确保 VREG 完全稳定 */
+            }
 
     /* 【v2.4.2 · XIP flash 分频必须在时钟切换的"正确时机"写入】
      * set_sys_clock_khz 内部序列：切 clk_sys 到 pll_usb(48MHz) → 重配
