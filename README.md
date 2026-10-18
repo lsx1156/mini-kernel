@@ -93,6 +93,11 @@ project/                          ← 本仓库根目录（单仓 · monorepo）
     ├── os_config.h               本工程专属裁剪配置（OS_CFG_SHOW_DEMO=0）
     ├── CMakeLists.txt
     └── build.bat                 Windows 一键构建（产出 rp2040system.uf2）
+│
+└── rp2350-overclock/              🔬 【RP2350 超频实测台】——375/500 档崩溃机制的实测依据
+    ├── docs/                      电压×频率矩阵、XIP 不跟频、USB CDC 失效真因
+    ├── firmware/vsweep/           电压×频率扫描台（S <mhz> <mv> <sec>）
+    └── firmware/sniffer/          12 路并发协议嗅探器（重负载来源，142 万轮拷机）
 ```
 
 ---
@@ -157,6 +162,21 @@ RP2040 不同外设吃**不同时钟源**，超频（`ovclk`）只改 CPU 计算
 
 ---
 
+## 🔬 RP2350 超频实测（375/500 档问题的数据支撑）
+
+同架构（Cortex-M33）实测，全部为板上跑出的数字，不是手册外推：
+
+| 问题 | 实测答案 |
+|---|---|
+| 超频先崩算力还是先崩取指 | **取指**。150 → 588 MHz 时 XIP 只从 16 MB/s 走到 18 MB/s（**1.13×**），热代码不进 SRAM 就一定会挂 |
+| USB 为什么在超频后失效 | **不是 USB 时钟**。长 CPU 忙等不喂 `tud_task()`，主机控制传输超时 → 端口假死；修法是在长循环里 1 ms 喂一次 |
+| 上限取决于什么 | **负载**。同一颗芯片 588 MHz：单核负载 1.70 V 稳，12 SM + 12 DMA 满速要 1.80 V |
+| 抬压有没有用 | **只买重负载裕量，不买频率**。1.90 V 下 600 MHz 反而挂，2.00 V 下 588 MHz 挂 |
+
+→ 数据、扫描台与复现方法：[**rp2350-overclock/README.md**](./rp2350-overclock/README.md)
+
+---
+
 ## 🔗 快速跳转
 
 | 文档/文件 | 链接 |
@@ -175,6 +195,7 @@ RP2040 不同外设吃**不同时钟源**，超频（`ovclk`）只改 CPU 计算
 | 🛠️ 一键构建脚本（RP2040 演示固件） | [rp2040demo/build.bat](./rp2040demo/build.bat) |
 | 🛠️ 一键构建脚本（RP2040 系统固件，无展示） | [rp2040system/build.bat](./rp2040system/build.bat) |
 | 🛠️ 纯内核库构建脚本 | [mini-kernel/build.bat](./mini-kernel/build.bat) |
+| 🔬 RP2350 超频实测台（电压×频率矩阵 / XIP / USB 失效真因） | [rp2350-overclock/README.md](./rp2350-overclock/README.md) |
 
 ---
 

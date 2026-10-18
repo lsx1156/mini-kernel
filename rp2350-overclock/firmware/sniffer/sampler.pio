@@ -1,0 +1,5 @@
+; 单通道定速采样器：每个 SM 时钟周期采样一次引脚，32 位自动推入 FIFO
+; 采样率 = clk_sys / (SM 时钟分频)，每个采样点严格 1 条指令周期，无抖动
+; 单指令程序，PC 到末尾自动绕回 0，无需 wrap_target/wrap
+.program sampler
+    in pins, 1

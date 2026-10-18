@@ -1,0 +1,18 @@
+; WS2812 发送：SM 时钟 40 MHz（div 3.75），1 比特 = 50 拍 = 1.25 µs
+; T1H = 32 拍 = 0.8 µs，T0H = 16 拍 = 0.4 µs
+.program ws2812
+.wrap_target
+    pull block
+    set x, 23   ; jmp x-- 执行 24 次（循环体跑 x+1 遍）
+bitloop:
+    out y, 1
+    jmp !y t0bit
+    set pins, 1 [31]
+    set pins, 0 [17]
+    jmp x-- bitloop
+t0bit:
+    set pins, 1 [15]
+    set pins, 0 [31]
+    nop [1]
+    jmp x-- bitloop
+.wrap

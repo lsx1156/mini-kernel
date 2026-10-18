@@ -1,0 +1,16 @@
+; UART 8N1 发送：每条指令 32 个 SM 时钟周期 = 1 比特
+; SM 时钟 = clk_sys / 42.1875 → 150 MHz 下 3.5556 MHz → 32 拍 = 9.000 µs/bit（精确）
+.program uart_tx
+.wrap_target
+    pull block
+    set pins, 0 [31]        ; 起始位
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]
+    out pins, 1 [31]        ; 8 个数据位（LSB 先出）
+    set pins, 1 [31]        ; 停止位
+.wrap

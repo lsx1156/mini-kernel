@@ -1,0 +1,12 @@
+; SPI 发送：CPOL=0，MSB 先出。SM 时钟 10 MHz（div 15），每拍 100 ns
+; 每比特 = out(MOSI) + SCK 高 + SCK 低 = 24 拍 = 2.4 µs → 416 kHz
+.program spi_tx
+.wrap_target
+    pull block
+    set x, 7   ; jmp x-- 执行 8 次
+bitloop:
+    out pins, 1 [7]
+    set pins, 1 [7]
+    set pins, 0 [7]
+    jmp x-- bitloop
+.wrap
