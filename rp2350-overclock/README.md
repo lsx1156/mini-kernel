@@ -133,7 +133,7 @@ rp2350-overclock/
 └── tools/                 bin→uf2、链接脚本展平、串口守护式抓取
 ```
 
-`docs/SUMMARY.md` §0 的「600 MHz 热限制不可用」一句已被本文 §1 覆盖——那是 1.70 V 单负载阶段的结论。
+`docs/SUMMARY.md` §0 与 `588-performance-report.md` 里「600 MHz 不可用 / 撞热墙」的旧结论已**就地更正**（文件内附勘误说明）——那是多步 sweep 连续换挡时的入口温度造成的误判，单点复测后 600 MHz 已列入可用工作点。
 
 ---
 
