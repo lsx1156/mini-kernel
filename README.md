@@ -86,14 +86,13 @@ project/                          ← 本仓库根目录（单仓 · monorepo）
     ├── CMakeLists.txt
     └── build.bat                 Windows 一键构建（产出 rp2040demo.uf2）
 
-└── rp2040system/                 🛠️ 【RP2040 系统工程】——无展示版本
+├── rp2040system/                 🛠️ 【RP2040 系统工程】——无展示版本
     │                               （复用 rp2040demo/rp2040_port，os_config.h OS_CFG_SHOW_DEMO=0）
     │                               · 与 demo 完全同命令集，仅去掉 OLED FPS/呼吸 LED/GP15 PWM 展示
     ├── src/main.c                应用入口（与 demo 相同）
     ├── os_config.h               本工程专属裁剪配置（OS_CFG_SHOW_DEMO=0）
     ├── CMakeLists.txt
     └── build.bat                 Windows 一键构建（产出 rp2040system.uf2）
-│
 └── rp2350-overclock/              🔬 【RP2350 超频实测台】——375/500 档崩溃机制的实测依据
     ├── docs/                      电压×频率矩阵、XIP 不跟频、USB CDC 失效真因
     ├── firmware/vsweep/           电压×频率扫描台（S <mhz> <mv> <sec>）
